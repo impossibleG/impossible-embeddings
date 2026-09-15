@@ -11,7 +11,7 @@ use std::{
     time::Instant,
 };
 
-/// A validated batch of non-empty text inputs.
+/// A validated non-empty batch of text inputs. Individual inputs may be empty strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingBatch<'a> {
     inputs: Vec<Cow<'a, str>>,

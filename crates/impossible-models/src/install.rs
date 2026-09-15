@@ -45,7 +45,7 @@ impl CancelToken {
 }
 
 /// Network policy for model installation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InstallOptions {
     /// Prohibits every network request when true.
     pub offline: bool,
@@ -55,6 +55,18 @@ pub struct InstallOptions {
     pub max_redirects: usize,
     /// Absolute defense-in-depth bound per artifact.
     pub max_artifact_bytes: u64,
+}
+
+impl std::fmt::Debug for InstallOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InstallOptions")
+            .field("offline", &self.offline)
+            .field("allowed_origin_count", &self.allowed_origins.len())
+            .field("max_redirects", &self.max_redirects)
+            .field("max_artifact_bytes", &self.max_artifact_bytes)
+            .finish()
+    }
 }
 
 impl Default for InstallOptions {
@@ -96,13 +108,18 @@ impl Installer {
                 && origin
                     .host_str()
                     .is_some_and(|host| matches!(host, "127.0.0.1" | "::1" | "localhost"));
+            let canonical = format!("{}/", origin.origin().ascii_serialization());
             if origin.host_str().is_none()
                 || (origin.scheme() != "https" && !safe_loopback)
                 || origin.username() != ""
                 || origin.password().is_some()
+                || origin.path() != "/"
+                || origin.query().is_some()
+                || origin.fragment().is_some()
+                || origin.as_str() != canonical
             {
                 return Err(Error::Invalid(
-                    "allowed origins must use HTTPS (HTTP is test-only for loopback)".into(),
+                    "allowed origins must be exact canonical HTTPS origins (HTTP is test-only for loopback)".into(),
                 ));
             }
         }
@@ -374,4 +391,39 @@ const fn is_windows_reparse(_metadata: &fs::Metadata) -> bool {
 
 fn is_lock_contention(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::WouldBlock || error.raw_os_error() == Some(33)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn rejects_non_origin_allowlist_entries_and_redacts_debug() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store = ModelStore::new(temp.path())?;
+        for value in [
+            "https://example.test/path",
+            "https://example.test/?token=sentinel-query-token",
+            "https://example.test/#fragment",
+            "https://user@example.test/",
+            "https://example.test//",
+        ] {
+            let options = InstallOptions {
+                allowed_origins: vec![
+                    Url::parse(value)
+                        .map_err(|_| Error::Invalid("test URL did not parse".into()))?,
+                ],
+                ..InstallOptions::default()
+            };
+            let debug = format!("{options:?}");
+            assert!(!debug.contains("example.test"));
+            assert!(!debug.contains("sentinel-query-token"));
+            assert!(
+                Installer::new(store.clone(), options).is_err(),
+                "accepted {value}"
+            );
+        }
+        Ok(())
+    }
 }

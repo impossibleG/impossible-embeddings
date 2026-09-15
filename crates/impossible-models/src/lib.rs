@@ -20,8 +20,27 @@ pub use store::{
 
 use std::{fmt, io};
 
+/// Sanitized category for an HTTP transport failure.
+///
+/// The originating request error is deliberately reduced to this closed category before it is
+/// stored so signed URLs and other request metadata cannot escape through formatting or logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpFailureKind {
+    /// A connection could not be established.
+    Connect,
+    /// A response body could not be read completely.
+    Body,
+    /// The operation exceeded a transport timeout.
+    Timeout,
+    /// An HTTP request could not be constructed or sent.
+    Request,
+    /// A response could not be decoded.
+    Decode,
+    /// A transport failure not covered by a more specific stable category.
+    Other,
+}
+
 /// Errors returned by catalog and model lifecycle operations.
-#[derive(Debug)]
 pub enum Error {
     /// A manifest or caller-controlled value failed validation.
     Invalid(String),
@@ -50,9 +69,40 @@ pub enum Error {
     /// A filesystem operation failed.
     Io(io::Error),
     /// An HTTP operation failed.
-    Http(reqwest::Error),
+    Http(HttpFailureKind),
     /// Manifest JSON could not be decoded.
     Json(serde_json::Error),
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(_) => formatter
+                .debug_tuple("Invalid")
+                .field(&"[REDACTED]")
+                .finish(),
+            Self::Cancelled => formatter.write_str("Cancelled"),
+            Self::Offline => formatter.write_str("Offline"),
+            Self::InUse => formatter.write_str("InUse"),
+            Self::OriginNotAllowed(_) => formatter
+                .debug_tuple("OriginNotAllowed")
+                .field(&"[REDACTED]")
+                .finish(),
+            Self::SizeLimit { expected, actual } => formatter
+                .debug_struct("SizeLimit")
+                .field("expected", expected)
+                .field("actual", actual)
+                .finish(),
+            Self::HashMismatch { .. } => formatter
+                .debug_struct("HashMismatch")
+                .field("expected", &"[REDACTED]")
+                .field("actual", &"[REDACTED]")
+                .finish(),
+            Self::Io(error) => formatter.debug_tuple("Io").field(&error.kind()).finish(),
+            Self::Http(kind) => formatter.debug_tuple("Http").field(kind).finish(),
+            Self::Json(_) => formatter.debug_tuple("Json").field(&"[REDACTED]").finish(),
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -74,7 +124,7 @@ impl fmt::Display for Error {
                 "artifact hash mismatch: expected {expected}, received {actual}"
             ),
             Self::Io(error) => write!(formatter, "filesystem error: {error}"),
-            Self::Http(error) => write!(formatter, "HTTP error: {error}"),
+            Self::Http(kind) => write!(formatter, "HTTP transport error: {kind}"),
             Self::Json(error) => write!(formatter, "manifest JSON error: {error}"),
         }
     }
@@ -90,7 +140,32 @@ impl From<io::Error> for Error {
 
 impl From<reqwest::Error> for Error {
     fn from(value: reqwest::Error) -> Self {
-        Self::Http(value)
+        let kind = if value.is_connect() {
+            HttpFailureKind::Connect
+        } else if value.is_body() {
+            HttpFailureKind::Body
+        } else if value.is_timeout() {
+            HttpFailureKind::Timeout
+        } else if value.is_request() {
+            HttpFailureKind::Request
+        } else if value.is_decode() {
+            HttpFailureKind::Decode
+        } else {
+            HttpFailureKind::Other
+        };
+        Self::Http(kind)
+    }
+}
+
+impl fmt::Display for HttpFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Connect => "connection failed",
+            Self::Body => "response body failed",
+            Self::Timeout => "request timed out",
+            Self::Request | Self::Other => "request failed",
+            Self::Decode => "response decoding failed",
+        })
     }
 }
 

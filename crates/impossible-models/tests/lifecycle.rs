@@ -98,8 +98,9 @@ async fn server(
     Ok((Url::parse(&format!("http://{address}/artifact"))?, handle))
 }
 
-fn installer(temp: &TempDir, origin: Url, offline: bool) -> TestResult<Installer> {
+fn installer(temp: &TempDir, origin: &Url, offline: bool) -> TestResult<Installer> {
     let store = ModelStore::new(temp.path())?;
+    let origin = Url::parse(&format!("{}/", origin.origin().ascii_serialization()))?;
     let options = InstallOptions {
         offline,
         allowed_origins: vec![origin],
@@ -107,6 +108,18 @@ fn installer(temp: &TempDir, origin: Url, offline: bool) -> TestResult<Installer
         max_artifact_bytes: 1024 * 1024,
     };
     Ok(Installer::new(store, options)?)
+}
+
+fn assert_http_error_is_redacted(error: &impossible_models::Error, secret: &str) {
+    assert!(
+        matches!(error, impossible_models::Error::Http(_)),
+        "{error:?}"
+    );
+    for rendered in [error.to_string(), format!("{error:?}")] {
+        assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+        assert!(!rendered.contains("http://"), "URL leaked: {rendered}");
+        assert!(!rendered.contains("https://"), "URL leaked: {rendered}");
+    }
 }
 
 fn trusted_store(path: impl AsRef<std::path::Path>, manifest: &Manifest) -> TestResult<ModelStore> {
@@ -124,7 +137,7 @@ async fn installs_and_promotes_only_after_hash_verification() -> TestResult {
     let requests = Arc::new(AtomicUsize::new(0));
     let (url, task) = server(body.clone(), None, Arc::clone(&requests)).await?;
     let manifest = fixture(url.to_string(), &body, None);
-    let status = installer(&temp, url, false)?
+    let status = installer(&temp, &url, false)?
         .install(&manifest, &CancelToken::new())
         .await;
     assert!(
@@ -143,7 +156,7 @@ async fn hash_mismatch_never_promotes() -> TestResult {
     let requests = Arc::new(AtomicUsize::new(0));
     let (url, task) = server(body.clone(), None, requests).await?;
     let manifest = fixture(url.to_string(), &body, Some("a".repeat(64)));
-    let result = installer(&temp, url, false)?
+    let result = installer(&temp, &url, false)?
         .install(&manifest, &CancelToken::new())
         .await;
     assert!(matches!(
@@ -165,7 +178,7 @@ async fn cancellation_leaves_only_partial_state_and_retry_recovers() -> TestResu
     let manifest = fixture(slow_url.to_string(), &body, None);
     let cancel = CancelToken::new();
     let pending = {
-        let installer = installer(&temp, slow_url, false)?;
+        let installer = installer(&temp, &slow_url, false)?;
         let manifest = manifest.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move { installer.install(&manifest, &cancel).await })
@@ -196,7 +209,7 @@ async fn cancellation_leaves_only_partial_state_and_retry_recovers() -> TestResu
     let retry_manifest = fixture(retry_url.to_string(), &body, None);
     assert!(
         matches!(
-            installer(&temp, retry_url, false)?
+            installer(&temp, &retry_url, false)?
                 .install(&retry_manifest, &CancelToken::new())
                 .await,
             Ok(ModelStatus::IntegrityVerified)
@@ -214,7 +227,7 @@ async fn concurrent_install_is_coalesced_by_cross_process_lock() -> TestResult {
     let requests = Arc::new(AtomicUsize::new(0));
     let (url, task) = server(body.clone(), Some(128), Arc::clone(&requests)).await?;
     let manifest = fixture(url.to_string(), &body, None);
-    let installer = installer(&temp, url, false)?;
+    let installer = installer(&temp, &url, false)?;
     let left_cancel = CancelToken::new();
     let right_cancel = CancelToken::new();
     let (left, right) = tokio::join!(
@@ -239,10 +252,60 @@ async fn offline_mode_performs_no_request() -> TestResult {
     let temp = TempDir::new()?;
     let url = Url::parse("http://127.0.0.1:9/artifact")?;
     let manifest = fixture(url.to_string(), b"unused", None);
-    let result = installer(&temp, url, true)?
+    let result = installer(&temp, &url, true)?
         .install(&manifest, &CancelToken::new())
         .await;
     assert!(matches!(result, Err(impossible_models::Error::Offline)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn connect_failures_do_not_retain_signed_urls() -> TestResult {
+    let temp = TempDir::new()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    drop(listener);
+    let secret = "sentinel-connect-token";
+    let url = Url::parse(&format!("http://{address}/artifact?token={secret}"))?;
+    let manifest = fixture(url.to_string(), b"unused", None);
+    let result = installer(&temp, &url, false)?
+        .install(&manifest, &CancelToken::new())
+        .await;
+    let Err(error) = result else {
+        return Err(std::io::Error::other("closed listener unexpectedly succeeded").into());
+    };
+    assert_http_error_is_redacted(&error, secret);
+    Ok(())
+}
+
+#[tokio::test]
+async fn body_failures_do_not_retain_signed_urls() -> TestResult {
+    let temp = TempDir::new()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nshort",
+                )
+                .await;
+        }
+    });
+    let secret = "sentinel-body-token";
+    let url = Url::parse(&format!("http://{address}/artifact?token={secret}"))?;
+    let expected = b"sixteen-byte-data";
+    let manifest = fixture(url.to_string(), expected, None);
+    let result = installer(&temp, &url, false)?
+        .install(&manifest, &CancelToken::new())
+        .await;
+    let Err(error) = result else {
+        return Err(std::io::Error::other("truncated body unexpectedly succeeded").into());
+    };
+    assert_http_error_is_redacted(&error, secret);
+    task.await?;
     Ok(())
 }
 

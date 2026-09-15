@@ -228,7 +228,12 @@ impl Manifest {
                 .dimensions
                 .matryoshka
                 .iter()
-                .any(|value| *value == 0 || *value > self.dimensions.native)
+                .any(|value| *value == 0 || *value >= self.dimensions.native)
+            || self
+                .dimensions
+                .matryoshka
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
         {
             return Err(Error::Invalid("invalid embedding dimensions".into()));
         }
@@ -512,6 +517,30 @@ mod tests {
         json["artifacts"][0]["path"] = "model.safetensors".into();
         json["surprise"] = true.into();
         assert!(Manifest::from_json(&serde_json::to_vec(&json).unwrap_or_default()).is_err());
+    }
+
+    #[test]
+    fn matryoshka_dimensions_have_one_canonical_representation() {
+        let bytes = include_bytes!("../manifests/bge-small-en.json");
+        let base: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_default();
+
+        let mut valid = base.clone();
+        valid["dimensions"] = serde_json::json!({ "native": 384, "matryoshka": [64, 128, 256] });
+        assert!(Manifest::from_json(&serde_json::to_vec(&valid).unwrap_or_default()).is_ok());
+
+        for matryoshka in [
+            serde_json::json!([0]),
+            serde_json::json!([64, 64]),
+            serde_json::json!([128, 64]),
+            serde_json::json!([64, 384]),
+        ] {
+            let mut invalid = base.clone();
+            invalid["dimensions"] = serde_json::json!({ "native": 384, "matryoshka": matryoshka });
+            assert!(
+                Manifest::from_json(&serde_json::to_vec(&invalid).unwrap_or_default()).is_err(),
+                "noncanonical dimensions were accepted: {matryoshka}"
+            );
+        }
     }
 
     #[test]

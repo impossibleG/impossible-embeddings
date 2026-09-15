@@ -7,7 +7,7 @@
   "tokenizer": { "kind": "bert-wordpiece", "max_tokens": 8192, "lowercase": true },
   "pooling": "mean",
   "prefixes": { "query": "search_query: ", "document": "search_document: " },
-  "dimensions": { "native": 768, "matryoshka": [64, 128, 256, 512, 768] },
+  "dimensions": { "native": 768, "matryoshka": [64, 128, 256, 512] },
   "tensors": { "format": "safetensors", "dtype": "float32", "architecture": "NomicBertModel" },
   "artifacts": [{
     "path": "model.safetensors",

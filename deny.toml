@@ -13,6 +13,9 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # Reviewed: webpki root-certificate data uses this permissive data license; the upstream
+    # crates distribute the agreement with the data, preserving its redistribution notice.
+    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "Unicode-3.0",
