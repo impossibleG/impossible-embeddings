@@ -17,6 +17,58 @@ pub struct EmbeddingBatch<'a> {
     inputs: Vec<Cow<'a, str>>,
 }
 
+/// Semantic purpose of an embedding input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingTask {
+    /// A search query.
+    Query,
+    /// A document or passage.
+    Document,
+}
+
+/// Behavior for tokenized inputs beyond a model's declared limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Truncation {
+    /// Reject the request.
+    Reject,
+    /// Retain the leading tokens that fit the model limit.
+    Truncate,
+}
+
+/// Transport-independent embedding request options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbedOptions {
+    /// Task used to select a model prefix.
+    pub task: EmbeddingTask,
+    /// Explicit over-length behavior.
+    pub truncation: Truncation,
+    /// Optional, manifest-approved output dimension.
+    pub dimensions: Option<usize>,
+}
+
+impl Default for EmbedOptions {
+    fn default() -> Self {
+        Self {
+            task: EmbeddingTask::Document,
+            truncation: Truncation::Reject,
+            dimensions: None,
+        }
+    }
+}
+
+/// Integrity and semantic readiness of an exact model identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelVerificationStatus {
+    /// No final installation exists.
+    Missing,
+    /// Files exist but fail validation or cannot safely be inspected.
+    Invalid,
+    /// Every byte matches, but semantic verification is pending.
+    IntegrityVerified,
+    /// Integrity and semantic behavior are both verified.
+    Loadable,
+}
+
 impl<'a> EmbeddingBatch<'a> {
     /// Validates and constructs a batch.
     ///

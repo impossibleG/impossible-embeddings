@@ -8,7 +8,7 @@ use std::{
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
-use crate::{Error, Manifest, Result};
+use crate::{Error, Manifest, ModelStatus, Result};
 
 const MANIFEST_FILE: &str = "manifest.json";
 
@@ -77,17 +77,44 @@ impl DiscoveryRoot {
     }
 }
 
-/// Integrity and semantic readiness for an exact identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelStatus {
-    /// No final installation exists.
-    Missing,
-    /// Files exist but do not match the manifest or cannot safely be inspected.
-    Invalid,
-    /// Every byte matches, but semantic verification is pending.
-    IntegrityVerified,
-    /// Integrity and semantic behavior are both verified.
-    Loadable,
+/// A model identity proven loadable by [`ModelStore`].
+///
+/// Construction is deliberately private so runtime adapters cannot accidentally bypass artifact
+/// integrity and semantic-readiness checks.
+#[derive(Debug, Clone)]
+pub struct VerifiedModel {
+    manifest: Manifest,
+    root: PathBuf,
+}
+
+impl VerifiedModel {
+    /// Returns the validated canonical manifest.
+    #[must_use]
+    pub const fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    /// Returns the verified, application-owned artifact directory.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Returns a stable fingerprint derived from every pinned artifact digest.
+    #[must_use]
+    pub fn artifact_fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(self.manifest.canonical_id.as_bytes());
+        digest.update([0]);
+        digest.update(self.manifest.revision.as_bytes());
+        for artifact in &self.manifest.artifacts {
+            digest.update([0]);
+            digest.update(artifact.path.as_bytes());
+            digest.update([0]);
+            digest.update(artifact.sha256.as_bytes());
+        }
+        format!("sha256:{:x}", digest.finalize())
+    }
 }
 
 /// Safe local store operations independent from the network installer.
@@ -165,6 +192,23 @@ impl ModelStore {
     /// Returns an error when validation or filesystem inspection cannot be completed safely.
     pub fn verify(&self, manifest: &Manifest) -> Result<ModelStatus> {
         self.status(manifest)
+    }
+
+    /// Returns a capability to load an exact identity only after complete verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless integrity and semantic verification both make the model loadable.
+    pub fn verified_model(&self, manifest: &Manifest) -> Result<VerifiedModel> {
+        match self.verify(manifest)? {
+            ModelStatus::Loadable => Ok(VerifiedModel {
+                manifest: manifest.clone(),
+                root: self.layout.model_dir(manifest),
+            }),
+            status => Err(Error::Invalid(format!(
+                "model is not loadable after verification: {status:?}"
+            ))),
+        }
     }
 
     /// Imports artifacts from a caller-authorized directory after full integrity validation.

@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+impossible-embedding-core = { path = "../impossible-embedding-core" }
 toml = "=1.1.4"
 
 [lints]

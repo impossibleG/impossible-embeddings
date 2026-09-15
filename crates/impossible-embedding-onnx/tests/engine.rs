@@ -7,7 +7,13 @@ use impossible_embedding_core::{
     CancellationToken, EmbeddingBatch, ErrorCode, ExecutionControl, RequestedModel,
 };
 use impossible_embedding_onnx::{EmbedOptions, EmbeddingTask, OnnxEmbeddingEngine, Truncation};
+use impossible_models::{
+    Artifact, Dimensions, License, Manifest, ModelStatus, ModelStore, OnnxInputNames, Pooling,
+    Prefixes, RuntimeMetadata, SemanticVerification, TensorMetadata, TokenizerMetadata,
+};
+use impossible_server_core::{HealthRegistry, LifecycleState, ModelKey};
 use prost::Message;
+use sha2::{Digest, Sha256};
 use tokenizers::{
     Tokenizer, models::wordpiece::WordPiece, pre_tokenizers::whitespace::Whitespace,
     processors::template::TemplateProcessing,
@@ -134,10 +140,14 @@ fn cast_model() -> ModelProto {
     }
 }
 
-fn write_fixture(root: &Path) -> Result<()> {
+fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn write_fixture(root: &Path) -> Result<Manifest> {
     let mut model = Vec::new();
     cast_model().encode(&mut model)?;
-    fs::write(root.join("model.onnx"), model)?;
+    fs::write(root.join("model.onnx"), &model)?;
 
     let vocab = [
         ("[UNK]".to_owned(), 0),
@@ -166,33 +176,76 @@ fn write_fixture(root: &Path) -> Result<()> {
     tokenizer
         .save(root.join("tokenizer.json"), false)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-
-    fs::write(
-        root.join("manifest.json"),
-        r#"{
-  "schema_version": 1,
-  "canonical_id": "fixture/cast-embedding",
-  "revision": "synthetic-v1",
-  "model_file": "model.onnx",
-  "tokenizer_file": "tokenizer.json",
-  "inputs": {"input_ids": "input_ids", "attention_mask": "attention_mask", "token_type_ids": null},
-  "output": "sentence_embedding",
-  "pooling": "mean",
-  "max_tokens": 5,
-  "pad_token_id": 0,
-  "normalize": true,
-  "matryoshka_dimensions": [2],
-  "prefixes": {"query": "query: ", "document": null}
-}"#,
-    )?;
-    Ok(())
+    let tokenizer_bytes = fs::read(root.join("tokenizer.json"))?;
+    Ok(Manifest {
+        schema_version: 1,
+        canonical_id: "fixture/cast-embedding".into(),
+        revision: "1111111111111111111111111111111111111111".into(),
+        license: License {
+            spdx: "MIT".into(),
+            source_url: "https://example.invalid/model".into(),
+        },
+        semantic_verification: SemanticVerification::Verified {
+            evidence: "synthetic-fixture-v1".into(),
+        },
+        tokenizer: TokenizerMetadata {
+            kind: "wordpiece".into(),
+            max_tokens: 5,
+            lowercase: false,
+        },
+        pooling: Pooling::Mean,
+        prefixes: Prefixes {
+            query: "query: ".into(),
+            document: String::new(),
+        },
+        dimensions: Dimensions {
+            native: 4,
+            matryoshka: vec![2],
+        },
+        tensors: TensorMetadata {
+            format: "onnx".into(),
+            dtype: "float32".into(),
+            architecture: "synthetic-cast".into(),
+        },
+        runtime: RuntimeMetadata::Onnx {
+            model_file: "model.onnx".into(),
+            tokenizer_file: "tokenizer.json".into(),
+            inputs: OnnxInputNames {
+                input_ids: "input_ids".into(),
+                attention_mask: Some("attention_mask".into()),
+                token_type_ids: None,
+            },
+            output: "sentence_embedding".into(),
+            pad_token_id: 0,
+            normalize: true,
+        },
+        artifacts: vec![
+            Artifact {
+                path: "model.onnx".into(),
+                url: "https://example.invalid/model.onnx".into(),
+                sha256: digest(&model),
+                size: u64::try_from(model.len())?,
+            },
+            Artifact {
+                path: "tokenizer.json".into(),
+                url: "https://example.invalid/tokenizer.json".into(),
+                sha256: digest(&tokenizer_bytes),
+                size: u64::try_from(tokenizer_bytes.len())?,
+            },
+        ],
+    })
 }
 
 fn setup() -> Result<(tempfile::TempDir, OnnxEmbeddingEngine)> {
     let directory = tempfile::tempdir()?;
-    write_fixture(directory.path())?;
+    let source = directory.path().join("source");
+    fs::create_dir(&source)?;
+    let manifest = write_fixture(&source)?;
+    let store = ModelStore::new(directory.path().join("cache"))?;
+    anyhow::ensure!(store.import(&manifest, &source)? == ModelStatus::Loadable);
+    let verified = store.verified_model(&manifest)?;
     let engine = OnnxEmbeddingEngine::new();
-    let identity = engine.load(&directory.path().join("manifest.json"))?;
+    let identity = engine.load(&verified)?;
     anyhow::ensure!(identity.canonical_id == "fixture/cast-embedding");
     anyhow::ensure!(identity.artifact_fingerprint.starts_with("sha256:"));
     Ok((directory, engine))
@@ -227,6 +280,31 @@ fn lifecycle_and_real_in_process_ort_execution() -> Result<()> {
     engine.unload()?;
     anyhow::ensure!(!engine.is_loaded());
     engine.unload()?;
+    Ok(())
+}
+
+#[test]
+fn verified_store_model_loads_and_drives_infrastructure_readiness() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source");
+    fs::create_dir(&source)?;
+    let manifest = write_fixture(&source)?;
+    let store = ModelStore::new(directory.path().join("cache"))?;
+    let status = store.import(&manifest, &source)?;
+    assert_eq!(status, ModelStatus::Loadable);
+
+    let health = HealthRegistry::default();
+    health.set_model_verification(ModelKey(7), status);
+    assert_eq!(health.model_counts(), (0, 1));
+
+    let verified = store.verified_model(&manifest)?;
+    let engine = OnnxEmbeddingEngine::new();
+    engine.load(&verified)?;
+    engine.warm()?;
+    health.set_model(ModelKey(7), impossible_server_core::ModelState::Ready);
+    assert_eq!(health.model_counts(), (1, 1));
+    assert!(health.transition(LifecycleState::Ready, None));
+    assert!(health.readiness().is_ready());
     Ok(())
 }
 
@@ -290,25 +368,28 @@ fn handles_empty_unicode_prefixes_limits_and_dimensions() -> Result<()> {
 #[test]
 fn errors_are_privacy_safe_and_artifacts_cannot_escape_manifest_root() -> Result<()> {
     let directory = tempfile::tempdir()?;
-    fs::write(
-        directory.path().join("manifest.json"),
-        r#"{
-      "schema_version":1,"canonical_id":"fixture/model","revision":"v1",
-      "model_file":"../secret.onnx","tokenizer_file":"tokenizer.json",
-      "inputs":{"input_ids":"input_ids","attention_mask":"attention_mask","token_type_ids":null},
-      "output":"output","pooling":"mean","max_tokens":8,"normalize":false
-    }"#,
-    )?;
-    let Err(error) = OnnxEmbeddingEngine::new().load(&directory.path().join("manifest.json"))
-    else {
+    let source = directory.path().join("source");
+    fs::create_dir(&source)?;
+    let mut manifest = write_fixture(&source)?;
+    manifest.runtime = RuntimeMetadata::Onnx {
+        model_file: "../secret.onnx".into(),
+        tokenizer_file: "tokenizer.json".into(),
+        inputs: OnnxInputNames {
+            input_ids: "input_ids".into(),
+            attention_mask: None,
+            token_type_ids: None,
+        },
+        output: "output".into(),
+        pad_token_id: 0,
+        normalize: false,
+    };
+    let Err(error) = manifest.validate() else {
         anyhow::bail!("traversal must fail");
     };
-    assert_eq!(error.public_error().code, ErrorCode::InvalidRequest);
     assert!(
         !error
             .to_string()
             .contains(directory.path().to_string_lossy().as_ref())
     );
-    assert!(!format!("{error:?}").contains(directory.path().to_string_lossy().as_ref()));
     Ok(())
 }

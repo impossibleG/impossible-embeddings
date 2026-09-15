@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+impossible-embedding-core = { path = "../impossible-embedding-core" }
 fs2 = "=0.4.3"
 reqwest = { version = "=0.12.24", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "=1.0.228", features = ["derive"] }

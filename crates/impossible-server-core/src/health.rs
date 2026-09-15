@@ -1,5 +1,6 @@
 //! Lock-safe liveness, readiness, and per-model state.
 
+use impossible_embedding_core::ModelVerificationStatus;
 use std::{
     collections::BTreeMap,
     sync::{Arc, RwLock},
@@ -33,6 +34,20 @@ pub enum ModelState {
     Ready,
     /// Model is unavailable with a stable reason code.
     Failed(&'static str),
+}
+
+impl From<ModelVerificationStatus> for ModelState {
+    fn from(status: ModelVerificationStatus) -> Self {
+        match status {
+            ModelVerificationStatus::Missing => Self::Failed("model_missing"),
+            ModelVerificationStatus::Invalid => Self::Failed("model_invalid"),
+            ModelVerificationStatus::IntegrityVerified => {
+                Self::Failed("semantic_verification_pending")
+            }
+            // Artifact readiness permits adapter loading; it does not prove an initialized runtime.
+            ModelVerificationStatus::Loadable => Self::Loading,
+        }
+    }
 }
 
 /// A privacy-safe readiness snapshot.
@@ -87,6 +102,14 @@ impl HealthRegistry {
         if let Ok(mut state) = self.0.write() {
             state.models.insert(key, model);
         }
+    }
+
+    /// Register model artifact readiness from the canonical verification status.
+    ///
+    /// A loadable identity becomes [`ModelState::Loading`]; only the runtime adapter may promote
+    /// it to [`ModelState::Ready`] after successful initialization and warmup.
+    pub fn set_model_verification(&self, key: ModelKey, status: ModelVerificationStatus) {
+        self.set_model(key, status.into());
     }
 
     /// Transition the process lifecycle. Stopped cannot transition back to service.

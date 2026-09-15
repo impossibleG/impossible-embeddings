@@ -31,6 +31,9 @@ pub struct Manifest {
     pub dimensions: Dimensions,
     /// Tensor/runtime compatibility metadata.
     pub tensors: TensorMetadata,
+    /// Runtime-specific loading contract, if this identity is directly executable.
+    #[serde(default)]
+    pub runtime: RuntimeMetadata,
     /// Immutable artifacts required by this manifest.
     pub artifacts: Vec<Artifact>,
 }
@@ -81,6 +84,8 @@ pub enum Pooling {
     Cls,
     /// Mean-pool non-padding token representations.
     Mean,
+    /// Use the final non-padding token representation.
+    LastToken,
 }
 
 /// Query/document prefix contract.
@@ -113,6 +118,43 @@ pub struct TensorMetadata {
     pub dtype: String,
     /// Architecture identifier required by a compatible runtime.
     pub architecture: String,
+}
+
+/// Runtime-specific loading metadata kept in the canonical model manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "engine", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeMetadata {
+    /// Catalog metadata only; no in-process adapter contract is declared.
+    #[default]
+    CatalogOnly,
+    /// ONNX Runtime graph and tokenizer contract.
+    Onnx {
+        /// ONNX artifact path from [`Manifest::artifacts`].
+        model_file: String,
+        /// Hugging Face tokenizer JSON artifact path from [`Manifest::artifacts`].
+        tokenizer_file: String,
+        /// ONNX graph input names.
+        inputs: OnnxInputNames,
+        /// Selected ONNX graph output name.
+        output: String,
+        /// Token id used for request-time batch padding.
+        #[serde(default)]
+        pad_token_id: u32,
+        /// Whether final vectors are L2-normalized.
+        normalize: bool,
+    },
+}
+
+/// Names of inputs in an ONNX embedding graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnnxInputNames {
+    /// Token ids input.
+    pub input_ids: String,
+    /// Optional attention-mask input.
+    pub attention_mask: Option<String>,
+    /// Optional segment/token-type input.
+    pub token_type_ids: Option<String>,
 }
 
 /// One content-addressed file.
@@ -196,6 +238,7 @@ impl Manifest {
         {
             return Err(Error::Invalid("tensor metadata is incomplete".into()));
         }
+        validate_runtime(&self.runtime)?;
         match &self.semantic_verification {
             SemanticVerification::Verified { evidence } if evidence.trim().is_empty() => {
                 return Err(Error::Invalid(
@@ -243,6 +286,7 @@ impl Manifest {
                 ));
             }
         }
+        validate_runtime_artifacts(&self.runtime, &self.artifacts)?;
         Ok(())
     }
 
@@ -254,6 +298,55 @@ impl Manifest {
             SemanticVerification::Verified { .. }
         )
     }
+}
+
+fn validate_runtime(runtime: &RuntimeMetadata) -> Result<()> {
+    let RuntimeMetadata::Onnx {
+        model_file,
+        tokenizer_file,
+        inputs,
+        output,
+        ..
+    } = runtime
+    else {
+        return Ok(());
+    };
+    validate_relative_path(model_file)?;
+    validate_relative_path(tokenizer_file)?;
+    if model_file == tokenizer_file
+        || inputs.input_ids.trim().is_empty()
+        || output.trim().is_empty()
+        || inputs
+            .attention_mask
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty())
+        || inputs
+            .token_type_ids
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err(Error::Invalid("ONNX runtime metadata is incomplete".into()));
+    }
+    Ok(())
+}
+
+fn validate_runtime_artifacts(runtime: &RuntimeMetadata, artifacts: &[Artifact]) -> Result<()> {
+    let RuntimeMetadata::Onnx {
+        model_file,
+        tokenizer_file,
+        ..
+    } = runtime
+    else {
+        return Ok(());
+    };
+    for required in [model_file, tokenizer_file] {
+        if !artifacts.iter().any(|artifact| &artifact.path == required) {
+            return Err(Error::Invalid(
+                "ONNX runtime file is not declared as an artifact".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_relative_path(value: &str) -> Result<()> {

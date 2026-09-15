@@ -7,12 +7,13 @@ mod install;
 mod manifest;
 mod store;
 
+pub use impossible_embedding_core::ModelVerificationStatus as ModelStatus;
 pub use install::{CancelToken, InstallOptions, Installer};
 pub use manifest::{
-    Artifact, Dimensions, License, Manifest, Pooling, Prefixes, SemanticVerification,
-    TensorMetadata, TokenizerMetadata, curated_manifests,
+    Artifact, Dimensions, License, Manifest, OnnxInputNames, Pooling, Prefixes, RuntimeMetadata,
+    SemanticVerification, TensorMetadata, TokenizerMetadata, curated_manifests,
 };
-pub use store::{CacheLayout, DiscoveryRoot, ModelStatus, ModelStore};
+pub use store::{CacheLayout, DiscoveryRoot, ModelStore, VerifiedModel};
 
 use std::{fmt, io};
 

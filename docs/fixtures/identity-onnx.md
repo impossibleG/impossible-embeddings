@@ -16,4 +16,7 @@ created entirely in test code from a seven-token synthetic vocabulary, serialize
 tokenizer JSON, and written only to a temporary directory. This fixture has no downloaded weights,
 training data, executable model code, or dependency on network access. It is intentionally not a
 quality model: it proves the production loader, tokenizer, input construction, ONNX execution,
-batch padding, normalization, prefix, truncation, dimension, and lifecycle paths offline.
+batch padding, normalization, prefix, truncation, dimension, and lifecycle paths offline. The test
+imports the generated artifacts through the production model store, obtains a verification-gated
+load capability, initializes and warms the ONNX engine, and only then promotes infrastructure
+health to ready.

@@ -3,16 +3,16 @@
 //! Models load only from local ONNX and tokenizer JSON files. This adapter never evaluates
 //! repository code, Python, pickle, or other executable model content.
 
+pub use impossible_embedding_core::{EmbedOptions, EmbeddingTask, Truncation};
 use impossible_embedding_core::{
     EmbeddingBatch, EmbeddingEngine, EmbeddingOutput, EngineFailure, ErrorCode, ExecutionControl,
     RequestedModel, ResolvedModelIdentity,
 };
+use impossible_models::{Manifest, OnnxInputNames, Pooling, RuntimeMetadata, VerifiedModel};
 use ort::{
     session::{Session, SessionInputValue},
     value::Tensor,
 };
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
     collections::BTreeSet,
@@ -26,113 +26,6 @@ use tokenizers::{Encoding, Tokenizer};
 /// Stable runtime name used in model identities.
 pub const ENGINE_NAME: &str = "onnx-runtime";
 
-/// Semantic purpose of an input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EmbeddingTask {
-    /// A search query.
-    Query,
-    /// A document or passage.
-    Document,
-}
-
-/// Behavior for tokenized inputs beyond the manifest limit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Truncation {
-    /// Reject the request.
-    Reject,
-    /// Retain the first `max_tokens` tokens.
-    Truncate,
-}
-
-/// Per-request controls beyond the foundation trait.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EmbedOptions {
-    /// Task used to select a prefix.
-    pub task: EmbeddingTask,
-    /// Explicit over-length behavior.
-    pub truncation: Truncation,
-    /// Optional, manifest-approved Matryoshka dimension.
-    pub dimensions: Option<usize>,
-}
-impl Default for EmbedOptions {
-    fn default() -> Self {
-        Self {
-            task: EmbeddingTask::Document,
-            truncation: Truncation::Reject,
-            dimensions: None,
-        }
-    }
-}
-
-/// Pooling applied to token-level output.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Pooling {
-    /// Mask-weighted mean.
-    Mean,
-    /// First non-padding token.
-    Cls,
-    /// Last non-padding token.
-    LastToken,
-}
-
-/// Names of graph inputs.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct InputNames {
-    /// Token ids.
-    pub input_ids: String,
-    /// Attention mask.
-    pub attention_mask: Option<String>,
-    /// Optional segment ids.
-    pub token_type_ids: Option<String>,
-}
-
-/// Optional task prefixes.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
-pub struct Prefixes {
-    /// Query prefix.
-    pub query: Option<String>,
-    /// Document prefix.
-    pub document: Option<String>,
-}
-
-/// Auditable local model manifest.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ModelManifest {
-    /// Supported schema version (currently 1).
-    pub schema_version: u32,
-    /// Canonical model id.
-    pub canonical_id: String,
-    /// Immutable revision.
-    pub revision: String,
-    /// ONNX filename relative to this manifest.
-    pub model_file: PathBuf,
-    /// Hugging Face tokenizer JSON filename relative to this manifest.
-    pub tokenizer_file: PathBuf,
-    /// Graph inputs.
-    pub inputs: InputNames,
-    /// Selected graph output.
-    pub output: String,
-    /// Pooling rule.
-    pub pooling: Pooling,
-    /// Limit including special tokens and prefix.
-    pub max_tokens: usize,
-    /// Token id used for request-time batch padding.
-    #[serde(default)]
-    pub pad_token_id: u32,
-    /// Whether final vectors are L2-normalized.
-    pub normalize: bool,
-    /// Allowed Matryoshka dimensions; empty prohibits dimension truncation.
-    #[serde(default)]
-    pub matryoshka_dimensions: Vec<usize>,
-    /// Task prefixes.
-    #[serde(default)]
-    pub prefixes: Prefixes,
-}
-
 #[derive(Debug)]
 struct Diagnostic(String);
 impl fmt::Display for Diagnostic {
@@ -143,10 +36,19 @@ impl fmt::Display for Diagnostic {
 impl Error for Diagnostic {}
 
 struct LoadedModel {
-    manifest: ModelManifest,
+    manifest: Manifest,
+    contract: OnnxContract,
     tokenizer: Tokenizer,
     session: Session,
     identity: ResolvedModelIdentity,
+}
+
+#[derive(Debug, Clone)]
+struct OnnxContract {
+    inputs: OnnxInputNames,
+    output: String,
+    pad_token_id: u32,
+    normalize: bool,
 }
 
 /// Single-model ONNX engine with explicit lifecycle operations.
@@ -168,31 +70,23 @@ impl OnnxEmbeddingEngine {
         }
     }
 
-    /// Loads a local JSON manifest, replacing the current model only after validation succeeds.
+    /// Loads a store-verified model, replacing the current model only after adapter validation.
     ///
     /// # Errors
     /// Returns stable invalid-manifest or unavailable-model errors with private diagnostics.
-    pub fn load(&self, manifest_path: &Path) -> Result<ResolvedModelIdentity, EngineFailure> {
-        let candidate = Self::load_candidate(manifest_path)?;
+    pub fn load(&self, verified: &VerifiedModel) -> Result<ResolvedModelIdentity, EngineFailure> {
+        let candidate = Self::load_candidate(verified)?;
         let identity = candidate.identity.clone();
         *self.state()? = Some(candidate);
         Ok(identity)
     }
 
-    fn load_candidate(manifest_path: &Path) -> Result<LoadedModel, EngineFailure> {
-        if manifest_path.extension().and_then(|v| v.to_str()) != Some("json") {
-            return Err(EngineFailure::public(ErrorCode::InvalidRequest));
-        }
-        let manifest_bytes = fs::read(manifest_path)
-            .map_err(|e| EngineFailure::with_source(ErrorCode::ModelUnavailable, e))?;
-        let manifest: ModelManifest = serde_json::from_slice(&manifest_bytes)
-            .map_err(|e| EngineFailure::with_source(ErrorCode::InvalidRequest, e))?;
-        validate_manifest(&manifest)?;
-        let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-        let model_path = safe_artifact_path(root, &manifest.model_file, "onnx")?;
-        let tokenizer_path = safe_artifact_path(root, &manifest.tokenizer_file, "json")?;
-        let model_bytes = fs::read(&model_path)
-            .map_err(|e| EngineFailure::with_source(ErrorCode::ModelUnavailable, e))?;
+    fn load_candidate(verified: &VerifiedModel) -> Result<LoadedModel, EngineFailure> {
+        let manifest = verified.manifest().clone();
+        let (model_file, tokenizer_file, contract) = onnx_contract(&manifest)?;
+        let model_path = safe_artifact_path(verified.root(), Path::new(&model_file), "onnx")?;
+        let tokenizer_path =
+            safe_artifact_path(verified.root(), Path::new(&tokenizer_file), "json")?;
         let tokenizer_bytes = fs::read(&tokenizer_path)
             .map_err(|e| EngineFailure::with_source(ErrorCode::ModelUnavailable, e))?;
         let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)
@@ -200,15 +94,16 @@ impl OnnxEmbeddingEngine {
         let session = Session::builder()
             .and_then(|b| b.commit_from_file(&model_path))
             .map_err(|e| private_error(ErrorCode::ModelUnavailable, "ONNX load", e))?;
-        validate_graph_contract(&manifest, &session)?;
+        validate_graph_contract(&contract, &session)?;
         let identity = ResolvedModelIdentity::new(
             manifest.canonical_id.clone(),
             manifest.revision.clone(),
             format!("{ENGINE_NAME}@{}", env!("CARGO_PKG_VERSION")),
-            artifact_fingerprint(&manifest_bytes, &model_bytes, &tokenizer_bytes),
+            verified.artifact_fingerprint(),
         )?;
         Ok(LoadedModel {
             manifest,
+            contract,
             tokenizer,
             session,
             identity,
@@ -309,8 +204,8 @@ impl EmbeddingEngine for OnnxEmbeddingEngine {
 impl LoadedModel {
     fn prefix_for(&self, task: EmbeddingTask) -> Option<&str> {
         match task {
-            EmbeddingTask::Query => self.manifest.prefixes.query.as_deref(),
-            EmbeddingTask::Document => self.manifest.prefixes.document.as_deref(),
+            EmbeddingTask::Query => Some(self.manifest.prefixes.query.as_str()),
+            EmbeddingTask::Document => Some(self.manifest.prefixes.document.as_str()),
         }
         .filter(|p| !p.is_empty())
     }
@@ -319,14 +214,14 @@ impl LoadedModel {
             .tokenizer
             .encode(text, true)
             .map_err(|e| private_error(ErrorCode::InvalidRequest, "tokenization", e))?;
-        if encoding.len() > self.manifest.max_tokens {
+        let max_tokens = usize::try_from(self.manifest.tokenizer.max_tokens)
+            .map_err(|error| EngineFailure::with_source(ErrorCode::Internal, error))?;
+        if encoding.len() > max_tokens {
             match truncation {
                 Truncation::Reject => return Err(EngineFailure::public(ErrorCode::InvalidRequest)),
-                Truncation::Truncate => encoding.truncate(
-                    self.manifest.max_tokens,
-                    0,
-                    tokenizers::TruncationDirection::Right,
-                ),
+                Truncation::Truncate => {
+                    encoding.truncate(max_tokens, 0, tokenizers::TruncationDirection::Right);
+                }
             }
         }
         Ok(encoding)
@@ -347,7 +242,7 @@ impl LoadedModel {
         let capacity = batch
             .checked_mul(sequence)
             .ok_or_else(|| EngineFailure::public(ErrorCode::InvalidRequest))?;
-        let mut ids = vec![i64::from(self.manifest.pad_token_id); capacity];
+        let mut ids = vec![i64::from(self.contract.pad_token_id); capacity];
         let mut masks = vec![0_i64; capacity];
         let mut types = vec![0_i64; capacity];
         for (row, encoding) in encodings.iter().enumerate() {
@@ -364,18 +259,18 @@ impl LoadedModel {
         let types = Tensor::from_array((shape, types)).map_err(inference_error)?;
         let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> = Vec::with_capacity(3);
         inputs.push((
-            Cow::Borrowed(self.manifest.inputs.input_ids.as_str()),
+            Cow::Borrowed(self.contract.inputs.input_ids.as_str()),
             ids.into(),
         ));
-        if let Some(name) = self.manifest.inputs.attention_mask.as_deref() {
+        if let Some(name) = self.contract.inputs.attention_mask.as_deref() {
             inputs.push((Cow::Borrowed(name), mask_tensor.into()));
         }
-        if let Some(name) = self.manifest.inputs.token_type_ids.as_deref() {
+        if let Some(name) = self.contract.inputs.token_type_ids.as_deref() {
             inputs.push((Cow::Borrowed(name), types.into()));
         }
         let outputs = self.session.run(inputs).map_err(inference_error)?;
         let output = outputs
-            .get(self.manifest.output.as_str())
+            .get(self.contract.output.as_str())
             .ok_or_else(|| EngineFailure::public(ErrorCode::InferenceFailed))?
             .try_extract_array::<f32>()
             .map_err(inference_error)?;
@@ -408,7 +303,7 @@ impl LoadedModel {
                 }
                 vector.truncate(d);
             }
-            if self.manifest.normalize {
+            if self.contract.normalize {
                 l2_normalize(vector)?;
             }
         }
@@ -423,33 +318,31 @@ fn apply_prefix<'a>(input: &'a str, prefix: Option<&str>) -> Cow<'a, str> {
         Some(p) => Cow::Owned(format!("{p}{input}")),
     }
 }
-fn validate_manifest(m: &ModelManifest) -> Result<(), EngineFailure> {
-    let fields = m.schema_version == 1
-        && !m.canonical_id.trim().is_empty()
-        && !m.revision.trim().is_empty()
-        && !m.inputs.input_ids.trim().is_empty()
-        && m.inputs
-            .attention_mask
-            .as_ref()
-            .is_none_or(|v| !v.trim().is_empty())
-        && m.inputs
-            .token_type_ids
-            .as_ref()
-            .is_none_or(|v| !v.trim().is_empty())
-        && !m.output.trim().is_empty()
-        && m.max_tokens > 0;
-    let dimensions = m
-        .matryoshka_dimensions
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if !fields || dimensions.len() != m.matryoshka_dimensions.len() || dimensions.contains(&0) {
-        return Err(EngineFailure::public(ErrorCode::InvalidRequest));
-    }
-    Ok(())
+fn onnx_contract(manifest: &Manifest) -> Result<(String, String, OnnxContract), EngineFailure> {
+    let RuntimeMetadata::Onnx {
+        model_file,
+        tokenizer_file,
+        inputs,
+        output,
+        pad_token_id,
+        normalize,
+    } = &manifest.runtime
+    else {
+        return Err(EngineFailure::public(ErrorCode::ModelUnavailable));
+    };
+    Ok((
+        model_file.clone(),
+        tokenizer_file.clone(),
+        OnnxContract {
+            inputs: inputs.clone(),
+            output: output.clone(),
+            pad_token_id: *pad_token_id,
+            normalize: *normalize,
+        },
+    ))
 }
 fn validate_graph_contract(
-    manifest: &ModelManifest,
+    contract: &OnnxContract,
     session: &Session,
 ) -> Result<(), EngineFailure> {
     let available_inputs = session
@@ -458,9 +351,9 @@ fn validate_graph_contract(
         .map(|input| input.name.as_str())
         .collect::<BTreeSet<_>>();
     let required_inputs = [
-        Some(manifest.inputs.input_ids.as_str()),
-        manifest.inputs.attention_mask.as_deref(),
-        manifest.inputs.token_type_ids.as_deref(),
+        Some(contract.inputs.input_ids.as_str()),
+        contract.inputs.attention_mask.as_deref(),
+        contract.inputs.token_type_ids.as_deref(),
     ];
     let has_inputs = required_inputs
         .into_iter()
@@ -469,14 +362,18 @@ fn validate_graph_contract(
     let has_output = session
         .outputs
         .iter()
-        .any(|output| output.name == manifest.output);
+        .any(|output| output.name == contract.output);
     if !has_inputs || !has_output {
         return Err(EngineFailure::public(ErrorCode::InvalidRequest));
     }
     Ok(())
 }
-fn validate_dimensions(m: &ModelManifest, requested: Option<usize>) -> Result<(), EngineFailure> {
-    if requested.is_some_and(|d| !m.matryoshka_dimensions.contains(&d)) {
+fn validate_dimensions(m: &Manifest, requested: Option<usize>) -> Result<(), EngineFailure> {
+    if requested.is_some_and(|dimension| {
+        !m.dimensions
+            .matryoshka
+            .contains(&u32::try_from(dimension).unwrap_or(u32::MAX))
+    }) {
         Err(EngineFailure::public(ErrorCode::InvalidRequest))
     } else {
         Ok(())
@@ -510,14 +407,6 @@ fn safe_artifact_path(
         return Err(EngineFailure::public(ErrorCode::InvalidRequest));
     }
     Ok(path)
-}
-fn artifact_fingerprint(manifest: &[u8], model: &[u8], tokenizer: &[u8]) -> String {
-    let mut hash = Sha256::new();
-    for bytes in [manifest, model, tokenizer] {
-        hash.update((bytes.len() as u64).to_le_bytes());
-        hash.update(bytes);
-    }
-    format!("sha256:{:x}", hash.finalize())
 }
 fn pool_tokens(
     output: &ndarray::ArrayViewD<'_, f32>,

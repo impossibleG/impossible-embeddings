@@ -53,6 +53,7 @@ fn fixture(url: String, bytes: &[u8], hash: Option<String>) -> Manifest {
             dtype: "bytes".into(),
             architecture: "identity".into(),
         },
+        runtime: impossible_models::RuntimeMetadata::CatalogOnly,
         artifacts: vec![Artifact {
             path: "weights/model.bin".into(),
             url,
