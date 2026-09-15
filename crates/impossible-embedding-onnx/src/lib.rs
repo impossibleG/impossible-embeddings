@@ -15,14 +15,7 @@ use ort::{
     value::Tensor,
     value::ValueType,
 };
-use std::{
-    borrow::Cow,
-    collections::BTreeSet,
-    error::Error,
-    fmt, fs,
-    path::{Path, PathBuf},
-    sync::Mutex,
-};
+use std::{borrow::Cow, collections::BTreeSet, error::Error, fmt, path::Path, sync::Mutex};
 use tokenizers::{Encoding, Tokenizer};
 
 /// Stable runtime name used in model identities.
@@ -118,14 +111,12 @@ impl OnnxEmbeddingEngine {
             .map_err(|e| EngineFailure::with_source(ErrorCode::ModelUnavailable, e))?;
         let manifest = verified.manifest().clone();
         let (model_file, tokenizer_file, contract) = onnx_contract(&manifest)?;
-        let model_path = safe_artifact_path(verified, &model_file, "onnx")?;
-        let tokenizer_path = safe_artifact_path(verified, &tokenizer_file, "json")?;
-        let tokenizer_bytes = fs::read(&tokenizer_path)
-            .map_err(|e| EngineFailure::with_source(ErrorCode::ModelUnavailable, e))?;
+        let model_bytes = safe_artifact_bytes(verified, &model_file, "onnx")?;
+        let tokenizer_bytes = safe_artifact_bytes(verified, &tokenizer_file, "json")?;
         let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)
             .map_err(|e| private_error(ErrorCode::ModelUnavailable, "tokenizer parse", e))?;
         let session = Session::builder()
-            .and_then(|b| b.commit_from_file(&model_path))
+            .and_then(|b| b.commit_from_memory(&model_bytes))
             .map_err(|e| private_error(ErrorCode::ModelUnavailable, "ONNX load", e))?;
         validate_graph_contract(&contract, &session, manifest.dimensions.native)?;
         verified
@@ -466,16 +457,16 @@ fn validate_dimensions(m: &Manifest, requested: Option<usize>) -> Result<(), Eng
         Ok(())
     }
 }
-fn safe_artifact_path(
+fn safe_artifact_bytes(
     verified: &VerifiedModel,
     relative: &str,
     extension: &str,
-) -> Result<PathBuf, EngineFailure> {
+) -> Result<Vec<u8>, EngineFailure> {
     if Path::new(relative).extension().and_then(|v| v.to_str()) != Some(extension) {
         return Err(EngineFailure::public(ErrorCode::InvalidRequest));
     }
     verified
-        .artifact_path(relative)
+        .artifact_bytes(relative)
         .map_err(|e| EngineFailure::with_source(ErrorCode::ModelUnavailable, e))
 }
 fn pool_tokens(

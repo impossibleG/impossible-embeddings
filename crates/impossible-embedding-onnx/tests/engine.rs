@@ -624,6 +624,29 @@ fn load_rehashes_verified_artifacts_and_loaded_engine_retains_delete_lease() -> 
 }
 
 #[test]
+fn substituted_then_restored_onnx_bytes_are_never_published() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source");
+    fs::create_dir(&source)?;
+    let manifest = write_fixture(&source)?;
+    let store = trusted_store(directory.path().join("cache"), &manifest)?;
+    store.import(&manifest, &source)?;
+    let verified = store.verified_model(&manifest)?;
+    let installed = store.layout().model_dir(&manifest)?.join("model.onnx");
+    let original = fs::read(&installed)?;
+    let replacement = vec![0xA5; original.len()];
+    fs::write(&installed, replacement)?;
+
+    let engine = OnnxEmbeddingEngine::new();
+    assert!(engine.load(&verified).is_err());
+    fs::write(&installed, original)?;
+    assert!(!engine.is_loaded());
+    engine.load(&verified)?;
+    assert!(engine.is_loaded());
+    Ok(())
+}
+
+#[test]
 fn errors_are_privacy_safe_and_artifacts_cannot_escape_manifest_root() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let source = directory.path().join("source");

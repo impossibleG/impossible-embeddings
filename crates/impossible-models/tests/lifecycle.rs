@@ -1,13 +1,15 @@
 //! End-to-end lifecycle tests using only loopback fixture servers and synthetic bytes.
 
 use std::{
+    fs::OpenOptions,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use fs2::FileExt;
 use impossible_models::{
     Artifact, CancelToken, Dimensions, DiscoveryRoot, InstallOptions, Installer, License, Manifest,
     ModelStatus, ModelStore, Pooling, Prefixes, SemanticTrustRoot, SemanticVerification,
@@ -505,6 +507,99 @@ fn delete_requires_exact_manifest_and_respects_runtime_lease() -> TestResult {
     ));
     drop(lease);
     assert!(store.delete(&manifest)?);
+    Ok(())
+}
+
+#[test]
+fn valid_import_is_idempotent_while_another_store_holds_a_runtime_lease() -> TestResult {
+    let cache = TempDir::new()?;
+    let source = TempDir::new()?;
+    let body = b"idempotent leased bytes";
+    let manifest = fixture("https://example.invalid/model".into(), body, None);
+    std::fs::create_dir_all(source.path().join("weights"))?;
+    std::fs::write(source.path().join("weights/model.bin"), body)?;
+    let first = trusted_store(cache.path(), &manifest)?;
+    let second = trusted_store(cache.path(), &manifest)?;
+    assert_eq!(
+        first.import(&manifest, source.path())?,
+        ModelStatus::Loadable
+    );
+    let lease = first.verified_model(&manifest)?;
+
+    let started = Instant::now();
+    assert_eq!(
+        second.import(&manifest, source.path())?,
+        ModelStatus::Loadable
+    );
+    assert!(started.elapsed() < Duration::from_millis(400));
+    drop(lease);
+    Ok(())
+}
+
+#[test]
+fn cross_handle_lock_contention_is_bounded_and_retryable() -> TestResult {
+    let cache = TempDir::new()?;
+    let source = TempDir::new()?;
+    let body = b"bounded lock bytes";
+    let manifest = fixture("https://example.invalid/model".into(), body, None);
+    std::fs::create_dir_all(source.path().join("weights"))?;
+    std::fs::write(source.path().join("weights/model.bin"), body)?;
+    let first = trusted_store(cache.path(), &manifest)?;
+    let second = trusted_store(cache.path(), &manifest)?;
+    first.import(&manifest, source.path())?;
+
+    let key = manifest
+        .semantic_fingerprint()?
+        .trim_start_matches("sha256:")
+        .to_owned();
+    let lock_path = cache.path().join("locks").join(format!("{key}.lock"));
+    let external = OpenOptions::new().read(true).write(true).open(lock_path)?;
+    external.lock_exclusive()?;
+    let started = Instant::now();
+    let Err(error) = second.verified_model(&manifest) else {
+        return Err("exclusive lock was unexpectedly acquired".into());
+    };
+    assert!(matches!(error, impossible_models::Error::Busy));
+    assert!(error.is_retryable());
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    FileExt::unlock(&external)?;
+    assert!(second.verified_model(&manifest).is_ok());
+    Ok(())
+}
+
+#[test]
+fn invalid_import_does_not_wait_forever_on_a_runtime_lease() -> TestResult {
+    let cache = TempDir::new()?;
+    let source = TempDir::new()?;
+    let body = b"lease contention bytes";
+    let manifest = fixture("https://example.invalid/model".into(), body, None);
+    std::fs::create_dir_all(source.path().join("weights"))?;
+    std::fs::write(source.path().join("weights/model.bin"), body)?;
+    let first = trusted_store(cache.path(), &manifest)?;
+    let second = trusted_store(cache.path(), &manifest)?;
+    first.import(&manifest, source.path())?;
+    let lease = first.verified_model(&manifest)?;
+    std::fs::write(
+        first
+            .layout()
+            .model_dir(&manifest)?
+            .join("weights/model.bin"),
+        b"changed while leased",
+    )?;
+
+    let started = Instant::now();
+    let Err(error) = second.import(&manifest, source.path()) else {
+        return Err("shared lease unexpectedly allowed repair".into());
+    };
+    assert!(matches!(error, impossible_models::Error::Busy));
+    assert!(error.is_retryable());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    drop(lease);
+    assert_eq!(
+        second.import(&manifest, source.path())?,
+        ModelStatus::Loadable
+    );
     Ok(())
 }
 

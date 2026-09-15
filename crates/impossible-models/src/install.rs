@@ -347,6 +347,7 @@ async fn acquire_lock(path: impl AsRef<Path>, cancel: &CancelToken) -> Result<fs
             "lock file cannot be a symlink or reparse point".into(),
         ));
     }
+    let deadline = tokio::time::Instant::now() + crate::store::LOCK_WAIT_LIMIT;
     loop {
         let file = match OpenOptions::new()
             .create(true)
@@ -360,6 +361,9 @@ async fn acquire_lock(path: impl AsRef<Path>, cancel: &CancelToken) -> Result<fs
                 if cancel.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::Busy);
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 continue;
             }
@@ -370,6 +374,9 @@ async fn acquire_lock(path: impl AsRef<Path>, cancel: &CancelToken) -> Result<fs
             Err(error) if is_lock_contention(&error) => {
                 if cancel.is_cancelled() {
                     return Err(Error::Cancelled);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::Busy);
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -424,6 +431,60 @@ mod tests {
                 "accepted {value}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn installer_lock_wait_is_bounded_and_retryable() -> Result<()> {
+        let temp = TempDir::new()?;
+        let locks = temp.path().join("locks");
+        fs::create_dir(&locks)?;
+        let path = locks.join("external.lock");
+        let external = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+        external.lock_exclusive()?;
+        let started = tokio::time::Instant::now();
+        let Err(error) = acquire_lock(&path, &CancelToken::new()).await else {
+            return Err(Error::Invalid("external lock unexpectedly acquired".into()));
+        };
+        assert!(matches!(error, Error::Busy));
+        assert!(error.is_retryable());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        FileExt::unlock(&external)?;
+        assert!(acquire_lock(&path, &CancelToken::new()).await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn installer_lock_wait_honors_cancellation_before_bound() -> Result<()> {
+        let temp = TempDir::new()?;
+        let locks = temp.path().join("locks");
+        fs::create_dir(&locks)?;
+        let path = locks.join("external.lock");
+        let external = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+        external.lock_exclusive()?;
+        let cancel = CancelToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            acquire_lock(&path, &cancel).await,
+            Err(Error::Cancelled)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(400));
+        FileExt::unlock(&external)?;
         Ok(())
     }
 }

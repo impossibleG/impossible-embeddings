@@ -50,6 +50,8 @@ pub enum Error {
     Offline,
     /// The exact model identity currently has one or more runtime leases.
     InUse,
+    /// A bounded wait for another model lifecycle operation expired.
+    Busy,
     /// A URL did not match an explicitly allowed HTTPS origin.
     OriginNotAllowed(String),
     /// A response exceeded an artifact's declared size or configured limit.
@@ -84,6 +86,7 @@ impl fmt::Debug for Error {
             Self::Cancelled => formatter.write_str("Cancelled"),
             Self::Offline => formatter.write_str("Offline"),
             Self::InUse => formatter.write_str("InUse"),
+            Self::Busy => formatter.write_str("Busy"),
             Self::OriginNotAllowed(_) => formatter
                 .debug_tuple("OriginNotAllowed")
                 .field(&"[REDACTED]")
@@ -112,6 +115,7 @@ impl fmt::Display for Error {
             Self::Cancelled => formatter.write_str("operation cancelled"),
             Self::Offline => formatter.write_str("network access is disabled in offline mode"),
             Self::InUse => formatter.write_str("model identity is currently in use"),
+            Self::Busy => formatter.write_str("model identity is busy; retry later"),
             Self::OriginNotAllowed(origin) => {
                 write!(formatter, "download origin is not allowed: {origin}")
             }
@@ -131,6 +135,14 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl Error {
+    /// Whether retrying the same operation later may succeed without changing its input.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self, Self::Busy | Self::InUse)
+    }
+}
 
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {

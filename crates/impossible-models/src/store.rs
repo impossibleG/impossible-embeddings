@@ -1,13 +1,14 @@
 use std::{
     collections::BTreeSet,
     fs::{self, OpenOptions},
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use fs2::FileExt;
@@ -19,6 +20,7 @@ use crate::{
 };
 
 const MANIFEST_FILE: &str = "manifest.json";
+pub(crate) const LOCK_WAIT_LIMIT: Duration = Duration::from_millis(500);
 static QUARANTINE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Independently supplied semantic-verification evidence.
@@ -211,6 +213,48 @@ impl VerifiedModel {
             ));
         }
         Ok(canonical)
+    }
+
+    /// Reads one declared artifact from a single, non-following handle and verifies those exact
+    /// bytes against the immutable manifest before returning them.
+    ///
+    /// The returned allocation is independent from the cache path. Replacing a path after this
+    /// method returns therefore cannot change the bytes consumed by a runtime adapter.
+    ///
+    /// # Errors
+    /// Returns an error if the artifact is undeclared, unsafe, replaced, or fails integrity.
+    pub fn artifact_bytes(&self, relative: &str) -> Result<Vec<u8>> {
+        let artifact = self
+            .manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == relative)
+            .ok_or_else(|| Error::Invalid("runtime requested an undeclared artifact".into()))?;
+        reject_reparse_components(&self.root, Path::new(relative))?;
+        let path = self.root.join(relative);
+        let mut options = OpenOptions::new();
+        options.read(true);
+        configure_no_follow(&mut options);
+        let mut file = options.open(&path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() != artifact.size {
+            return Err(Error::Invalid("artifact changed after verification".into()));
+        }
+        let capacity = usize::try_from(artifact.size)
+            .map_err(|_| Error::Invalid("artifact is too large for this platform".into()))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        file.read_to_end(&mut bytes)?;
+        if bytes.len() != capacity || format!("{:x}", Sha256::digest(&bytes)) != artifact.sha256 {
+            return Err(Error::Invalid("artifact changed after verification".into()));
+        }
+        reject_reparse_components(&self.root, Path::new(relative))?;
+        let canonical = fs::canonicalize(&path)?;
+        if !canonical.starts_with(fs::canonicalize(&self.root)?) {
+            return Err(Error::Invalid(
+                "artifact escaped verified model root".into(),
+            ));
+        }
+        Ok(bytes)
     }
 
     /// Rehashes the stored manifest and every artifact while the in-use lease is held.
@@ -455,6 +499,13 @@ impl ModelStore {
     /// Returns an error for unsafe paths, identity/integrity failures, or filesystem failures.
     pub fn import(&self, manifest: &Manifest, source: impl AsRef<Path>) -> Result<ModelStatus> {
         manifest.validate()?;
+        let existing = self.status(manifest)?;
+        if matches!(
+            existing,
+            ModelStatus::IntegrityVerified | ModelStatus::Loadable
+        ) {
+            return Ok(existing);
+        }
         let _lock = acquire_store_lock(&self.layout, manifest)?;
         let existing = self.status(manifest)?;
         if matches!(
@@ -635,6 +686,7 @@ fn acquire_store_lock(layout: &CacheLayout, manifest: &Manifest) -> Result<fs::F
     {
         return Err(Error::Invalid("model lock path cannot be a symlink".into()));
     }
+    let deadline = Instant::now() + LOCK_WAIT_LIMIT;
     loop {
         match OpenOptions::new()
             .create(true)
@@ -650,6 +702,9 @@ fn acquire_store_lock(layout: &CacheLayout, manifest: &Manifest) -> Result<fs::F
             },
             Err(error) if is_lock_contention(&error) => {}
             Err(error) => return Err(error.into()),
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Busy);
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -678,8 +733,17 @@ fn acquire_shared_store_lock(layout: &CacheLayout, manifest: &Manifest) -> Resul
         .write(true)
         .truncate(false)
         .open(path)?;
-    FileExt::lock_shared(&file)?;
-    Ok(file)
+    let deadline = Instant::now() + LOCK_WAIT_LIMIT;
+    loop {
+        match FileExt::try_lock_shared(&file) {
+            Ok(()) => return Ok(file),
+            Err(error) if is_lock_contention(&error) && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) if is_lock_contention(&error) => return Err(Error::Busy),
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn acquire_delete_lock(layout: &CacheLayout, manifest: &Manifest) -> Result<fs::File> {
@@ -714,6 +778,20 @@ fn acquire_delete_lock(layout: &CacheLayout, manifest: &Manifest) -> Result<fs::
 
 fn is_lock_contention(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(33)
+}
+
+fn configure_no_follow(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
 }
 
 pub(crate) fn prepare_staging(layout: &CacheLayout, staging: &Path) -> Result<()> {
