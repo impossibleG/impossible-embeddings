@@ -797,8 +797,10 @@ name = "impossible-server-core"
 version = "0.1.0"
 dependencies = [
  "impossible-embedding-core",
+ "libc",
  "toml",
  "url",
+ "zeroize",
 ]
 
 [[package]]

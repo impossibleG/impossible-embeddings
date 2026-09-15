@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/impossible-g/impossible-embedding"
+repository = "https://github.com/impossibleG/impossible-embedding"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
@@ -22,6 +22,7 @@ prost = "=0.14.4"
 tonic = { version = "=0.14.2", default-features = false, features = ["codegen"] }
 tonic-build = "=0.14.2"
 tonic-prost = "=0.14.2"
+zeroize = "=1.9.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

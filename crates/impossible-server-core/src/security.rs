@@ -1,11 +1,20 @@
 //! Credential loading and request-origin primitives.
 
-use std::{env, fmt, fs, path::Path};
+use std::{
+    env, fmt,
+    fs::{File, OpenOptions},
+    io::Read,
+    path::Path,
+};
+
+use zeroize::Zeroizing;
 
 use crate::config::CredentialSource;
 
 /// Owned secret bytes. Debug and Display never expose the value; memory is wiped on drop.
-pub struct Secret(Vec<u8>);
+pub struct Secret(Zeroizing<Vec<u8>>);
+
+const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
 
 impl Secret {
     /// Construct a non-empty secret.
@@ -14,8 +23,8 @@ impl Secret {
     ///
     /// Returns [`CredentialError::Invalid`] for empty or unreasonably large values.
     pub fn new(value: impl Into<Vec<u8>>) -> Result<Self, CredentialError> {
-        let value = value.into();
-        if value.is_empty() || value.len() > 16 * 1024 {
+        let value = Zeroizing::new(value.into());
+        if value.is_empty() || value.len() > MAX_CREDENTIAL_BYTES {
             return Err(CredentialError::Invalid);
         }
         Ok(Self(value))
@@ -34,11 +43,7 @@ impl fmt::Debug for Secret {
     }
 }
 
-impl Drop for Secret {
-    fn drop(&mut self) {
-        self.0.fill(0);
-    }
-}
+impl zeroize::ZeroizeOnDrop for Secret {}
 
 /// Sanitized credential-loading failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,23 +71,116 @@ impl std::error::Error for CredentialError {}
 ///
 /// Returns a sanitized error when the source is missing, unreadable, empty, or too large.
 pub fn load_credential(source: &CredentialSource) -> Result<Secret, CredentialError> {
-    let bytes = match source {
-        CredentialSource::Environment(name) => env::var_os(name)
-            .map(|value| value.to_string_lossy().into_owned().into_bytes())
-            .ok_or(CredentialError::Unavailable)?,
+    let mut bytes = match source {
+        CredentialSource::Environment(name) => Zeroizing::new(
+            env::var_os(name)
+                .map(|value| value.to_string_lossy().into_owned().into_bytes())
+                .ok_or(CredentialError::Unavailable)?,
+        ),
         CredentialSource::File(path) => read_secret_file(path)?,
     };
-    let trimmed = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
-    let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
-    Secret::new(trimmed.to_vec())
-}
-
-fn read_secret_file(path: &Path) -> Result<Vec<u8>, CredentialError> {
-    let metadata = fs::metadata(path).map_err(|_| CredentialError::Unavailable)?;
-    if !metadata.is_file() || metadata.len() > 16 * 1024 {
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    if bytes.is_empty() || bytes.len() > MAX_CREDENTIAL_BYTES {
         return Err(CredentialError::Invalid);
     }
-    fs::read(path).map_err(|_| CredentialError::Unavailable)
+    Ok(Secret(bytes))
+}
+
+fn read_secret_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, CredentialError> {
+    let file = open_secret_file(path)?;
+    read_secret_handle(file)
+}
+
+fn open_secret_file(path: &Path) -> Result<File, CredentialError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_no_follow(&mut options);
+    options.open(path).map_err(map_open_error)
+}
+
+#[cfg(unix)]
+fn configure_no_follow(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+}
+
+#[cfg(windows)]
+fn configure_no_follow(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // Open the reparse point itself so its handle metadata can be rejected instead of following it.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_no_follow(_options: &mut OpenOptions) {}
+
+fn map_open_error(_error: std::io::Error) -> CredentialError {
+    #[cfg(unix)]
+    if _error.raw_os_error() == Some(libc::ELOOP) {
+        return CredentialError::Invalid;
+    }
+    CredentialError::Unavailable
+}
+
+fn read_secret_handle(file: File) -> Result<Zeroizing<Vec<u8>>, CredentialError> {
+    read_secret_handle_with_hook(file, || {})
+}
+
+fn read_secret_handle_with_hook(
+    mut file: File,
+    after_metadata: impl FnOnce(),
+) -> Result<Zeroizing<Vec<u8>>, CredentialError> {
+    let initial = file.metadata().map_err(|_| CredentialError::Unavailable)?;
+    if !is_safe_regular_file(&initial) || initial.len() > MAX_CREDENTIAL_BYTES as u64 {
+        return Err(CredentialError::Invalid);
+    }
+    let initial_len = usize::try_from(initial.len()).map_err(|_| CredentialError::Invalid)?;
+
+    after_metadata();
+
+    // Take one extra byte so a growing file cannot silently bypass the hard limit.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(initial_len));
+    file.by_ref()
+        .take(MAX_CREDENTIAL_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| CredentialError::Unavailable)?;
+
+    let final_metadata = file.metadata().map_err(|_| CredentialError::Unavailable)?;
+    if !is_safe_regular_file(&final_metadata)
+        || bytes.len() > MAX_CREDENTIAL_BYTES
+        || final_metadata.len() != initial.len()
+        || final_metadata.len() != bytes.len() as u64
+    {
+        return Err(CredentialError::Invalid);
+    }
+    Ok(bytes)
+}
+
+fn is_safe_regular_file(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn constant_time_eq(expected: &[u8], candidate: &[u8]) -> bool {
@@ -154,10 +252,31 @@ pub fn verify_distinct_credentials(public: &Secret, admin: &Secret) -> Result<()
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::{
+        fs::{self, OpenOptions},
+        io::Write,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
     use super::*;
+
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn fixture_dir() -> std::path::PathBuf {
+        let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "impossible-credential-test-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create fixture directory");
+        path
+    }
 
     #[test]
     fn bearer_is_exact_and_debug_is_redacted() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+        assert_zeroize_on_drop::<Secret>();
         let secret = Secret::new(b"sentinel-secret-value".to_vec()).expect("secret");
         assert!(verify_bearer(Some("Bearer sentinel-secret-value"), &secret));
         assert!(!verify_bearer(
@@ -173,6 +292,106 @@ mod tests {
             &secret
         ));
         assert!(!format!("{secret:?}").contains("sentinel-secret-value"));
+    }
+
+    #[test]
+    fn credential_file_enforces_exact_size_cap() {
+        let directory = fixture_dir();
+        let maximum = directory.join("maximum");
+        let oversized = directory.join("oversized");
+        fs::write(&maximum, vec![b'x'; MAX_CREDENTIAL_BYTES]).expect("write maximum fixture");
+        fs::write(&oversized, vec![b'x'; MAX_CREDENTIAL_BYTES + 1])
+            .expect("write oversized fixture");
+
+        let secret = load_credential(&CredentialSource::File(maximum)).expect("maximum accepted");
+        assert!(secret.verify(&vec![b'x'; MAX_CREDENTIAL_BYTES]));
+        assert!(matches!(
+            load_credential(&CredentialSource::File(oversized)),
+            Err(CredentialError::Invalid)
+        ));
+
+        fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn credential_read_is_bound_to_the_open_handle() {
+        let directory = fixture_dir();
+        let configured = directory.join("credential");
+        let moved = directory.join("original");
+        fs::write(&configured, b"first-value").expect("write original fixture");
+
+        let file = open_secret_file(&configured).expect("open original fixture");
+        fs::rename(&configured, &moved).expect("move original fixture");
+        fs::write(&configured, b"replacement").expect("write replacement fixture");
+
+        let bytes = read_secret_handle(file).expect("read opened handle");
+        assert_eq!(bytes.as_slice(), b"first-value");
+
+        fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn credential_read_rejects_growth_after_metadata_check() {
+        let directory = fixture_dir();
+        let path = directory.join("credential");
+        fs::write(&path, b"value").expect("write fixture");
+        let file = open_secret_file(&path).expect("open fixture");
+
+        let result = read_secret_handle_with_hook(file, || {
+            let mut writer = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open fixture for append");
+            writer.write_all(b"x").expect("grow fixture");
+        });
+        assert_eq!(result, Err(CredentialError::Invalid));
+
+        fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn credential_file_must_be_regular() {
+        let directory = fixture_dir();
+        assert!(matches!(
+            load_credential(&CredentialSource::File(directory.clone())),
+            Err(CredentialError::Invalid)
+        ));
+        fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = fixture_dir();
+        let target = directory.join("target");
+        let link = directory.join("link");
+        fs::write(&target, b"value").expect("write fixture");
+        symlink(&target, &link).expect("create symlink fixture");
+        assert!(matches!(
+            load_credential(&CredentialSource::File(link)),
+            Err(CredentialError::Invalid)
+        ));
+        fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_file_rejects_reparse_symlinks_when_supported() {
+        use std::os::windows::fs::symlink_file;
+
+        let directory = fixture_dir();
+        let target = directory.join("target");
+        let link = directory.join("link");
+        fs::write(&target, b"value").expect("write fixture");
+        if symlink_file(&target, &link).is_ok() {
+            assert!(matches!(
+                load_credential(&CredentialSource::File(link)),
+                Err(CredentialError::Invalid)
+            ));
+        }
+        fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 
     #[test]
