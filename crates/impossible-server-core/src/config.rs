@@ -139,6 +139,7 @@ pub enum ConfigKey {
 
 impl ConfigKey {
     /// Return the stable, non-sensitive public name for this field.
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Bind => "bind",
@@ -249,6 +250,7 @@ impl ConfigSource {
 
 impl ConfigError {
     /// Return stable, non-sensitive diagnostic metadata for structured logging.
+    #[must_use]
     pub const fn diagnostic(&self) -> ConfigDiagnostic {
         match self {
             Self::UnknownKey { source } => ConfigDiagnostic {
