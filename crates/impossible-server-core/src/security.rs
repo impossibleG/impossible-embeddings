@@ -107,7 +107,11 @@ fn open_secret_file(path: &Path) -> Result<File, CredentialError> {
 fn configure_no_follow(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
 
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    // Opening a FIFO read-only normally waits indefinitely for a writer. Open every
+    // candidate non-blocking so handle metadata can reject FIFOs and other special
+    // files without letting a configured credential path stall startup. O_NONBLOCK
+    // does not change reads from regular files.
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
 }
 
 #[cfg(windows)]
@@ -373,6 +377,54 @@ mod tests {
             load_credential(&CredentialSource::File(link)),
             Err(CredentialError::Invalid)
         ));
+        fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_rejects_fifo_without_waiting_for_a_writer() {
+        use std::{process::Command, sync::mpsc, time::Duration};
+
+        let directory = fixture_dir();
+        let fifo = directory.join("credential-fifo");
+        let status = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "create FIFO fixture");
+
+        let (sender, receiver) = mpsc::channel();
+        let credential_path = fifo.clone();
+        std::thread::spawn(move || {
+            let result = load_credential(&CredentialSource::File(credential_path));
+            let _ = sender.send(result);
+        });
+
+        let result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("FIFO credential validation must not wait for a writer");
+        assert!(matches!(result, Err(CredentialError::Invalid)));
+
+        fs::remove_file(fifo).expect("remove FIFO fixture");
+        fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_rejects_unix_socket_promptly() {
+        use std::{os::unix::net::UnixListener, time::Instant};
+
+        let directory = fixture_dir();
+        let socket = directory.join("credential-socket");
+        let _listener = UnixListener::bind(&socket).expect("create socket fixture");
+        let started = Instant::now();
+
+        assert!(load_credential(&CredentialSource::File(socket)).is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "socket credential validation must return promptly"
+        );
+
         fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 
