@@ -1,0 +1,14 @@
+[package]
+name = "impossible-server"
+description = "Impossible Embedding server assembly"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+impossible-server-core = { path = "../impossible-server-core" }
+
+[lints]
+workspace = true

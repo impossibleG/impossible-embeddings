@@ -1,0 +1,14 @@
+/target/
+/.idea/
+/.vscode/
+*.onnx
+*.ort
+*.dll
+*.dylib
+*.so
+*.log
+.env
+.env.*
+!.env.example
+/models/
+/data/

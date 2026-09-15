@@ -1,0 +1,20 @@
+[package]
+name = "impossible-embedding-onnx"
+description = "ONNX Runtime adapter feasibility boundary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+impossible-embedding-core = { path = "../impossible-embedding-core" }
+
+[dev-dependencies]
+anyhow.workspace = true
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["download-binaries", "ndarray", "std"] }
+prost.workspace = true
+tempfile = "3.23.0"
+
+[lints]
+workspace = true

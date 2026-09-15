@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package impossible.embedding.v1;
+
+// Minimal domain contract used to validate reproducible code generation.
+service EmbeddingService {
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
+}
+
+message EmbedRequest {
+  string model = 1;
+  repeated string input = 2;
+}
+
+message EmbedResponse {
+  repeated DenseVector embeddings = 1;
+}
+
+message DenseVector {
+  repeated float values = 1;
+}

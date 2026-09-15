@@ -1,0 +1,21 @@
+[package]
+name = "impossible-protocol"
+description = "Generated transport contracts for Impossible Embedding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14.2"
+
+[lints]
+workspace = true
