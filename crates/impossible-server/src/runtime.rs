@@ -147,6 +147,8 @@ impl BatchPolicy {
 pub enum LifecycleError {
     /// Runtime bounds were invalid.
     InvalidPolicy,
+    /// Dedicated runtime workers could not be initialized.
+    InitializationFailed,
     /// The service no longer accepts lifecycle operations.
     ShuttingDown,
     /// The requested model is not registered.
@@ -167,6 +169,7 @@ impl fmt::Display for LifecycleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidPolicy => "runtime policy is invalid",
+            Self::InitializationFailed => "runtime initialization failed",
             Self::ShuttingDown => "the service is shutting down",
             Self::NotFound => "the model is not registered",
             Self::AlreadyLoaded => "the model is already loaded",
@@ -188,34 +191,50 @@ struct BlockingPool {
 }
 
 impl BlockingPool {
-    fn new(size: usize, queue_depth: usize) -> Self {
+    fn new(size: usize, queue_depth: usize) -> Result<Self, LifecycleError> {
+        Self::new_with_spawner(size, queue_depth, |index, receiver| {
+            thread::Builder::new()
+                .name(format!("impossible-inference-{index}"))
+                .spawn(move || run_blocking_worker(&receiver))
+                .map(|_| ())
+        })
+    }
+
+    fn new_with_spawner<F>(
+        size: usize,
+        queue_depth: usize,
+        mut spawn_worker: F,
+    ) -> Result<Self, LifecycleError>
+    where
+        F: FnMut(usize, Arc<Mutex<std::sync::mpsc::Receiver<BlockingJob>>>) -> std::io::Result<()>,
+    {
         let (sender, receiver) = sync_channel::<BlockingJob>(queue_depth);
         let receiver = Arc::new(Mutex::new(receiver));
         for index in 0..size {
-            let receiver = Arc::clone(&receiver);
-            let _ = thread::Builder::new()
-                .name(format!("impossible-inference-{index}"))
-                .spawn(move || {
-                    loop {
-                        let job = receiver.lock().ok().and_then(|guard| guard.recv().ok());
-                        match job {
-                            Some(job) => {
-                                // A defective native adapter must fail its own job, never remove a
-                                // worker and silently reduce service capacity.
-                                let _ = catch_unwind(AssertUnwindSafe(job));
-                            }
-                            None => break,
-                        }
-                    }
-                });
+            spawn_worker(index, Arc::clone(&receiver))
+                .map_err(|_| LifecycleError::InitializationFailed)?;
         }
-        Self { sender }
+        Ok(Self { sender })
     }
 
     fn try_execute(&self, job: BlockingJob) -> Result<(), BlockingJob> {
         self.sender.try_send(job).map_err(|error| match error {
             TrySendError::Full(job) | TrySendError::Disconnected(job) => job,
         })
+    }
+}
+
+fn run_blocking_worker(receiver: &Mutex<std::sync::mpsc::Receiver<BlockingJob>>) {
+    loop {
+        let job = receiver.lock().ok().and_then(|guard| guard.recv().ok());
+        match job {
+            Some(job) => {
+                // A defective native adapter must fail its own job, never remove a worker and
+                // silently reduce service capacity.
+                let _ = catch_unwind(AssertUnwindSafe(job));
+            }
+            None => break,
+        }
     }
 }
 
@@ -314,6 +333,7 @@ struct Inner {
 
 struct ShutdownFlight {
     completion: watch::Receiver<Option<bool>>,
+    deadline: watch::Sender<Option<Instant>>,
     _task: JoinHandle<()>,
 }
 
@@ -501,7 +521,7 @@ impl ApplicationRuntime {
             installs: Arc::new(Mutex::new(HashMap::new())),
             health,
             shutdown: ShutdownCoordinator::default(),
-            pool: BlockingPool::new(policy.blocking_concurrency, policy.queue_depth),
+            pool: BlockingPool::new(policy.blocking_concurrency, policy.queue_depth)?,
             next_key: AtomicUsize::new(1),
             draining: AtomicBool::new(false),
             admin: Mutex::new(()),
@@ -1088,6 +1108,13 @@ impl ApplicationRuntime {
 
     /// Reject new work, allow accepted work to drain, then cancel and discard remaining work.
     pub async fn shutdown(&self, timeout: Duration) -> bool {
+        // An async function may be created under Tokio and first polled elsewhere. Resolve the
+        // executor before acquiring lifecycle locks or publishing Draining so that unsupported
+        // polling contexts fail atomically instead of panicking in `spawn`.
+        let Ok(executor) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        let requested_deadline = Instant::now().checked_add(timeout);
         let mut completion = {
             let Ok(admin) = self.0.admin.lock() else {
                 return false;
@@ -1096,6 +1123,19 @@ impl ApplicationRuntime {
                 return false;
             };
             if let Some(existing) = flight.as_ref() {
+                existing.deadline.send_if_modified(|current| {
+                    let tightened = match (*current, requested_deadline) {
+                        (None, Some(requested)) => Some(requested),
+                        (Some(current), Some(requested)) => Some(current.min(requested)),
+                        (current, None) => current,
+                    };
+                    if tightened == *current {
+                        false
+                    } else {
+                        *current = tightened;
+                        true
+                    }
+                });
                 existing.completion.clone()
             } else {
                 self.0.draining.store(true, Ordering::Release);
@@ -1105,13 +1145,15 @@ impl ApplicationRuntime {
                     .transition(LifecycleState::Draining, Some(ReadinessReason::Draining));
                 self.0.shutdown.begin();
                 let (finished, completion) = watch::channel(None);
+                let (deadline, deadline_updates) = watch::channel(requested_deadline);
                 let runtime = self.clone();
-                let task = tokio::spawn(async move {
-                    let result = runtime.finish_shutdown(timeout).await;
+                let task = executor.spawn(async move {
+                    let result = runtime.finish_shutdown(deadline_updates).await;
                     let _ = finished.send(Some(result));
                 });
                 *flight = Some(ShutdownFlight {
                     completion: completion.clone(),
+                    deadline,
                     _task: task,
                 });
                 drop(admin);
@@ -1132,13 +1174,26 @@ impl ApplicationRuntime {
         }
     }
 
-    async fn finish_shutdown(&self, timeout: Duration) -> bool {
-        let started = Instant::now();
-        while started.elapsed() < timeout {
+    async fn finish_shutdown(&self, mut deadline: watch::Receiver<Option<Instant>>) -> bool {
+        loop {
             if self.0.shutdown.wait(Duration::ZERO) {
                 break;
             }
-            tokio::task::yield_now().await;
+            if deadline
+                .borrow()
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                break;
+            }
+            tokio::select! {
+                biased;
+                changed = deadline.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                () = tokio::task::yield_now() => {}
+            }
         }
         let drained = self.0.shutdown.wait(Duration::ZERO);
         if let Ok(models) = self.0.models.read() {
@@ -1189,6 +1244,7 @@ impl ApplicationRuntime {
                 tokio::task::yield_now().await;
             }
         }
+        self.0.health.clear_models();
         let _ = self
             .0
             .health
@@ -1498,6 +1554,13 @@ mod tests {
     use impossible_embedding_core::EmbeddingTask;
     use impossible_models::curated_manifests;
     use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
 
     struct FakeEngine {
         calls: AtomicUsize,
@@ -1674,6 +1737,41 @@ mod tests {
             ApplicationRuntime::new(invalid),
             Err(LifecycleError::InvalidPolicy)
         ));
+    }
+
+    #[test]
+    fn blocking_pool_propagates_worker_spawn_failure() {
+        let result = BlockingPool::new_with_spawner(1, 1, |_index, _receiver| {
+            Err(std::io::Error::other("deliberate test failure"))
+        });
+
+        assert!(matches!(result, Err(LifecycleError::InitializationFailed)));
+    }
+
+    #[tokio::test]
+    async fn polling_shutdown_without_tokio_fails_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let outside_runtime = runtime.clone();
+        let polling = thread::spawn(move || {
+            catch_unwind(AssertUnwindSafe(|| {
+                let mut shutdown = Box::pin(outside_runtime.shutdown(Duration::ZERO));
+                let waker = Waker::from(Arc::new(NoopWake));
+                let mut context = Context::from_waker(&waker);
+                Future::poll(shutdown.as_mut(), &mut context)
+            }))
+        })
+        .join()
+        .map_err(|_| "polling thread panicked")?;
+        let poll = polling.map_err(|_| "shutdown panicked outside Tokio")?;
+
+        assert!(matches!(poll, Poll::Ready(false)));
+        assert!(!runtime.snapshot().draining);
+        assert!(runtime.health().is_live());
+        assert_eq!(runtime.health().model_counts(), (0, 0));
+        assert!(runtime.shutdown(Duration::ZERO).await);
+        assert!(!runtime.health().is_live());
+        Ok(())
     }
 
     #[test]
@@ -2430,6 +2528,50 @@ mod tests {
             runtime.register_engine("other", Arc::new(FakeEngine::new(Duration::ZERO))),
             Err(LifecycleError::ShuttingDown)
         );
+        assert_eq!(runtime.health().model_counts(), (0, 0));
+        assert_eq!(runtime.snapshot().ready_models, 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn later_shutdown_caller_tightens_the_shared_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        runtime.register_engine("fake", Arc::new(FakeEngine::new(Duration::ZERO)))?;
+        let permit = runtime
+            .0
+            .shutdown
+            .admit()
+            .ok_or("test work was not admitted")?;
+        let mut forced = runtime.0.force_stop.subscribe();
+
+        let long_runtime = runtime.clone();
+        let long = tokio::spawn(async move { long_runtime.shutdown(Duration::from_secs(5)).await });
+        while !runtime.snapshot().draining {
+            tokio::task::yield_now().await;
+        }
+        let zero_runtime = runtime.clone();
+        let zero = tokio::spawn(async move { zero_runtime.shutdown(Duration::ZERO).await });
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while !*forced.borrow() {
+                if forced.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await?;
+        assert!(*forced.borrow());
+        drop(permit);
+
+        let (long_result, zero_result) = tokio::time::timeout(Duration::from_millis(250), async {
+            tokio::join!(long, zero)
+        })
+        .await?;
+        assert!(!long_result?);
+        assert!(!zero_result?);
+        assert_eq!(runtime.health().model_counts(), (0, 0));
+        assert_eq!(runtime.snapshot().ready_models, 0);
         Ok(())
     }
 

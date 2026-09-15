@@ -161,6 +161,15 @@ impl HealthRegistry {
             .is_some()
     }
 
+    /// Remove every model entry when the process reaches its terminal state.
+    ///
+    /// Shutdown must not leave a stale ready-model count on health or status surfaces.
+    pub fn clear_models(&self) {
+        if let Ok(mut state) = self.0.write() {
+            state.models.clear();
+        }
+    }
+
     /// Register model artifact readiness from the canonical verification status.
     ///
     /// A loadable identity becomes [`ModelState::Loading`]; only the runtime adapter may promote
@@ -255,6 +264,18 @@ mod tests {
         assert!(health.transition(LifecycleState::Stopped, Some(ReadinessReason::Stopped)));
         assert!(!health.is_live());
         assert!(!health.transition(LifecycleState::Starting, None));
+    }
+
+    #[test]
+    fn clearing_models_removes_all_ready_state() {
+        let health = HealthRegistry::default();
+        health.set_model(ModelKey(1), ModelState::Ready);
+        health.set_model(ModelKey(2), ModelState::Loading);
+        assert_eq!(health.model_counts(), (1, 2));
+
+        health.clear_models();
+
+        assert_eq!(health.model_counts(), (0, 0));
     }
 
     #[test]
