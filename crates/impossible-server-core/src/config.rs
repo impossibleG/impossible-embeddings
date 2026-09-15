@@ -111,20 +111,97 @@ impl Default for ServerConfig {
     }
 }
 
-/// Configuration failure that never includes credential values or file contents.
+/// A closed identifier for a supported configuration field.
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConfigKey {
+    Bind,
+    AllowInsecureRemote,
+    AuthEnv,
+    AuthTokenPresent,
+    AuthFile,
+    AdminAuthEnv,
+    AdminAuthTokenPresent,
+    AdminAuthFile,
+    AllowedOrigins,
+    ModelDirectories,
+    MaxBodyBytes,
+    MaxItems,
+    MaxTokens,
+    MaxQueueDepth,
+    MaxBatchItems,
+    MaxConcurrency,
+    RequestTimeout,
+    ShutdownTimeout,
+    Toml,
+    Path,
+}
+
+impl ConfigKey {
+    /// Return the stable, non-sensitive public name for this field.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bind => "bind",
+            Self::AllowInsecureRemote => "allow_insecure_remote",
+            Self::AuthEnv => "auth_env",
+            Self::AuthTokenPresent => "auth_token_present",
+            Self::AuthFile => "auth_file",
+            Self::AdminAuthEnv => "admin_auth_env",
+            Self::AdminAuthTokenPresent => "admin_auth_token_present",
+            Self::AdminAuthFile => "admin_auth_file",
+            Self::AllowedOrigins => "allowed_origins",
+            Self::ModelDirectories => "model_directories",
+            Self::MaxBodyBytes => "limits.max_body_bytes",
+            Self::MaxItems => "limits.max_items",
+            Self::MaxTokens => "limits.max_tokens",
+            Self::MaxQueueDepth => "limits.max_queue_depth",
+            Self::MaxBatchItems => "limits.max_batch_items",
+            Self::MaxConcurrency => "limits.max_concurrency",
+            Self::RequestTimeout => "limits.request_timeout_ms",
+            Self::ShutdownTimeout => "limits.shutdown_timeout_ms",
+            Self::Toml => "toml",
+            Self::Path => "path",
+        }
+    }
+}
+
+/// Configuration input category, deliberately excluding attacker-controlled names.
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigSource {
+    Toml,
+    Environment,
+    CommandLine,
+    Validation,
+}
+
+/// Stable diagnostic metadata available only through an explicit call.
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfigDiagnostic {
+    pub code: &'static str,
+    pub source: ConfigSource,
+    pub key: Option<ConfigKey>,
+    pub reason: Option<&'static str>,
+}
+
+/// Configuration failure that never retains credential values, paths, or arbitrary field names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigError {
     /// An option or TOML key is not supported.
-    UnknownKey(String),
+    UnknownKey {
+        /// Input category containing the unsupported name.
+        source: ConfigSource,
+    },
     /// A known option has an invalid value.
     InvalidValue {
         /// Public option or key name.
-        key: String,
+        key: ConfigKey,
         /// Stable explanation that excludes the rejected value.
         reason: &'static str,
     },
     /// A CLI option requires a following value.
-    MissingValue(String),
+    MissingValue(ConfigKey),
     /// A positional argument was supplied where only an option is valid.
     UnexpectedArgument,
     /// A configuration file could not be accessed.
@@ -138,9 +215,13 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownKey(key) => write!(f, "unknown configuration key: {key}"),
-            Self::InvalidValue { key, reason } => write!(f, "invalid value for {key}: {reason}"),
-            Self::MissingValue(key) => write!(f, "missing value for {key}"),
+            Self::UnknownKey { source } => {
+                write!(f, "unknown configuration key in {}", source.as_str())
+            }
+            Self::InvalidValue { key, reason } => {
+                write!(f, "invalid value for {}: {reason}", key.as_str())
+            }
+            Self::MissingValue(key) => write!(f, "missing value for {}", key.as_str()),
             Self::UnexpectedArgument => f.write_str("unexpected positional argument"),
             Self::ConfigFileUnavailable => f.write_str("configuration file is unavailable"),
             Self::UnsafeRemoteBind => f.write_str(
@@ -155,17 +236,80 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+impl ConfigSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Toml => "TOML",
+            Self::Environment => "environment",
+            Self::CommandLine => "command line",
+            Self::Validation => "validation",
+        }
+    }
+}
+
+impl ConfigError {
+    /// Return stable, non-sensitive diagnostic metadata for structured logging.
+    pub const fn diagnostic(&self) -> ConfigDiagnostic {
+        match self {
+            Self::UnknownKey { source } => ConfigDiagnostic {
+                code: "config_unknown_key",
+                source: *source,
+                key: None,
+                reason: None,
+            },
+            Self::InvalidValue { key, reason } => ConfigDiagnostic {
+                code: "config_invalid_value",
+                source: ConfigSource::Validation,
+                key: Some(*key),
+                reason: Some(reason),
+            },
+            Self::MissingValue(key) => ConfigDiagnostic {
+                code: "config_missing_value",
+                source: ConfigSource::CommandLine,
+                key: Some(*key),
+                reason: None,
+            },
+            Self::UnexpectedArgument => ConfigDiagnostic {
+                code: "config_unexpected_argument",
+                source: ConfigSource::CommandLine,
+                key: None,
+                reason: None,
+            },
+            Self::ConfigFileUnavailable => ConfigDiagnostic {
+                code: "config_file_unavailable",
+                source: ConfigSource::Toml,
+                key: None,
+                reason: None,
+            },
+            Self::UnsafeRemoteBind => ConfigDiagnostic {
+                code: "config_unsafe_remote_bind",
+                source: ConfigSource::Validation,
+                key: Some(ConfigKey::Bind),
+                reason: None,
+            },
+            Self::InvalidAdminCredentialPolicy => ConfigDiagnostic {
+                code: "config_invalid_admin_credential_policy",
+                source: ConfigSource::Validation,
+                key: Some(ConfigKey::AdminAuthEnv),
+                reason: None,
+            },
+        }
+    }
+}
+
 #[derive(Default)]
-struct Patch(BTreeMap<String, String>);
+struct Patch(BTreeMap<ConfigKey, PatchValue>);
+
+enum PatchValue {
+    Scalar(String),
+    List(Vec<String>),
+}
 
 impl Patch {
-    fn set(&mut self, key: &str, value: String) -> Result<(), ConfigError> {
-        if !KNOWN_KEYS.contains(&key) {
-            return Err(ConfigError::UnknownKey(key.to_owned()));
-        }
-        if self.0.insert(key.to_owned(), value).is_some() {
+    fn set(&mut self, key: ConfigKey, value: PatchValue) -> Result<(), ConfigError> {
+        if self.0.insert(key, value).is_some() {
             return Err(ConfigError::InvalidValue {
-                key: key.to_owned(),
+                key,
                 reason: "duplicate key in one configuration source",
             });
         }
@@ -174,52 +318,35 @@ impl Patch {
 
     fn apply(self, target: &mut ServerConfig) -> Result<(), ConfigError> {
         for alternatives in [
-            ["auth_env", "auth_file", "auth_token_present"],
             [
-                "admin_auth_env",
-                "admin_auth_file",
-                "admin_auth_token_present",
+                ConfigKey::AuthEnv,
+                ConfigKey::AuthFile,
+                ConfigKey::AuthTokenPresent,
+            ],
+            [
+                ConfigKey::AdminAuthEnv,
+                ConfigKey::AdminAuthFile,
+                ConfigKey::AdminAuthTokenPresent,
             ],
         ] {
             if alternatives
                 .iter()
-                .filter(|key| self.0.contains_key(**key))
+                .filter(|key| self.0.contains_key(key))
                 .count()
                 > 1
             {
                 return Err(ConfigError::InvalidValue {
-                    key: alternatives[0].to_owned(),
+                    key: alternatives[0],
                     reason: "configure exactly one credential source",
                 });
             }
         }
         for (key, value) in self.0 {
-            apply_value(target, &key, &value)?;
+            apply_value(target, key, value)?;
         }
         Ok(())
     }
 }
-
-const KNOWN_KEYS: &[&str] = &[
-    "bind",
-    "allow_insecure_remote",
-    "auth_env",
-    "auth_token_present",
-    "auth_file",
-    "admin_auth_env",
-    "admin_auth_token_present",
-    "admin_auth_file",
-    "allowed_origins",
-    "model_directories",
-    "limits.max_body_bytes",
-    "limits.max_items",
-    "limits.max_tokens",
-    "limits.max_queue_depth",
-    "limits.max_batch_items",
-    "limits.max_concurrency",
-    "limits.request_timeout_ms",
-    "limits.shutdown_timeout_ms",
-];
 
 impl ServerConfig {
     /// Load configuration with precedence CLI > environment > TOML > defaults.
@@ -283,7 +410,7 @@ impl ServerConfig {
             .any(|origin| !valid_origin(origin))
         {
             return Err(ConfigError::InvalidValue {
-                key: "allowed_origins".to_owned(),
+                key: ConfigKey::AllowedOrigins,
                 reason: "origins must be exact HTTP(S) origins without wildcards",
             });
         }
@@ -296,48 +423,60 @@ fn parse_toml(input: &str) -> Result<Patch, ConfigError> {
     let table = input
         .parse::<toml::Table>()
         .map_err(|_| ConfigError::InvalidValue {
-            key: "toml".to_owned(),
+            key: ConfigKey::Toml,
             reason: "invalid TOML document",
         })?;
     for (key, value) in table {
         if key == "limits" {
             let toml::Value::Table(limits) = value else {
                 return Err(ConfigError::InvalidValue {
-                    key,
+                    key: ConfigKey::Toml,
                     reason: "expected table",
                 });
             };
             for (limit_key, limit_value) in limits {
-                insert_toml_value(&mut patch, &format!("limits.{limit_key}"), limit_value)?;
+                let raw_key = format!("limits.{limit_key}");
+                let key = parse_key(&raw_key).ok_or(ConfigError::UnknownKey {
+                    source: ConfigSource::Toml,
+                })?;
+                insert_toml_value(&mut patch, key, limit_value)?;
             }
         } else {
-            insert_toml_value(&mut patch, &key, value)?;
+            let key = parse_key(&key).ok_or(ConfigError::UnknownKey {
+                source: ConfigSource::Toml,
+            })?;
+            insert_toml_value(&mut patch, key, value)?;
         }
     }
     Ok(patch)
 }
 
-fn insert_toml_value(patch: &mut Patch, key: &str, value: toml::Value) -> Result<(), ConfigError> {
+fn insert_toml_value(
+    patch: &mut Patch,
+    key: ConfigKey,
+    value: toml::Value,
+) -> Result<(), ConfigError> {
     let value = match value {
-        toml::Value::String(value) => value,
-        toml::Value::Integer(value) => value.to_string(),
-        toml::Value::Boolean(value) => value.to_string(),
-        toml::Value::Array(values) => values
-            .into_iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(ToOwned::to_owned)
-                    .ok_or_else(|| ConfigError::InvalidValue {
-                        key: key.to_owned(),
-                        reason: "expected an array of strings",
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .join(","),
+        toml::Value::String(value) => PatchValue::Scalar(value),
+        toml::Value::Integer(value) => PatchValue::Scalar(value.to_string()),
+        toml::Value::Boolean(value) => PatchValue::Scalar(value.to_string()),
+        toml::Value::Array(values) => PatchValue::List(
+            values
+                .into_iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .ok_or(ConfigError::InvalidValue {
+                            key,
+                            reason: "expected an array of strings",
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
         _ => {
             return Err(ConfigError::InvalidValue {
-                key: key.to_owned(),
+                key,
                 reason: "unsupported TOML value type",
             });
         }
@@ -358,36 +497,43 @@ where
             continue;
         };
         let normalized = match suffix {
-            "BIND" => "bind",
-            "ALLOW_INSECURE_REMOTE" => "allow_insecure_remote",
-            "AUTH_ENV" => "auth_env",
-            "AUTH_TOKEN" => "auth_token_present",
-            "AUTH_FILE" => "auth_file",
-            "ADMIN_AUTH_ENV" => "admin_auth_env",
-            "ADMIN_AUTH_TOKEN" => "admin_auth_token_present",
-            "ADMIN_AUTH_FILE" => "admin_auth_file",
-            "ALLOWED_ORIGINS" => "allowed_origins",
-            "MODEL_DIRECTORIES" => "model_directories",
-            "MAX_BODY_BYTES" => "limits.max_body_bytes",
-            "MAX_ITEMS" => "limits.max_items",
-            "MAX_TOKENS" => "limits.max_tokens",
-            "MAX_QUEUE_DEPTH" => "limits.max_queue_depth",
-            "MAX_BATCH_ITEMS" => "limits.max_batch_items",
-            "MAX_CONCURRENCY" => "limits.max_concurrency",
-            "REQUEST_TIMEOUT_MS" => "limits.request_timeout_ms",
-            "SHUTDOWN_TIMEOUT_MS" => "limits.shutdown_timeout_ms",
-            _ => return Err(ConfigError::UnknownKey(key.to_owned())),
+            "BIND" => ConfigKey::Bind,
+            "ALLOW_INSECURE_REMOTE" => ConfigKey::AllowInsecureRemote,
+            "AUTH_ENV" => ConfigKey::AuthEnv,
+            "AUTH_TOKEN" => ConfigKey::AuthTokenPresent,
+            "AUTH_FILE" => ConfigKey::AuthFile,
+            "ADMIN_AUTH_ENV" => ConfigKey::AdminAuthEnv,
+            "ADMIN_AUTH_TOKEN" => ConfigKey::AdminAuthTokenPresent,
+            "ADMIN_AUTH_FILE" => ConfigKey::AdminAuthFile,
+            "ALLOWED_ORIGINS" => ConfigKey::AllowedOrigins,
+            "MODEL_DIRECTORIES" => ConfigKey::ModelDirectories,
+            "MAX_BODY_BYTES" => ConfigKey::MaxBodyBytes,
+            "MAX_ITEMS" => ConfigKey::MaxItems,
+            "MAX_TOKENS" => ConfigKey::MaxTokens,
+            "MAX_QUEUE_DEPTH" => ConfigKey::MaxQueueDepth,
+            "MAX_BATCH_ITEMS" => ConfigKey::MaxBatchItems,
+            "MAX_CONCURRENCY" => ConfigKey::MaxConcurrency,
+            "REQUEST_TIMEOUT_MS" => ConfigKey::RequestTimeout,
+            "SHUTDOWN_TIMEOUT_MS" => ConfigKey::ShutdownTimeout,
+            _ => {
+                return Err(ConfigError::UnknownKey {
+                    source: ConfigSource::Environment,
+                });
+            }
         };
-        if normalized.ends_with("_token_present") {
+        if matches!(
+            normalized,
+            ConfigKey::AuthTokenPresent | ConfigKey::AdminAuthTokenPresent
+        ) {
             if value.as_ref().is_empty() {
                 return Err(ConfigError::InvalidValue {
-                    key: key.to_owned(),
+                    key: normalized,
                     reason: "credential must not be empty",
                 });
             }
-            patch.set(normalized, key.to_owned())?;
+            patch.set(normalized, PatchValue::Scalar(key.to_owned()))?;
         } else {
-            patch.set(normalized, value.as_ref().to_owned())?;
+            patch.set(normalized, PatchValue::Scalar(value.as_ref().to_owned()))?;
         }
     }
     Ok(patch)
@@ -408,34 +554,36 @@ where
         let option_name = option.split_once('=').map_or(option, |(name, _)| name);
         let normalized_name = option_name.replace('-', "_");
         if credential_like_option(&normalized_name) {
-            return Err(ConfigError::UnknownKey(normalized_name));
+            return Err(ConfigError::UnknownKey {
+                source: ConfigSource::CommandLine,
+            });
         }
+        let normalized_name = match normalized_name.as_str() {
+            "max_body_bytes" => "limits.max_body_bytes",
+            "max_items" => "limits.max_items",
+            "max_tokens" => "limits.max_tokens",
+            "max_queue_depth" => "limits.max_queue_depth",
+            "max_batch_items" => "limits.max_batch_items",
+            "max_concurrency" => "limits.max_concurrency",
+            "request_timeout_ms" => "limits.request_timeout_ms",
+            "shutdown_timeout_ms" => "limits.shutdown_timeout_ms",
+            other => other,
+        };
+        let key = parse_key(normalized_name).ok_or(ConfigError::UnknownKey {
+            source: ConfigSource::CommandLine,
+        })?;
         if option.contains('=') {
             return Err(ConfigError::InvalidValue {
-                key: normalized_name,
+                key,
                 reason: "inline option values are not supported",
             });
         }
-        let normalized = normalized_name;
-        let key = match normalized.as_str() {
-            "max_body_bytes"
-            | "max_items"
-            | "max_tokens"
-            | "max_queue_depth"
-            | "max_batch_items"
-            | "max_concurrency"
-            | "request_timeout_ms"
-            | "shutdown_timeout_ms" => format!("limits.{normalized}"),
-            _ => normalized,
-        };
-        if key == "allow_insecure_remote" {
-            patch.set(&key, "true".to_owned())?;
+        if key == ConfigKey::AllowInsecureRemote {
+            patch.set(key, PatchValue::Scalar("true".to_owned()))?;
             continue;
         }
-        let value = args
-            .next()
-            .ok_or_else(|| ConfigError::MissingValue(option.to_owned()))?;
-        patch.set(&key, value.as_ref().to_owned())?;
+        let value = args.next().ok_or(ConfigError::MissingValue(key))?;
+        patch.set(key, PatchValue::Scalar(value.as_ref().to_owned()))?;
     }
     Ok(patch)
 }
@@ -449,65 +597,116 @@ fn credential_like_option(option: &str) -> bool {
         || option.contains("api_key")
 }
 
-fn apply_value(target: &mut ServerConfig, key: &str, value: &str) -> Result<(), ConfigError> {
-    let invalid = |reason| ConfigError::InvalidValue {
-        key: key.to_owned(),
-        reason,
+fn parse_key(key: &str) -> Option<ConfigKey> {
+    match key {
+        "bind" => Some(ConfigKey::Bind),
+        "allow_insecure_remote" => Some(ConfigKey::AllowInsecureRemote),
+        "auth_env" => Some(ConfigKey::AuthEnv),
+        "auth_token_present" => Some(ConfigKey::AuthTokenPresent),
+        "auth_file" => Some(ConfigKey::AuthFile),
+        "admin_auth_env" => Some(ConfigKey::AdminAuthEnv),
+        "admin_auth_token_present" => Some(ConfigKey::AdminAuthTokenPresent),
+        "admin_auth_file" => Some(ConfigKey::AdminAuthFile),
+        "allowed_origins" => Some(ConfigKey::AllowedOrigins),
+        "model_directories" => Some(ConfigKey::ModelDirectories),
+        "limits.max_body_bytes" => Some(ConfigKey::MaxBodyBytes),
+        "limits.max_items" => Some(ConfigKey::MaxItems),
+        "limits.max_tokens" => Some(ConfigKey::MaxTokens),
+        "limits.max_queue_depth" => Some(ConfigKey::MaxQueueDepth),
+        "limits.max_batch_items" => Some(ConfigKey::MaxBatchItems),
+        "limits.max_concurrency" => Some(ConfigKey::MaxConcurrency),
+        "limits.request_timeout_ms" => Some(ConfigKey::RequestTimeout),
+        "limits.shutdown_timeout_ms" => Some(ConfigKey::ShutdownTimeout),
+        _ => None,
+    }
+}
+
+fn apply_value(
+    target: &mut ServerConfig,
+    key: ConfigKey,
+    value: PatchValue,
+) -> Result<(), ConfigError> {
+    let invalid = |reason| ConfigError::InvalidValue { key, reason };
+    let scalar = || match &value {
+        PatchValue::Scalar(value) => Ok(value.as_str()),
+        PatchValue::List(_) => Err(invalid("expected scalar value")),
     };
     match key {
-        "bind" => {
-            target.bind = value
+        ConfigKey::Bind => {
+            target.bind = scalar()?
                 .parse()
                 .map_err(|_| invalid("expected socket address"))?;
         }
-        "allow_insecure_remote" => {
+        ConfigKey::AllowInsecureRemote => {
             target.allow_insecure_remote =
-                parse_bool(value).ok_or_else(|| invalid("expected boolean"))?;
+                parse_bool(scalar()?).ok_or_else(|| invalid("expected boolean"))?;
         }
-        "auth_env" => {
+        ConfigKey::AuthEnv => {
             target.auth = Some(CredentialSource::Environment(validate_env_name(
-                value, key,
+                scalar()?,
+                key,
             )?));
         }
-        "auth_token_present" => {
-            target.auth = Some(CredentialSource::Environment(value.to_owned()));
+        ConfigKey::AuthTokenPresent => {
+            target.auth = Some(CredentialSource::Environment(scalar()?.to_owned()));
         }
-        "auth_file" => target.auth = Some(CredentialSource::File(PathBuf::from(value))),
-        "admin_auth_env" => {
+        ConfigKey::AuthFile => target.auth = Some(CredentialSource::File(PathBuf::from(scalar()?))),
+        ConfigKey::AdminAuthEnv => {
             target.admin_auth = Some(CredentialSource::Environment(validate_env_name(
-                value, key,
+                scalar()?,
+                key,
             )?));
         }
-        "admin_auth_token_present" => {
-            target.admin_auth = Some(CredentialSource::Environment(value.to_owned()));
+        ConfigKey::AdminAuthTokenPresent => {
+            target.admin_auth = Some(CredentialSource::Environment(scalar()?.to_owned()));
         }
-        "admin_auth_file" => target.admin_auth = Some(CredentialSource::File(PathBuf::from(value))),
-        "allowed_origins" => target.allowed_origins = split_list(value),
-        "model_directories" => {
-            target.model_directories = split_list(value).into_iter().map(PathBuf::from).collect();
+        ConfigKey::AdminAuthFile => {
+            target.admin_auth = Some(CredentialSource::File(PathBuf::from(scalar()?)));
         }
-        "limits.max_body_bytes" => target.limits.max_body_bytes = parse_usize(value, key)?,
-        "limits.max_items" => target.limits.max_items = parse_usize(value, key)?,
-        "limits.max_tokens" => target.limits.max_tokens = parse_usize(value, key)?,
-        "limits.max_queue_depth" => target.limits.max_queue_depth = parse_usize(value, key)?,
-        "limits.max_batch_items" => target.limits.max_batch_items = parse_usize(value, key)?,
-        "limits.max_concurrency" => target.limits.max_concurrency = parse_usize(value, key)?,
-        "limits.request_timeout_ms" => target.limits.request_timeout = parse_duration(value, key)?,
-        "limits.shutdown_timeout_ms" => {
-            target.limits.shutdown_timeout = parse_duration(value, key)?;
+        ConfigKey::AllowedOrigins => {
+            target.allowed_origins = list_value(value, key)?;
         }
-        _ => return Err(ConfigError::UnknownKey(key.to_owned())),
+        ConfigKey::ModelDirectories => {
+            target.model_directories = list_value(value, key)?
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+        }
+        ConfigKey::MaxBodyBytes => target.limits.max_body_bytes = parse_usize(scalar()?, key)?,
+        ConfigKey::MaxItems => target.limits.max_items = parse_usize(scalar()?, key)?,
+        ConfigKey::MaxTokens => target.limits.max_tokens = parse_usize(scalar()?, key)?,
+        ConfigKey::MaxQueueDepth => target.limits.max_queue_depth = parse_usize(scalar()?, key)?,
+        ConfigKey::MaxBatchItems => target.limits.max_batch_items = parse_usize(scalar()?, key)?,
+        ConfigKey::MaxConcurrency => target.limits.max_concurrency = parse_usize(scalar()?, key)?,
+        ConfigKey::RequestTimeout => {
+            target.limits.request_timeout = parse_duration(scalar()?, key)?;
+        }
+        ConfigKey::ShutdownTimeout => {
+            target.limits.shutdown_timeout = parse_duration(scalar()?, key)?;
+        }
+        ConfigKey::Toml | ConfigKey::Path => {
+            return Err(invalid("field is not directly configurable"));
+        }
     }
     Ok(())
 }
 
-fn split_list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+fn list_value(value: PatchValue, key: ConfigKey) -> Result<Vec<String>, ConfigError> {
+    let values = match value {
+        PatchValue::Scalar(value) => value
+            .split(',')
+            .map(str::trim)
+            .map(ToOwned::to_owned)
+            .collect(),
+        PatchValue::List(values) => values,
+    };
+    if values.iter().any(String::is_empty) {
+        return Err(ConfigError::InvalidValue {
+            key,
+            reason: "list entries must not be empty",
+        });
+    }
+    Ok(values)
 }
 
 fn valid_origin(origin: &str) -> bool {
@@ -539,29 +738,29 @@ fn parse_bool(value: &str) -> Option<bool> {
         _ => None,
     }
 }
-fn parse_usize(value: &str, key: &str) -> Result<usize, ConfigError> {
+fn parse_usize(value: &str, key: ConfigKey) -> Result<usize, ConfigError> {
     value.parse().map_err(|_| ConfigError::InvalidValue {
-        key: key.to_owned(),
+        key,
         reason: "expected positive integer",
     })
 }
-fn parse_duration(value: &str, key: &str) -> Result<Duration, ConfigError> {
+fn parse_duration(value: &str, key: ConfigKey) -> Result<Duration, ConfigError> {
     value
         .parse::<u64>()
         .map(Duration::from_millis)
         .map_err(|_| ConfigError::InvalidValue {
-            key: key.to_owned(),
+            key,
             reason: "expected milliseconds",
         })
 }
-fn validate_env_name(value: &str, key: &str) -> Result<String, ConfigError> {
+fn validate_env_name(value: &str, key: ConfigKey) -> Result<String, ConfigError> {
     if value.is_empty()
         || !value
             .chars()
             .all(|c| c == '_' || c.is_ascii_uppercase() || c.is_ascii_digit())
     {
         return Err(ConfigError::InvalidValue {
-            key: key.to_owned(),
+            key,
             reason: "expected an uppercase environment variable name",
         });
     }
@@ -571,27 +770,27 @@ fn validate_env_name(value: &str, key: &str) -> Result<String, ConfigError> {
 fn validate_bounds(limits: &Limits) -> Result<(), ConfigError> {
     const MIB: usize = 1024 * 1024;
     for (key, value, min, max) in [
-        ("limits.max_body_bytes", limits.max_body_bytes, 1, 64 * MIB),
-        ("limits.max_items", limits.max_items, 1, 4096),
-        ("limits.max_tokens", limits.max_tokens, 1, 1_000_000),
-        ("limits.max_queue_depth", limits.max_queue_depth, 1, 100_000),
-        ("limits.max_batch_items", limits.max_batch_items, 1, 4096),
-        ("limits.max_concurrency", limits.max_concurrency, 1, 1024),
+        (ConfigKey::MaxBodyBytes, limits.max_body_bytes, 1, 64 * MIB),
+        (ConfigKey::MaxItems, limits.max_items, 1, 4096),
+        (ConfigKey::MaxTokens, limits.max_tokens, 1, 1_000_000),
+        (ConfigKey::MaxQueueDepth, limits.max_queue_depth, 1, 100_000),
+        (ConfigKey::MaxBatchItems, limits.max_batch_items, 1, 4096),
+        (ConfigKey::MaxConcurrency, limits.max_concurrency, 1, 1024),
     ] {
         if !(min..=max).contains(&value) {
             return Err(ConfigError::InvalidValue {
-                key: key.to_owned(),
+                key,
                 reason: "outside supported bounds",
             });
         }
     }
     for (key, value) in [
-        ("limits.request_timeout_ms", limits.request_timeout),
-        ("limits.shutdown_timeout_ms", limits.shutdown_timeout),
+        (ConfigKey::RequestTimeout, limits.request_timeout),
+        (ConfigKey::ShutdownTimeout, limits.shutdown_timeout),
     ] {
         if value < Duration::from_millis(10) || value > Duration::from_secs(600) {
             return Err(ConfigError::InvalidValue {
-                key: key.to_owned(),
+                key,
                 reason: "outside supported bounds",
             });
         }
@@ -606,7 +805,7 @@ fn validate_bounds(limits: &Limits) -> Result<(), ConfigError> {
 /// Returns a sanitized error when the path does not exist or cannot be resolved.
 pub fn canonical_existing_path(path: &Path) -> Result<PathBuf, ConfigError> {
     fs::canonicalize(path).map_err(|_| ConfigError::InvalidValue {
-        key: "path".to_owned(),
+        key: ConfigKey::Path,
         reason: "path does not exist or cannot be resolved",
     })
 }
@@ -622,7 +821,7 @@ pub fn canonical_path_within(root: &Path, child: &Path) -> Result<PathBuf, Confi
     let candidate = canonical_existing_path(&root.join(child))?;
     if !candidate.starts_with(&root) {
         return Err(ConfigError::InvalidValue {
-            key: "path".to_owned(),
+            key: ConfigKey::Path,
             reason: "path escapes configured root",
         });
     }
@@ -661,16 +860,55 @@ mod tests {
     fn strict_unknown_keys_across_sources() {
         assert!(matches!(
             parse_toml("mystery = 1"),
-            Err(ConfigError::UnknownKey(_))
+            Err(ConfigError::UnknownKey { .. })
         ));
         assert!(matches!(
             parse_environment([("IMPOSSIBLE_MYSTERY", "1")]),
-            Err(ConfigError::UnknownKey(_))
+            Err(ConfigError::UnknownKey { .. })
         ));
         assert!(matches!(
             parse_cli(["--mystery", "1"]),
-            Err(ConfigError::UnknownKey(_))
+            Err(ConfigError::UnknownKey { .. })
         ));
+    }
+
+    #[test]
+    fn display_and_debug_never_echo_untrusted_configuration_text() {
+        const SENTINEL: &str = "SENTINEL_SECRET_PATH";
+        let errors = [
+            parse_toml("\"SENTINEL_SECRET_PATH\\n\\u001b[31m\" = 1")
+                .err()
+                .expect("unknown TOML key"),
+            parse_environment([("IMPOSSIBLE_SENTINEL_SECRET_PATH\n\u{1b}[31m", "secret")])
+                .err()
+                .expect("unknown environment key"),
+            parse_cli(["--SENTINEL_SECRET_PATH\n\u{1b}[31m", "secret"])
+                .err()
+                .expect("unknown command-line key"),
+            parse_cli(["--bind", "SENTINEL_SECRET_PATH\n\u{1b}[31m"])
+                .and_then(|patch| {
+                    let mut config = ServerConfig::default();
+                    patch.apply(&mut config)
+                })
+                .expect_err("invalid command-line value"),
+            ServerConfig::load(
+                Some(Path::new("C:/SENTINEL_SECRET_PATH/private/config.toml")),
+                std::iter::empty::<(&str, &str)>(),
+                std::iter::empty::<&str>(),
+            )
+            .expect_err("unavailable path"),
+        ];
+
+        for error in errors {
+            let rendered = format!("{error} {error:?}");
+            assert!(!rendered.contains(SENTINEL), "leaked sentinel: {rendered}");
+            assert!(!rendered.contains('\n'), "leaked newline: {rendered:?}");
+            assert!(
+                !rendered.contains('\u{1b}'),
+                "leaked ANSI escape: {rendered:?}"
+            );
+            assert!(error.diagnostic().code.starts_with("config_"));
+        }
     }
 
     #[test]
@@ -824,6 +1062,65 @@ mod tests {
         assert_eq!(config.allowed_origins.len(), 2);
         assert_eq!(config.model_directories, vec![PathBuf::from("models#one")]);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn toml_model_directory_arrays_preserve_commas_inside_entries() {
+        let patch = parse_toml("model_directories = [\"C:/models,private\", \"D:/other models\"]")
+            .expect("valid typed array");
+        let mut config = ServerConfig::default();
+        patch.apply(&mut config).expect("valid values");
+        assert_eq!(
+            config.model_directories,
+            [
+                PathBuf::from("C:/models,private"),
+                PathBuf::from("D:/other models")
+            ]
+        );
+    }
+
+    #[test]
+    fn list_sources_reject_empty_entries_but_allow_an_empty_toml_array() {
+        for input in [
+            "model_directories = [\"\"]",
+            "model_directories = [\"models\", \"\"]",
+        ] {
+            let patch = parse_toml(input).expect("well-typed TOML");
+            assert!(patch.apply(&mut ServerConfig::default()).is_err());
+        }
+        for value in ["", ",", "models,", ",models", "models,,other"] {
+            let patch = parse_environment([("IMPOSSIBLE_MODEL_DIRECTORIES", value)])
+                .expect("known environment key");
+            assert!(
+                patch.apply(&mut ServerConfig::default()).is_err(),
+                "accepted {value:?}"
+            );
+        }
+
+        let patch = parse_toml("model_directories = []").expect("empty typed array");
+        let mut config = ServerConfig {
+            model_directories: vec![PathBuf::from("old")],
+            ..ServerConfig::default()
+        };
+        patch.apply(&mut config).expect("empty array clears list");
+        assert!(config.model_directories.is_empty());
+    }
+
+    #[test]
+    fn list_precedence_replaces_typed_toml_values_without_reinterpreting_them() {
+        let path = std::env::temp_dir().join(format!(
+            "impossible-list-precedence-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, "model_directories = [\"toml,one\", \"toml-two\"]\n").expect("fixture");
+        let config = ServerConfig::load(
+            Some(&path),
+            [("IMPOSSIBLE_MODEL_DIRECTORIES", "environment")],
+            ["--model-directories", "command-line"],
+        )
+        .expect("valid precedence");
+        let _ = fs::remove_file(path);
+        assert_eq!(config.model_directories, [PathBuf::from("command-line")]);
     }
 
     #[test]
