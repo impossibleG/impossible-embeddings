@@ -8,7 +8,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+impossible-embedding-core = { version = "=0.1.0", path = "../impossible-embedding-core" }
+impossible-embedding-onnx = { version = "=0.1.0", path = "../impossible-embedding-onnx" }
+impossible-models = { version = "=0.1.0", path = "../impossible-models" }
 impossible-server-core = { version = "=0.1.0", path = "../impossible-server-core" }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+anyhow.workspace = true
 
 [lints]
 workspace = true

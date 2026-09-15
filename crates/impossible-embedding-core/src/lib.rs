@@ -18,7 +18,7 @@ pub struct EmbeddingBatch<'a> {
 }
 
 /// Semantic purpose of an embedding input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EmbeddingTask {
     /// A search query.
     Query,
@@ -27,7 +27,7 @@ pub enum EmbeddingTask {
 }
 
 /// Behavior for tokenized inputs beyond a model's declared limit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Truncation {
     /// Reject the request.
     Reject,
@@ -36,7 +36,7 @@ pub enum Truncation {
 }
 
 /// Transport-independent embedding request options.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EmbedOptions {
     /// Task used to select a model prefix.
     pub task: EmbeddingTask,
@@ -44,6 +44,8 @@ pub struct EmbedOptions {
     pub truncation: Truncation,
     /// Optional, manifest-approved output dimension.
     pub dimensions: Option<usize>,
+    /// Explicit L2-normalization override. `None` preserves the model manifest's semantics.
+    pub normalize: Option<bool>,
 }
 
 impl Default for EmbedOptions {
@@ -52,6 +54,7 @@ impl Default for EmbedOptions {
             task: EmbeddingTask::Document,
             truncation: Truncation::Reject,
             dimensions: None,
+            normalize: None,
         }
     }
 }

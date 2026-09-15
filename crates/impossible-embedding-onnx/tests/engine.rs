@@ -440,6 +440,22 @@ fn handles_empty_unicode_prefixes_limits_and_dimensions() -> Result<()> {
         .sum::<f32>()
         .sqrt();
     assert!((norm - 1.0).abs() < 1e-6);
+    let unnormalized = embed(
+        &engine,
+        &["hello world hello world"],
+        EmbedOptions {
+            truncation: Truncation::Truncate,
+            dimensions: Some(2),
+            normalize: Some(false),
+            ..defaults
+        },
+    )?;
+    let unnormalized_norm = unnormalized[0]
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    assert!((unnormalized_norm - 1.0).abs() > 1e-3);
     assert_eq!(
         embed(
             &engine,

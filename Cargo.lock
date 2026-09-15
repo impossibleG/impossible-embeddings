@@ -783,7 +783,12 @@ dependencies = [
 name = "impossible-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "impossible-embedding-core",
+ "impossible-embedding-onnx",
+ "impossible-models",
  "impossible-server-core",
+ "tokio",
 ]
 
 [[package]]

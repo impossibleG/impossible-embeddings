@@ -180,7 +180,7 @@ impl OnnxEmbeddingEngine {
             .unwrap_or("warmup")
             .to_owned();
         let encoding = model.encode(&input, Truncation::Truncate)?;
-        drop(model.run(&[encoding], None)?);
+        drop(model.run(&[encoding], None, model.contract.normalize)?);
         Ok(())
     }
 
@@ -225,7 +225,8 @@ impl OnnxEmbeddingEngine {
             })
             .collect::<Result<Vec<_>, _>>()?;
         control.ensure_active()?;
-        let vectors = model.run(&encodings, options.dimensions)?;
+        let normalize = options.normalize.unwrap_or(model.contract.normalize);
+        let vectors = model.run(&encodings, options.dimensions, normalize)?;
         control.ensure_active()?;
         Ok(EmbeddingOutput {
             vectors,
@@ -275,6 +276,7 @@ impl LoadedModel {
         &mut self,
         encodings: &[Encoding],
         dimensions: Option<usize>,
+        normalize: bool,
     ) -> Result<Vec<Vec<f32>>, EngineFailure> {
         let batch = encodings.len();
         let sequence = encodings
@@ -352,7 +354,7 @@ impl LoadedModel {
                 }
                 vector.truncate(d);
             }
-            if self.contract.normalize {
+            if normalize {
                 l2_normalize(vector)?;
             }
         }
