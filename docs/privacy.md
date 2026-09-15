@@ -13,3 +13,16 @@ The server design follows these rules:
 
 Repository automation scans tracked files for common local-path and attribution leaks. This is a
 guardrail, not a substitute for review.
+
+## Panic output
+
+Rust invokes the process panic hook before `catch_unwind`. The default hook prints the panic
+payload and source location, which may contain request data or local paths supplied by a runtime
+adapter. Creating the application runtime therefore installs one process-wide sanitized hook. It
+emits only a fixed failure sentence; payloads and locations are discarded, while native jobs are
+still caught and converted to stable public errors so workers survive.
+
+Rust does not provide a stable thread-local panic hook. This policy consequently applies to the
+whole process, including code outside native workers. Embedders must not replace it with a hook
+that prints arbitrary payloads or locations. Panics remain bugs rather than an observability
+channel; use structured, explicitly redacted diagnostics for operational detail.

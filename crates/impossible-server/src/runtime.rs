@@ -21,7 +21,7 @@ use std::{
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, Once, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{SyncSender, TrySendError, sync_channel},
     },
@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{Notify, mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
@@ -245,6 +245,23 @@ struct SchedulerTask {
     handle: JoinHandle<()>,
 }
 
+// `catch_unwind` does not suppress Rust's default panic hook: the hook runs first and can print
+// adapter-owned payloads and source paths. Installing this once gives every native worker a
+// process-wide, payload-free policy. Rust has no stable thread-local panic hook, so embedders that
+// need a different global policy must install their own equally privacy-safe hook before creating
+// other application components and accept that this runtime deliberately does not chain it.
+static SANITIZED_PANIC_HOOK: Once = Once::new();
+static SANITIZED_PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn install_sanitized_panic_hook() {
+    SANITIZED_PANIC_HOOK.call_once(|| {
+        std::panic::set_hook(Box::new(|_| {
+            SANITIZED_PANIC_COUNT.fetch_add(1, Ordering::Relaxed);
+            eprintln!("impossible runtime: an isolated worker failed");
+        }));
+    });
+}
+
 /// RAII capability preventing unload/delete while application work refers to a model.
 #[derive(Debug)]
 pub struct RuntimeLease(Arc<AtomicUsize>);
@@ -289,6 +306,7 @@ struct Inner {
     force_stop: watch::Sender<bool>,
     metrics: Metrics,
     active: Arc<AtomicUsize>,
+    active_zero: Arc<Notify>,
     queued: Arc<AtomicUsize>,
 }
 
@@ -302,10 +320,16 @@ struct GaugeGuard {
     counter: Arc<AtomicUsize>,
     metrics: Metrics,
     kind: GaugeKind,
+    zero_latch: Option<Arc<Notify>>,
 }
 
 impl GaugeGuard {
-    fn increment(counter: Arc<AtomicUsize>, metrics: Metrics, kind: GaugeKind) -> Self {
+    fn increment(
+        counter: Arc<AtomicUsize>,
+        metrics: Metrics,
+        kind: GaugeKind,
+        zero_latch: Option<Arc<Notify>>,
+    ) -> Self {
         counter.fetch_add(1, Ordering::AcqRel);
         match kind {
             GaugeKind::Active => metrics.increment_active(),
@@ -315,16 +339,22 @@ impl GaugeGuard {
             counter,
             metrics,
             kind,
+            zero_latch,
         }
     }
 }
 
 impl Drop for GaugeGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.counter.fetch_sub(1, Ordering::AcqRel);
         match self.kind {
             GaugeKind::Active => self.metrics.decrement_active(),
             GaugeKind::Queue => self.metrics.decrement_queue_depth(),
+        }
+        if previous == 1 {
+            if let Some(latch) = &self.zero_latch {
+                latch.notify_waiters();
+            }
         }
     }
 }
@@ -348,7 +378,7 @@ impl QueuePermit {
             .ok()?;
         Some(Self {
             local,
-            _global: GaugeGuard::increment(global, metrics, GaugeKind::Queue),
+            _global: GaugeGuard::increment(global, metrics, GaugeKind::Queue, None),
         })
     }
 }
@@ -373,6 +403,12 @@ struct LoadReservation {
 struct InstallRegistration {
     installs: Arc<Mutex<HashMap<usize, InstallCancelToken>>>,
     operation: usize,
+}
+
+struct ActiveInstall {
+    _registration: InstallRegistration,
+    _permit: WorkPermit,
+    cancellation: InstallCancelToken,
 }
 
 struct CancelOnDrop {
@@ -431,6 +467,7 @@ impl ApplicationRuntime {
     /// Returns [`LifecycleError::InvalidPolicy`] when any required bound is zero.
     pub fn new(policy: BatchPolicy) -> Result<Self, LifecycleError> {
         let policy = policy.validate()?;
+        install_sanitized_panic_hook();
         let health = HealthRegistry::default();
         let _ = health.transition(LifecycleState::Ready, None);
         let (force_stop, _) = watch::channel(false);
@@ -450,6 +487,7 @@ impl ApplicationRuntime {
             force_stop,
             metrics: Metrics::default(),
             active: Arc::new(AtomicUsize::new(0)),
+            active_zero: Arc::new(Notify::new()),
             queued: Arc::new(AtomicUsize::new(0)),
         })))
     }
@@ -702,7 +740,19 @@ impl ApplicationRuntime {
             .shutdown
             .admit()
             .ok_or(LifecycleError::ShuttingDown)?;
-        operation.await
+        let mut force_stop = self.0.force_stop.subscribe();
+        if *force_stop.borrow() {
+            return Err(LifecycleError::ShuttingDown);
+        }
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            changed = force_stop.changed() => {
+                let _ = changed;
+                Err(LifecycleError::ShuttingDown)
+            }
+            result = &mut operation => result,
+        }
     }
 
     /// Install one exact manifest with cooperative cancellation on forced shutdown.
@@ -714,7 +764,38 @@ impl ApplicationRuntime {
         installer: &Installer,
         manifest: &Manifest,
     ) -> Result<ModelStatus, LifecycleError> {
-        let _permit = self
+        let active = self.begin_install()?;
+        let mut force_stop = self.0.force_stop.subscribe();
+        if *force_stop.borrow() {
+            active.cancellation.cancel();
+            return Err(LifecycleError::ShuttingDown);
+        }
+        let install = installer.install(manifest, &active.cancellation);
+        tokio::pin!(install);
+        let result = tokio::select! {
+            biased;
+            changed = force_stop.changed() => {
+                let _ = changed;
+                active.cancellation.cancel();
+                return Err(LifecycleError::ShuttingDown);
+            }
+            result = &mut install => result,
+        };
+        result.map_err(|_| LifecycleError::InstallFailed)
+    }
+
+    fn begin_install(&self) -> Result<ActiveInstall, LifecycleError> {
+        // The admin lock makes shutdown admission and cancellation-token publication one atomic
+        // lifecycle transition: shutdown cannot publish Draining/Stopped between the two.
+        let _admin = self
+            .0
+            .admin
+            .lock()
+            .map_err(|_| LifecycleError::InstallFailed)?;
+        if self.0.draining.load(Ordering::Acquire) {
+            return Err(LifecycleError::ShuttingDown);
+        }
+        let permit = self
             .0
             .shutdown
             .admit()
@@ -726,12 +807,14 @@ impl ApplicationRuntime {
             .lock()
             .map_err(|_| LifecycleError::InstallFailed)?
             .insert(operation, cancellation.clone());
-        let _registration = InstallRegistration {
-            installs: Arc::clone(&self.0.installs),
-            operation,
-        };
-        let result = installer.install(manifest, &cancellation).await;
-        result.map_err(|_| LifecycleError::InstallFailed)
+        Ok(ActiveInstall {
+            _registration: InstallRegistration {
+                installs: Arc::clone(&self.0.installs),
+                operation,
+            },
+            _permit: permit,
+            cancellation,
+        })
     }
 
     /// Acquire an explicit model lease for coordinated external administrative work.
@@ -765,6 +848,7 @@ impl ApplicationRuntime {
             Arc::clone(&self.0.active),
             self.0.metrics.clone(),
             GaugeKind::Active,
+            Some(Arc::clone(&self.0.active_zero)),
         );
         let result = self
             .embed_inner(model_id, inputs, options, cancellation, deadline)
@@ -910,11 +994,29 @@ impl ApplicationRuntime {
         store: &ModelStore,
         manifest: &Manifest,
     ) -> Result<bool, LifecycleError> {
+        if model_id != manifest.canonical_id {
+            return Err(LifecycleError::DeleteFailed);
+        }
+        let _admin = self
+            .0
+            .admin
+            .lock()
+            .map_err(|_| LifecycleError::DeleteFailed)?;
+        if self.0.draining.load(Ordering::Acquire) {
+            return Err(LifecycleError::ShuttingDown);
+        }
         if self
             .0
             .models
             .read()
-            .is_ok_and(|models| models.contains_key(model_id))
+            .map_err(|_| LifecycleError::DeleteFailed)?
+            .contains_key(model_id)
+            || self
+                .0
+                .loading
+                .lock()
+                .map_err(|_| LifecycleError::DeleteFailed)?
+                .contains_key(model_id)
         {
             return Err(LifecycleError::InUse);
         }
@@ -945,6 +1047,11 @@ impl ApplicationRuntime {
             tokio::task::yield_now().await;
         }
         let drained = self.0.shutdown.wait(Duration::ZERO);
+        if let Ok(models) = self.0.models.read() {
+            for slot in models.values() {
+                slot.accepting.store(false, Ordering::Release);
+            }
+        }
         if !drained {
             if let Ok(installs) = self.0.installs.lock() {
                 for cancellation in installs.values() {
@@ -952,11 +1059,6 @@ impl ApplicationRuntime {
                 }
             }
             let _ = self.0.force_stop.send(true);
-        }
-        if let Ok(models) = self.0.models.read() {
-            for slot in models.values() {
-                slot.accepting.store(false, Ordering::Release);
-            }
         }
         let mut tasks = self
             .0
@@ -975,13 +1077,27 @@ impl ApplicationRuntime {
         if let Ok(mut retired) = self.0.retired_schedulers.lock() {
             tasks.extend(retired.drain(..));
         }
-        for task in tasks {
-            let remaining = timeout.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                drop(task);
-                continue;
+        for mut task in tasks {
+            if !task.is_finished() {
+                task.abort();
             }
-            let _ = tokio::time::timeout(remaining, task).await;
+            // An aborted scheduler is cheap to acknowledge and must never be detached. Native
+            // jobs are separately fenced by `accepting` and may finish internally.
+            let _ = (&mut task).await;
+        }
+        if !drained {
+            // The force-stop watch makes every admitted public request future terminal without
+            // waiting for a non-cooperative native call. Do not publish Stopped before they have
+            // observed that terminal state and released their shutdown permits.
+            while self.0.active.load(Ordering::Acquire) != 0 {
+                let notified = self.0.active_zero.notified();
+                if self.0.active.load(Ordering::Acquire) != 0 {
+                    notified.await;
+                }
+            }
+            while !self.0.shutdown.wait(Duration::ZERO) {
+                tokio::task::yield_now().await;
+            }
         }
         let _ = self
             .0
@@ -1006,6 +1122,9 @@ async fn await_response(
     tokio::pin!(sleep);
     let mut cancellation_poll = tokio::time::interval(Duration::from_millis(1));
     let result = loop {
+        if *force_stop.borrow() {
+            break Err(EngineFailure::public(ErrorCode::ModelUnavailable));
+        }
         if let Err(error) = control.ensure_active() {
             break Err(error);
         }
@@ -1033,9 +1152,9 @@ async fn await_response(
             }
         }
     };
-    if result.is_ok() {
-        cancel_on_drop.armed = false;
-    }
+    // Reaching this point is a normal completion even when the operation returned an error.
+    // Cancellation belongs exclusively to actual abandonment of this response future.
+    cancel_on_drop.armed = false;
     result
 }
 
@@ -1288,15 +1407,43 @@ fn fail_requests(requests: Vec<Request>, code: ErrorCode) {
 mod tests {
     use super::*;
     use impossible_embedding_core::EmbeddingTask;
+    use impossible_models::curated_manifests;
     use std::sync::atomic::AtomicUsize;
 
     struct FakeEngine {
         calls: AtomicUsize,
+        finished: AtomicBool,
         block: Duration,
         fail: bool,
     }
 
     struct PanicOnceEngine(AtomicUsize);
+
+    struct OrdinaryPanicOnceEngine(AtomicUsize);
+
+    impl RuntimeEngine for OrdinaryPanicOnceEngine {
+        fn embed(
+            &self,
+            _model: &RequestedModel,
+            batch: &EmbeddingBatch<'_>,
+            _control: &ExecutionControl,
+            _options: EmbedOptions,
+        ) -> Result<EmbeddingOutput, EngineFailure> {
+            assert_ne!(
+                self.0.fetch_add(1, Ordering::AcqRel),
+                0,
+                "adapter-owned panic payload"
+            );
+            Ok(EmbeddingOutput {
+                vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
+                model: ResolvedModelIdentity::new("fake", "rev", "fake@1", "artifact", "semantic")?,
+            })
+        }
+
+        fn warm(&self) -> Result<(), EngineFailure> {
+            Ok(())
+        }
+    }
 
     impl RuntimeEngine for PanicOnceEngine {
         fn embed(
@@ -1349,6 +1496,7 @@ mod tests {
         fn new(block: Duration) -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                finished: AtomicBool::new(false),
                 block,
                 fail: false,
             }
@@ -1357,6 +1505,7 @@ mod tests {
         fn failing() -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                finished: AtomicBool::new(false),
                 block: Duration::ZERO,
                 fail: true,
             }
@@ -1373,6 +1522,7 @@ mod tests {
         ) -> Result<EmbeddingOutput, EngineFailure> {
             self.calls.fetch_add(1, Ordering::AcqRel);
             thread::sleep(self.block);
+            self.finished.store(true, Ordering::Release);
             if self.fail {
                 return Err(EngineFailure::public(ErrorCode::InferenceFailed));
             }
@@ -1682,6 +1832,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_panic_uses_process_wide_sanitized_hook_and_worker_recovers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let before = SANITIZED_PANIC_COUNT.load(Ordering::Acquire);
+        let runtime = ApplicationRuntime::new(policy())?;
+        runtime.register_engine(
+            "fake",
+            Arc::new(OrdinaryPanicOnceEngine(AtomicUsize::new(0))),
+        )?;
+        let _ = runtime
+            .embed(
+                "fake",
+                vec!["first".into()],
+                EmbedOptions::default(),
+                CancellationToken::default(),
+                None,
+            )
+            .await;
+        assert!(SANITIZED_PANIC_COUNT.load(Ordering::Acquire) > before);
+        assert_eq!(
+            runtime
+                .embed(
+                    "fake",
+                    vec!["second".into()],
+                    EmbedOptions::default(),
+                    CancellationToken::default(),
+                    None,
+                )
+                .await?
+                .vectors
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn normal_error_completion_does_not_cancel_a_shared_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut limits = policy();
+        limits.max_batch_wait = Duration::ZERO;
+        let runtime = ApplicationRuntime::new(limits)?;
+        runtime.register_engine("fake", Arc::new(PanicOnceEngine(AtomicUsize::new(0))))?;
+        let shared = CancellationToken::default();
+        let failure = runtime
+            .embed(
+                "fake",
+                vec!["first".into()],
+                EmbedOptions::default(),
+                shared.clone(),
+                None,
+            )
+            .await;
+        assert_eq!(
+            failure
+                .err()
+                .ok_or("first request must fail")?
+                .public_error()
+                .code,
+            ErrorCode::InferenceFailed
+        );
+        assert!(!shared.is_cancelled());
+        let survivor = runtime
+            .embed(
+                "fake",
+                vec!["second".into()],
+                EmbedOptions::default(),
+                shared.clone(),
+                None,
+            )
+            .await?;
+        assert_eq!(survivor.vectors.len(), 1);
+        assert!(!shared.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exact_queue_capacity_and_abort_safe_gauges() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut limits = policy();
@@ -1769,12 +1995,115 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(!runtime.shutdown(Duration::ZERO).await);
+        assert!(request.is_finished());
+        assert!(!slow.finished.load(Ordering::Acquire));
+        assert!(
+            runtime
+                .0
+                .schedulers
+                .lock()
+                .is_ok_and(|schedulers| schedulers.is_empty())
+        );
         let error = tokio::time::timeout(Duration::from_millis(20), request)
             .await??
             .err()
             .ok_or("forced shutdown must fail accepted request")?;
         assert_eq!(error.public_error().code, ErrorCode::ModelUnavailable);
         assert!(!runtime.health().is_live());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_admission_is_atomic_with_shutdown_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..20 {
+            let runtime = ApplicationRuntime::new(policy())?;
+            let candidate = runtime.clone();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let candidate_barrier = Arc::clone(&barrier);
+            let admission = tokio::task::spawn_blocking(move || {
+                candidate_barrier.wait();
+                let result = candidate.begin_install();
+                let admitted = result.is_ok();
+                drop(result);
+                admitted
+            });
+            barrier.wait();
+            let _ = runtime.shutdown(Duration::ZERO).await;
+            let _was_admitted = admission.await?;
+            assert!(matches!(
+                runtime.begin_install(),
+                Err(LifecycleError::ShuttingDown)
+            ));
+            assert!(
+                runtime
+                    .0
+                    .installs
+                    .lock()
+                    .is_ok_and(|installs| installs.is_empty())
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_requires_canonical_identity_and_serializes_registration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        static STORE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let sequence = STORE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "impossible-runtime-delete-{}-{sequence}",
+            std::process::id()
+        ));
+        let store = ModelStore::new(&root)?;
+        let manifest = curated_manifests()?
+            .into_iter()
+            .next()
+            .ok_or("curated manifest required")?;
+        let runtime = ApplicationRuntime::new(policy())?;
+        assert_eq!(
+            runtime.delete("different/model", &store, &manifest),
+            Err(LifecycleError::DeleteFailed)
+        );
+        runtime
+            .0
+            .loading
+            .lock()
+            .map_err(|_| "loading registry poisoned")?
+            .insert(manifest.canonical_id.clone(), ModelKey(42));
+        assert_eq!(
+            runtime.delete(&manifest.canonical_id, &store, &manifest),
+            Err(LifecycleError::InUse)
+        );
+        runtime
+            .0
+            .loading
+            .lock()
+            .map_err(|_| "loading registry poisoned")?
+            .remove(&manifest.canonical_id);
+
+        let canonical_id = manifest.canonical_id.clone();
+        let registration_runtime = runtime.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let registration_barrier = Arc::clone(&barrier);
+        let registration = tokio::task::spawn_blocking(move || {
+            registration_barrier.wait();
+            registration_runtime
+                .register_engine(canonical_id, Arc::new(FakeEngine::new(Duration::ZERO)))
+        });
+        barrier.wait();
+        let deletion = runtime.delete(&manifest.canonical_id, &store, &manifest);
+        let registration = registration.await?;
+        match (registration, deletion) {
+            (Ok(()), Err(LifecycleError::InUse) | Ok(false)) => {}
+            (registration, deletion) => {
+                return Err(format!(
+                    "unexpected registration/deletion outcome: {registration:?}, {deletion:?}"
+                )
+                .into());
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
 
