@@ -49,4 +49,25 @@ Every transport maps failures to the stable codes `invalid_request`, `model_unav
 `queue_full`, `cancelled`, `deadline_exceeded`, `inference_failed`, and `internal`, together with
 explicit retryability. Public messages are privacy-reviewed static text. Runtime errors, paths, and
 other diagnostic sources remain separate and may only enter explicitly access-controlled debug
-telemetry; they are never serialized to clients or ordinary logs.
+telemetry; they are never reachable through the standard Rust error source chain, serialized to
+clients, or included in ordinary logs.
+
+### Normative gRPC error mapping (v1)
+
+Failed gRPC requests use the status and `impossible.embedding.v1.PublicErrorDetail` values below.
+The detail message is the privacy-reviewed core public message. Enum numbers in the protobuf are
+stable for the lifetime of v1; clients must treat unspecified or unknown enum values defensively.
+
+| Core code | Protobuf `ErrorCode` | gRPC status | Retryability |
+| --- | --- | --- | --- |
+| `invalid_request` | `ERROR_CODE_INVALID_REQUEST` | `INVALID_ARGUMENT` | `RETRYABILITY_NEVER` |
+| `model_unavailable` | `ERROR_CODE_MODEL_UNAVAILABLE` | `UNAVAILABLE` | `RETRYABILITY_RETRYABLE` |
+| `queue_full` | `ERROR_CODE_QUEUE_FULL` | `RESOURCE_EXHAUSTED` | `RETRYABILITY_RETRYABLE` |
+| `cancelled` | `ERROR_CODE_CANCELLED` | `CANCELLED` | `RETRYABILITY_NEVER` |
+| `deadline_exceeded` | `ERROR_CODE_DEADLINE_EXCEEDED` | `DEADLINE_EXCEEDED` | `RETRYABILITY_NEVER` |
+| `inference_failed` | `ERROR_CODE_INFERENCE_FAILED` | `INTERNAL` | `RETRYABILITY_UNKNOWN` |
+| `internal` | `ERROR_CODE_INTERNAL` | `INTERNAL` | `RETRYABILITY_UNKNOWN` |
+
+Cancellation and deadline checks run after native inference on both success and failure paths.
+When cancellation or deadline expiry is observed after dispatch, that control-state failure takes
+precedence over any late engine result, including a simultaneous engine failure.

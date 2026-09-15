@@ -279,13 +279,10 @@ impl fmt::Display for EngineFailure {
     }
 }
 
-impl Error for EngineFailure {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn Error + 'static))
-    }
-}
+// Intentionally do not expose the diagnostic through `Error::source`. Generic error reporters
+// commonly traverse that chain into ordinary logs and client responses. Callers that are allowed
+// to handle private diagnostics must opt in through `diagnostic_source` instead.
+impl Error for EngineFailure {}
 
 /// Cloneable cancellation signal shared by admission, engine, and response layers.
 #[derive(Debug, Clone, Default)]
@@ -382,14 +379,23 @@ pub fn execute_embedding(
     control: &ExecutionControl,
 ) -> Result<EmbeddingOutput, EngineFailure> {
     control.ensure_active()?;
-    let result = engine.embed(requested_model, batch, control)?;
+    let result = engine.embed(requested_model, batch, control);
     control.ensure_active()?;
-    Ok(result)
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn format_error_chain(mut error: &(dyn Error + 'static)) -> String {
+        let mut messages = vec![error.to_string()];
+        while let Some(source) = error.source() {
+            messages.push(source.to_string());
+            error = source;
+        }
+        messages.join(": ")
+    }
 
     fn identity() -> Result<ResolvedModelIdentity, EngineFailure> {
         ResolvedModelIdentity::new(
@@ -401,6 +407,10 @@ mod tests {
     }
 
     struct CancelsDuringInference;
+
+    struct CancelsThenFails;
+
+    struct ExpiresThenFails;
 
     struct MustNotRun;
 
@@ -428,6 +438,35 @@ mod tests {
                 vectors: vec![vec![1.0]],
                 model: identity()?,
             })
+        }
+    }
+
+    impl EmbeddingEngine for CancelsThenFails {
+        fn embed(
+            &self,
+            _requested_model: &RequestedModel,
+            _batch: &EmbeddingBatch<'_>,
+            control: &ExecutionControl,
+        ) -> Result<EmbeddingOutput, EngineFailure> {
+            control.cancellation().cancel();
+            Err(EngineFailure::public(ErrorCode::InferenceFailed))
+        }
+    }
+
+    impl EmbeddingEngine for ExpiresThenFails {
+        fn embed(
+            &self,
+            _requested_model: &RequestedModel,
+            _batch: &EmbeddingBatch<'_>,
+            control: &ExecutionControl,
+        ) -> Result<EmbeddingOutput, EngineFailure> {
+            let Some(deadline) = control.deadline else {
+                return Err(EngineFailure::public(ErrorCode::Internal));
+            };
+            while Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            Err(EngineFailure::public(ErrorCode::InferenceFailed))
         }
     }
 
@@ -492,6 +531,35 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_takes_precedence_over_late_engine_failure() -> Result<(), EngineFailure> {
+        let batch = EmbeddingBatch::new([Cow::Borrowed("input")])?;
+        let requested = RequestedModel::new("default")?;
+        let control = ExecutionControl::new(CancellationToken::default(), None);
+        let Some(error) = execute_embedding(&CancelsThenFails, &requested, &batch, &control).err()
+        else {
+            return Err(EngineFailure::public(ErrorCode::Internal));
+        };
+        assert_eq!(error.public_error().code, ErrorCode::Cancelled);
+        Ok(())
+    }
+
+    #[test]
+    fn deadline_takes_precedence_over_late_engine_failure() -> Result<(), EngineFailure> {
+        let batch = EmbeddingBatch::new([Cow::Borrowed("input")])?;
+        let requested = RequestedModel::new("default")?;
+        let control = ExecutionControl::new(
+            CancellationToken::default(),
+            Some(Instant::now() + std::time::Duration::from_millis(10)),
+        );
+        let Some(error) = execute_embedding(&ExpiresThenFails, &requested, &batch, &control).err()
+        else {
+            return Err(EngineFailure::public(ErrorCode::Internal));
+        };
+        assert_eq!(error.public_error().code, ErrorCode::DeadlineExceeded);
+        Ok(())
+    }
+
+    #[test]
     fn public_error_codes_have_stable_wire_values() {
         assert_eq!(ErrorCode::InvalidRequest.as_str(), "invalid_request");
         assert_eq!(ErrorCode::ModelUnavailable.as_str(), "model_unavailable");
@@ -511,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_output_never_formats_private_source() {
+    fn ordinary_error_reporting_never_exposes_private_source() {
         #[derive(Debug)]
         struct SensitiveDiagnostic;
         impl fmt::Display for SensitiveDiagnostic {
@@ -525,6 +593,18 @@ mod tests {
         let debug = format!("{failure:?}");
         assert!(!debug.contains("private local path"));
         assert_eq!(failure.to_string(), "embedding inference failed");
+        assert!(std::error::Error::source(&failure).is_none());
+
+        let ordinary_chain = format_error_chain(&failure);
+        assert_eq!(ordinary_chain, "embedding inference failed");
+        assert!(!ordinary_chain.contains("private local path"));
+
+        let diagnostic = failure
+            .diagnostic_source()
+            .map(ToString::to_string)
+            .ok_or("private diagnostics must remain explicitly accessible")
+            .unwrap_or_default();
+        assert_eq!(diagnostic, "private local path");
         assert!(failure.diagnostic_source().is_some());
     }
 }

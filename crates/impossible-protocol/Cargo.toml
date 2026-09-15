@@ -9,6 +9,7 @@ repository.workspace = true
 build = "build.rs"
 
 [dependencies]
+impossible-embedding-core = { path = "../impossible-embedding-core" }
 prost.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true

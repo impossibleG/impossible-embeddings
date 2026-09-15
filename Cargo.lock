@@ -353,6 +353,7 @@ dependencies = [
 name = "impossible-protocol"
 version = "0.1.0"
 dependencies = [
+ "impossible-embedding-core",
  "prost",
  "protoc-bin-vendored",
  "tonic",
