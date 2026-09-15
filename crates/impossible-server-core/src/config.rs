@@ -40,6 +40,8 @@ pub struct Limits {
     pub max_queue_depth: usize,
     /// Maximum inputs combined by dynamic batching.
     pub max_batch_items: usize,
+    /// Maximum estimated tokens combined by dynamic batching.
+    pub max_batch_tokens: usize,
     /// Maximum concurrent inference calls.
     pub max_concurrency: usize,
     /// End-to-end request timeout.
@@ -56,6 +58,7 @@ impl Default for Limits {
             max_tokens: 32_768,
             max_queue_depth: 256,
             max_batch_items: 128,
+            max_batch_tokens: 32_768,
             max_concurrency: 4,
             request_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(20),
@@ -130,6 +133,7 @@ pub enum ConfigKey {
     MaxTokens,
     MaxQueueDepth,
     MaxBatchItems,
+    MaxBatchTokens,
     MaxConcurrency,
     RequestTimeout,
     ShutdownTimeout,
@@ -157,6 +161,7 @@ impl ConfigKey {
             Self::MaxTokens => "limits.max_tokens",
             Self::MaxQueueDepth => "limits.max_queue_depth",
             Self::MaxBatchItems => "limits.max_batch_items",
+            Self::MaxBatchTokens => "limits.max_batch_tokens",
             Self::MaxConcurrency => "limits.max_concurrency",
             Self::RequestTimeout => "limits.request_timeout_ms",
             Self::ShutdownTimeout => "limits.shutdown_timeout_ms",
@@ -514,6 +519,7 @@ where
             "MAX_TOKENS" => ConfigKey::MaxTokens,
             "MAX_QUEUE_DEPTH" => ConfigKey::MaxQueueDepth,
             "MAX_BATCH_ITEMS" => ConfigKey::MaxBatchItems,
+            "MAX_BATCH_TOKENS" => ConfigKey::MaxBatchTokens,
             "MAX_CONCURRENCY" => ConfigKey::MaxConcurrency,
             "REQUEST_TIMEOUT_MS" => ConfigKey::RequestTimeout,
             "SHUTDOWN_TIMEOUT_MS" => ConfigKey::ShutdownTimeout,
@@ -566,6 +572,7 @@ where
             "max_tokens" => "limits.max_tokens",
             "max_queue_depth" => "limits.max_queue_depth",
             "max_batch_items" => "limits.max_batch_items",
+            "max_batch_tokens" => "limits.max_batch_tokens",
             "max_concurrency" => "limits.max_concurrency",
             "request_timeout_ms" => "limits.request_timeout_ms",
             "shutdown_timeout_ms" => "limits.shutdown_timeout_ms",
@@ -616,6 +623,7 @@ fn parse_key(key: &str) -> Option<ConfigKey> {
         "limits.max_tokens" => Some(ConfigKey::MaxTokens),
         "limits.max_queue_depth" => Some(ConfigKey::MaxQueueDepth),
         "limits.max_batch_items" => Some(ConfigKey::MaxBatchItems),
+        "limits.max_batch_tokens" => Some(ConfigKey::MaxBatchTokens),
         "limits.max_concurrency" => Some(ConfigKey::MaxConcurrency),
         "limits.request_timeout_ms" => Some(ConfigKey::RequestTimeout),
         "limits.shutdown_timeout_ms" => Some(ConfigKey::ShutdownTimeout),
@@ -679,6 +687,7 @@ fn apply_value(
         ConfigKey::MaxTokens => target.limits.max_tokens = parse_usize(scalar()?, key)?,
         ConfigKey::MaxQueueDepth => target.limits.max_queue_depth = parse_usize(scalar()?, key)?,
         ConfigKey::MaxBatchItems => target.limits.max_batch_items = parse_usize(scalar()?, key)?,
+        ConfigKey::MaxBatchTokens => target.limits.max_batch_tokens = parse_usize(scalar()?, key)?,
         ConfigKey::MaxConcurrency => target.limits.max_concurrency = parse_usize(scalar()?, key)?,
         ConfigKey::RequestTimeout => {
             target.limits.request_timeout = parse_duration(scalar()?, key)?;
@@ -777,6 +786,12 @@ fn validate_bounds(limits: &Limits) -> Result<(), ConfigError> {
         (ConfigKey::MaxTokens, limits.max_tokens, 1, 1_000_000),
         (ConfigKey::MaxQueueDepth, limits.max_queue_depth, 1, 100_000),
         (ConfigKey::MaxBatchItems, limits.max_batch_items, 1, 4096),
+        (
+            ConfigKey::MaxBatchTokens,
+            limits.max_batch_tokens,
+            1,
+            10_000_000,
+        ),
         (ConfigKey::MaxConcurrency, limits.max_concurrency, 1, 1024),
     ] {
         if !(min..=max).contains(&value) {
@@ -796,6 +811,18 @@ fn validate_bounds(limits: &Limits) -> Result<(), ConfigError> {
                 reason: "outside supported bounds",
             });
         }
+    }
+    if limits.max_items > limits.max_batch_items {
+        return Err(ConfigError::InvalidValue {
+            key: ConfigKey::MaxBatchItems,
+            reason: "must be at least limits.max_items",
+        });
+    }
+    if limits.max_tokens > limits.max_batch_tokens {
+        return Err(ConfigError::InvalidValue {
+            key: ConfigKey::MaxBatchTokens,
+            reason: "must be at least limits.max_tokens",
+        });
     }
     Ok(())
 }

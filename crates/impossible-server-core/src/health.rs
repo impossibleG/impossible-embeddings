@@ -149,6 +149,18 @@ impl HealthRegistry {
         }
     }
 
+    /// Remove an opaque model entry after unload or an abandoned lifecycle operation.
+    ///
+    /// Returning whether an entry existed makes cleanup idempotent without exposing identity.
+    #[must_use]
+    pub fn remove_model(&self, key: ModelKey) -> bool {
+        self.0
+            .write()
+            .ok()
+            .and_then(|mut state| state.models.remove(&key))
+            .is_some()
+    }
+
     /// Register model artifact readiness from the canonical verification status.
     ///
     /// A loadable identity becomes [`ModelState::Loading`]; only the runtime adapter may promote
@@ -265,5 +277,12 @@ mod tests {
         health.set_model(ModelKey(1), ModelState::Ready);
         assert_eq!(health.readiness().reason_code, None);
         assert!(health.readiness().is_ready());
+
+        assert!(health.remove_model(ModelKey(1)));
+        assert_eq!(
+            health.readiness().reason_code,
+            Some(ReadinessReason::NoModelsConfigured)
+        );
+        assert!(!health.remove_model(ModelKey(1)));
     }
 }

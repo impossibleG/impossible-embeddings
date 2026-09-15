@@ -9,15 +9,17 @@ use impossible_models::{
     CancelToken as InstallCancelToken, Installer, Manifest, ModelStatus, ModelStore,
 };
 use impossible_server_core::{
-    HealthRegistry, LifecycleState, ModelFailureReason, ModelKey, ModelState, ReadinessReason,
-    ShutdownCoordinator,
+    HealthRegistry, LifecycleState, ModelKey, ModelState, ReadinessReason, ShutdownCoordinator,
+    config::Limits,
     metrics::{Metrics, Operation, Outcome},
+    shutdown::WorkPermit,
 };
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
     fmt,
     future::Future,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -26,7 +28,10 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    task::JoinHandle,
+};
 
 /// Engine operations required by the application layer.
 pub trait RuntimeEngine: Send + Sync + 'static {
@@ -70,6 +75,10 @@ impl RuntimeEngine for OnnxEmbeddingEngine {
 pub struct BatchPolicy {
     /// Waiting requests accepted per loaded model.
     pub queue_depth: usize,
+    /// Inputs allowed in one caller request.
+    pub max_items: usize,
+    /// Estimated tokens allowed in one caller request.
+    pub max_tokens: usize,
     /// Inputs in one native call.
     pub max_batch_items: usize,
     /// Estimated tokens in one native call.
@@ -86,6 +95,8 @@ impl Default for BatchPolicy {
     fn default() -> Self {
         Self {
             queue_depth: 256,
+            max_items: 128,
+            max_tokens: 32_768,
             max_batch_items: 128,
             max_batch_tokens: 32_768,
             max_batch_wait: Duration::from_millis(4),
@@ -98,14 +109,36 @@ impl Default for BatchPolicy {
 impl BatchPolicy {
     fn validate(self) -> Result<Self, LifecycleError> {
         if self.queue_depth == 0
+            || self.max_items == 0
+            || self.max_tokens == 0
             || self.max_batch_items == 0
             || self.max_batch_tokens == 0
             || self.blocking_concurrency == 0
             || self.request_timeout.is_zero()
+            || self.max_items > self.max_batch_items
+            || self.max_tokens > self.max_batch_tokens
         {
             return Err(LifecycleError::InvalidPolicy);
         }
         Ok(self)
+    }
+}
+
+impl BatchPolicy {
+    /// Build scheduler policy explicitly from the validated server resource limits.
+    /// Request bounds and cross-request native batch bounds remain independent.
+    #[must_use]
+    pub fn from_limits(limits: &Limits, max_batch_wait: Duration) -> Self {
+        Self {
+            queue_depth: limits.max_queue_depth,
+            max_items: limits.max_items,
+            max_tokens: limits.max_tokens,
+            max_batch_items: limits.max_batch_items,
+            max_batch_tokens: limits.max_batch_tokens,
+            max_batch_wait,
+            blocking_concurrency: limits.max_concurrency,
+            request_timeout: limits.request_timeout,
+        }
     }
 }
 
@@ -166,7 +199,11 @@ impl BlockingPool {
                     loop {
                         let job = receiver.lock().ok().and_then(|guard| guard.recv().ok());
                         match job {
-                            Some(job) => job(),
+                            Some(job) => {
+                                // A defective native adapter must fail its own job, never remove a
+                                // worker and silently reduce service capacity.
+                                let _ = catch_unwind(AssertUnwindSafe(job));
+                            }
                             None => break,
                         }
                     }
@@ -192,6 +229,7 @@ struct Request {
     control: ExecutionControl,
     response: oneshot::Sender<Result<EmbeddingOutput, EngineFailure>>,
     _lease: RuntimeLease,
+    queue: Option<QueuePermit>,
 }
 
 struct ModelSlot {
@@ -199,6 +237,12 @@ struct ModelSlot {
     sender: mpsc::Sender<Request>,
     leases: Arc<AtomicUsize>,
     accepting: Arc<AtomicBool>,
+    queued: Arc<AtomicUsize>,
+}
+
+struct SchedulerTask {
+    stop: watch::Sender<bool>,
+    handle: JoinHandle<()>,
 }
 
 /// RAII capability preventing unload/delete while application work refers to a model.
@@ -233,19 +277,152 @@ struct Inner {
     policy: BatchPolicy,
     models: RwLock<HashMap<String, Arc<ModelSlot>>>,
     loading: Mutex<HashMap<String, ModelKey>>,
-    installs: Mutex<HashMap<usize, InstallCancelToken>>,
+    installs: Arc<Mutex<HashMap<usize, InstallCancelToken>>>,
     health: HealthRegistry,
     shutdown: ShutdownCoordinator,
     pool: BlockingPool,
     next_key: AtomicUsize,
     draining: AtomicBool,
+    admin: Mutex<()>,
+    schedulers: Mutex<HashMap<ModelKey, SchedulerTask>>,
+    retired_schedulers: Mutex<Vec<JoinHandle<()>>>,
+    force_stop: watch::Sender<bool>,
     metrics: Metrics,
-    active: AtomicUsize,
+    active: Arc<AtomicUsize>,
+    queued: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum GaugeKind {
+    Active,
+    Queue,
+}
+
+struct GaugeGuard {
+    counter: Arc<AtomicUsize>,
+    metrics: Metrics,
+    kind: GaugeKind,
+}
+
+impl GaugeGuard {
+    fn increment(counter: Arc<AtomicUsize>, metrics: Metrics, kind: GaugeKind) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        match kind {
+            GaugeKind::Active => metrics.increment_active(),
+            GaugeKind::Queue => metrics.increment_queue_depth(),
+        }
+        Self {
+            counter,
+            metrics,
+            kind,
+        }
+    }
+}
+
+impl Drop for GaugeGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+        match self.kind {
+            GaugeKind::Active => self.metrics.decrement_active(),
+            GaugeKind::Queue => self.metrics.decrement_queue_depth(),
+        }
+    }
+}
+
+struct QueuePermit {
+    local: Arc<AtomicUsize>,
+    _global: GaugeGuard,
+}
+
+impl QueuePermit {
+    fn acquire(
+        local: Arc<AtomicUsize>,
+        global: Arc<AtomicUsize>,
+        metrics: Metrics,
+        limit: usize,
+    ) -> Option<Self> {
+        local
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                (value < limit).then_some(value + 1)
+            })
+            .ok()?;
+        Some(Self {
+            local,
+            _global: GaugeGuard::increment(global, metrics, GaugeKind::Queue),
+        })
+    }
+}
+
+impl Drop for QueuePermit {
+    fn drop(&mut self) {
+        self.local.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Cloneable application service shared by every transport adapter.
 #[derive(Clone)]
 pub struct ApplicationRuntime(Arc<Inner>);
+
+struct LoadReservation {
+    runtime: ApplicationRuntime,
+    model_id: String,
+    key: ModelKey,
+    armed: bool,
+}
+
+struct InstallRegistration {
+    installs: Arc<Mutex<HashMap<usize, InstallCancelToken>>>,
+    operation: usize,
+}
+
+struct CancelOnDrop {
+    cancellation: CancellationToken,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+        }
+    }
+}
+
+impl Drop for InstallRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut installs) = self.installs.lock() {
+            installs.remove(&self.operation);
+        }
+    }
+}
+
+impl LoadReservation {
+    fn publish(mut self, engine: Arc<dyn RuntimeEngine>) -> Result<(), LifecycleError> {
+        let result = self
+            .runtime
+            .register_reserved_engine(self.model_id.clone(), self.key, engine);
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+}
+
+impl Drop for LoadReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(_admin) = self.runtime.0.admin.lock() {
+            if let Ok(mut loading) = self.runtime.0.loading.lock() {
+                if loading.get(&self.model_id) == Some(&self.key) {
+                    loading.remove(&self.model_id);
+                }
+            }
+            let _ = self.runtime.0.health.remove_model(self.key);
+        }
+    }
+}
 
 impl ApplicationRuntime {
     /// Construct a runtime with validated finite resource bounds.
@@ -256,18 +433,24 @@ impl ApplicationRuntime {
         let policy = policy.validate()?;
         let health = HealthRegistry::default();
         let _ = health.transition(LifecycleState::Ready, None);
+        let (force_stop, _) = watch::channel(false);
         Ok(Self(Arc::new(Inner {
             policy,
             models: RwLock::new(HashMap::new()),
             loading: Mutex::new(HashMap::new()),
-            installs: Mutex::new(HashMap::new()),
+            installs: Arc::new(Mutex::new(HashMap::new())),
             health,
             shutdown: ShutdownCoordinator::default(),
             pool: BlockingPool::new(policy.blocking_concurrency, policy.queue_depth),
             next_key: AtomicUsize::new(1),
             draining: AtomicBool::new(false),
+            admin: Mutex::new(()),
+            schedulers: Mutex::new(HashMap::new()),
+            retired_schedulers: Mutex::new(Vec::new()),
+            force_stop,
             metrics: Metrics::default(),
-            active: AtomicUsize::new(0),
+            active: Arc::new(AtomicUsize::new(0)),
+            queued: Arc::new(AtomicUsize::new(0)),
         })))
     }
 
@@ -304,40 +487,61 @@ impl ApplicationRuntime {
         model_id: impl Into<String>,
         engine: Arc<dyn RuntimeEngine>,
     ) -> Result<(), LifecycleError> {
-        if self.0.draining.load(Ordering::Acquire) {
-            return Err(LifecycleError::ShuttingDown);
-        }
         let model_id = model_id.into();
         if model_id.trim().is_empty() {
             return Err(LifecycleError::LoadFailed);
+        }
+        let _admin = self
+            .0
+            .admin
+            .lock()
+            .map_err(|_| LifecycleError::LoadFailed)?;
+        if self.0.draining.load(Ordering::Acquire) {
+            return Err(LifecycleError::ShuttingDown);
         }
         let mut models = self
             .0
             .models
             .write()
             .map_err(|_| LifecycleError::LoadFailed)?;
-        if models.contains_key(&model_id) {
+        if models.contains_key(&model_id)
+            || self
+                .0
+                .loading
+                .lock()
+                .is_ok_and(|loading| loading.contains_key(&model_id))
+        {
             return Err(LifecycleError::AlreadyLoaded);
         }
         let key_value = self.0.next_key.fetch_add(1, Ordering::Relaxed);
         let key = ModelKey(u64::try_from(key_value).unwrap_or(u64::MAX));
+        // Channel capacity is only an implementation detail. QueuePermit below is the single
+        // admission authority across channel, scheduler pending state, and native-pool waiting.
         let (sender, receiver) = mpsc::channel(self.0.policy.queue_depth);
         let leases = Arc::new(AtomicUsize::new(0));
         let accepting = Arc::new(AtomicBool::new(true));
+        let queued = Arc::new(AtomicUsize::new(0));
         let slot = Arc::new(ModelSlot {
             key,
             sender,
             leases,
             accepting: Arc::clone(&accepting),
+            queued,
         });
         models.insert(model_id.clone(), Arc::clone(&slot));
         drop(models);
         self.0.health.set_model(key, ModelState::Ready);
         let policy = self.0.policy;
         let pool = self.0.pool.clone();
-        tokio::spawn(run_scheduler(
-            receiver, model_id, engine, policy, pool, accepting,
+        let (stop, stop_rx) = watch::channel(false);
+        let handle = tokio::spawn(run_scheduler(
+            receiver, model_id, engine, policy, pool, accepting, stop_rx,
         ));
+        self.0
+            .schedulers
+            .lock()
+            .map_err(|_| LifecycleError::LoadFailed)?
+            .insert(key, SchedulerTask { stop, handle });
         Ok(())
     }
 
@@ -350,13 +554,31 @@ impl ApplicationRuntime {
         store: ModelStore,
         manifest: Manifest,
     ) -> Result<(), LifecycleError> {
-        if self.0.draining.load(Ordering::Acquire) {
-            return Err(LifecycleError::ShuttingDown);
-        }
+        let permit = self
+            .0
+            .shutdown
+            .admit()
+            .ok_or(LifecycleError::ShuttingDown)?;
         let model_id = manifest.canonical_id.clone();
         let key_value = self.0.next_key.fetch_add(1, Ordering::Relaxed);
         let key = ModelKey(u64::try_from(key_value).unwrap_or(u64::MAX));
+        // Construct cleanup ownership before publishing the reservation. Cancellation at every
+        // later await or early return then has an owner that can remove both registry entries.
+        let reservation = LoadReservation {
+            runtime: self.clone(),
+            model_id: model_id.clone(),
+            key,
+            armed: true,
+        };
         {
+            let _admin = self
+                .0
+                .admin
+                .lock()
+                .map_err(|_| LifecycleError::LoadFailed)?;
+            if self.0.draining.load(Ordering::Acquire) {
+                return Err(LifecycleError::ShuttingDown);
+            }
             let models = self
                 .0
                 .models
@@ -371,10 +593,11 @@ impl ApplicationRuntime {
                 return Err(LifecycleError::AlreadyLoaded);
             }
             loading.insert(model_id.clone(), key);
+            self.0.health.set_model(key, ModelState::Loading);
         }
-        self.0.health.set_model(key, ModelState::Loading);
         let (tx, rx) = oneshot::channel();
         let job = Box::new(move || {
+            let _permit: WorkPermit = permit;
             let result = store
                 .verified_model(&manifest)
                 .map_err(|_| LifecycleError::LoadFailed)
@@ -386,42 +609,17 @@ impl ApplicationRuntime {
                     engine.warm().map_err(|_| LifecycleError::LoadFailed)?;
                     Ok(Arc::new(engine) as Arc<dyn RuntimeEngine>)
                 });
-            let _ = tx.send(result);
+            let _ = tx.send((result, reservation));
         }) as BlockingJob;
         if self.0.pool.try_execute(job).is_err() {
-            self.finish_failed_load(&model_id, key);
             return Err(LifecycleError::InUse);
         }
-        let engine = match rx.await {
-            Ok(Ok(engine)) => engine,
-            Ok(Err(error)) => {
-                self.finish_failed_load(&model_id, key);
-                return Err(error);
-            }
-            Err(_) => {
-                self.finish_failed_load(&model_id, key);
-                return Err(LifecycleError::LoadFailed);
-            }
+        let (result, reservation) = rx.await.map_err(|_| LifecycleError::LoadFailed)?;
+        let engine = match result {
+            Ok(engine) => engine,
+            Err(error) => return Err(error),
         };
-        if self.0.draining.load(Ordering::Acquire) {
-            self.finish_failed_load(&model_id, key);
-            return Err(LifecycleError::ShuttingDown);
-        }
-        let result = self.register_reserved_engine(model_id.clone(), key, engine);
-        if let Ok(mut loading) = self.0.loading.lock() {
-            loading.remove(&model_id);
-        }
-        result
-    }
-
-    fn finish_failed_load(&self, model_id: &str, key: ModelKey) {
-        if let Ok(mut loading) = self.0.loading.lock() {
-            loading.remove(model_id);
-        }
-        self.0.health.set_model(
-            key,
-            ModelState::Failed(ModelFailureReason::RuntimeInitializationFailed),
-        );
+        reservation.publish(engine)
     }
 
     fn register_reserved_engine(
@@ -430,6 +628,14 @@ impl ApplicationRuntime {
         key: ModelKey,
         engine: Arc<dyn RuntimeEngine>,
     ) -> Result<(), LifecycleError> {
+        let _admin = self
+            .0
+            .admin
+            .lock()
+            .map_err(|_| LifecycleError::LoadFailed)?;
+        if self.0.draining.load(Ordering::Acquire) {
+            return Err(LifecycleError::ShuttingDown);
+        }
         let mut models = self
             .0
             .models
@@ -438,9 +644,21 @@ impl ApplicationRuntime {
         if models.contains_key(&model_id) {
             return Err(LifecycleError::AlreadyLoaded);
         }
+        {
+            let mut loading = self
+                .0
+                .loading
+                .lock()
+                .map_err(|_| LifecycleError::LoadFailed)?;
+            if loading.get(&model_id) != Some(&key) {
+                return Err(LifecycleError::LoadFailed);
+            }
+            loading.remove(&model_id);
+        }
         let (sender, receiver) = mpsc::channel(self.0.policy.queue_depth);
         let leases = Arc::new(AtomicUsize::new(0));
         let accepting = Arc::new(AtomicBool::new(true));
+        let queued = Arc::new(AtomicUsize::new(0));
         models.insert(
             model_id.clone(),
             Arc::new(ModelSlot {
@@ -448,18 +666,26 @@ impl ApplicationRuntime {
                 sender,
                 leases,
                 accepting: Arc::clone(&accepting),
+                queued,
             }),
         );
         drop(models);
         self.0.health.set_model(key, ModelState::Ready);
-        tokio::spawn(run_scheduler(
+        let (stop, stop_rx) = watch::channel(false);
+        let handle = tokio::spawn(run_scheduler(
             receiver,
             model_id,
             engine,
             self.0.policy,
             self.0.pool.clone(),
             accepting,
+            stop_rx,
         ));
+        self.0
+            .schedulers
+            .lock()
+            .map_err(|_| LifecycleError::LoadFailed)?
+            .insert(key, SchedulerTask { stop, handle });
         Ok(())
     }
 
@@ -500,10 +726,11 @@ impl ApplicationRuntime {
             .lock()
             .map_err(|_| LifecycleError::InstallFailed)?
             .insert(operation, cancellation.clone());
+        let _registration = InstallRegistration {
+            installs: Arc::clone(&self.0.installs),
+            operation,
+        };
         let result = installer.install(manifest, &cancellation).await;
-        if let Ok(mut installs) = self.0.installs.lock() {
-            installs.remove(&operation);
-        }
         result.map_err(|_| LifecycleError::InstallFailed)
     }
 
@@ -534,17 +761,14 @@ impl ApplicationRuntime {
         deadline: Option<Instant>,
     ) -> Result<EmbeddingOutput, EngineFailure> {
         let started = Instant::now();
-        let active = self.0.active.fetch_add(1, Ordering::AcqRel) + 1;
-        self.0.metrics.set_active(active);
+        let _active = GaugeGuard::increment(
+            Arc::clone(&self.0.active),
+            self.0.metrics.clone(),
+            GaugeKind::Active,
+        );
         let result = self
             .embed_inner(model_id, inputs, options, cancellation, deadline)
             .await;
-        let remaining = self
-            .0
-            .active
-            .fetch_sub(1, Ordering::AcqRel)
-            .saturating_sub(1);
-        self.0.metrics.set_active(remaining);
         let outcome = match &result {
             Ok(_) => Outcome::Ok,
             Err(error) => match error.public_error().code {
@@ -571,16 +795,21 @@ impl ApplicationRuntime {
         cancellation: CancellationToken,
         deadline: Option<Instant>,
     ) -> Result<EmbeddingOutput, EngineFailure> {
+        // Start the server cap before admission, validation, and registry locks so it is genuinely
+        // end-to-end rather than only an inference-response timeout.
+        let server_deadline = Instant::now()
+            .checked_add(self.0.policy.request_timeout)
+            .ok_or_else(|| EngineFailure::public(ErrorCode::Internal))?;
         let _permit = self
             .0
             .shutdown
             .admit()
             .ok_or_else(|| EngineFailure::public(ErrorCode::ModelUnavailable))?;
-        if inputs.is_empty() || inputs.len() > self.0.policy.max_batch_items {
+        if inputs.is_empty() || inputs.len() > self.0.policy.max_items {
             return Err(EngineFailure::public(ErrorCode::InvalidRequest));
         }
         let token_estimate = estimate_tokens(&inputs);
-        if token_estimate > self.0.policy.max_batch_tokens {
+        if token_estimate > self.0.policy.max_tokens {
             return Err(EngineFailure::public(ErrorCode::InvalidRequest));
         }
         let slot = {
@@ -602,17 +831,25 @@ impl ApplicationRuntime {
             .lease(model_id)
             .map_err(|_| EngineFailure::public(ErrorCode::ModelUnavailable))?;
         let effective_deadline =
-            deadline.or_else(|| Instant::now().checked_add(self.0.policy.request_timeout));
-        let control = ExecutionControl::new(cancellation.clone(), effective_deadline);
+            deadline.map_or(server_deadline, |caller| caller.min(server_deadline));
+        let control = ExecutionControl::new(cancellation.clone(), Some(effective_deadline));
         control.ensure_active()?;
+        let queue = QueuePermit::acquire(
+            Arc::clone(&slot.queued),
+            Arc::clone(&self.0.queued),
+            self.0.metrics.clone(),
+            self.0.policy.queue_depth,
+        )
+        .ok_or_else(|| EngineFailure::public(ErrorCode::QueueFull))?;
         let (response, receive) = oneshot::channel();
         let request = Request {
             inputs,
             token_estimate,
             options,
-            control,
+            control: control.clone(),
             response,
             _lease: lease,
+            queue: Some(queue),
         };
         slot.sender.try_send(request).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => EngineFailure::public(ErrorCode::QueueFull),
@@ -620,17 +857,14 @@ impl ApplicationRuntime {
                 EngineFailure::public(ErrorCode::ModelUnavailable)
             }
         })?;
-        let wait = effective_deadline.map_or(self.0.policy.request_timeout, |value| {
-            value.saturating_duration_since(Instant::now())
-        });
-        match tokio::time::timeout(wait, receive).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(EngineFailure::public(ErrorCode::ModelUnavailable)),
-            Err(_) => {
-                cancellation.cancel();
-                Err(EngineFailure::public(ErrorCode::DeadlineExceeded))
-            }
-        }
+        await_response(
+            control,
+            cancellation,
+            receive,
+            self.0.force_stop.subscribe(),
+            effective_deadline,
+        )
+        .await
     }
 
     /// Unregister an idle model. Existing leases make the operation fail without partial mutation.
@@ -638,6 +872,10 @@ impl ApplicationRuntime {
     /// # Errors
     /// Returns not-found or in-use without changing the registry.
     pub fn unload(&self, model_id: &str) -> Result<(), LifecycleError> {
+        let _admin = self.0.admin.lock().map_err(|_| LifecycleError::NotFound)?;
+        if self.0.draining.load(Ordering::Acquire) {
+            return Err(LifecycleError::ShuttingDown);
+        }
         let mut models = self
             .0
             .models
@@ -649,7 +887,16 @@ impl ApplicationRuntime {
         }
         slot.accepting.store(false, Ordering::Release);
         let slot = models.remove(model_id).ok_or(LifecycleError::NotFound)?;
-        self.0.health.set_model(slot.key, ModelState::Unloaded);
+        if let Ok(mut schedulers) = self.0.schedulers.lock() {
+            if let Some(task) = schedulers.remove(&slot.key) {
+                let _ = task.stop.send(true);
+                if let Ok(mut retired) = self.0.retired_schedulers.lock() {
+                    retired.retain(|handle| !handle.is_finished());
+                    retired.push(task.handle);
+                }
+            }
+        }
+        let _ = self.0.health.remove_model(slot.key);
         Ok(())
     }
 
@@ -678,6 +925,9 @@ impl ApplicationRuntime {
 
     /// Reject new work, allow accepted work to drain, then cancel and discard remaining work.
     pub async fn shutdown(&self, timeout: Duration) -> bool {
+        let Ok(admin) = self.0.admin.lock() else {
+            return false;
+        };
         if self.0.draining.swap(true, Ordering::AcqRel) {
             return self.0.shutdown.wait(Duration::ZERO);
         }
@@ -686,6 +936,7 @@ impl ApplicationRuntime {
             .health
             .transition(LifecycleState::Draining, Some(ReadinessReason::Draining));
         self.0.shutdown.begin();
+        drop(admin);
         let started = Instant::now();
         while started.elapsed() < timeout {
             if self.0.shutdown.wait(Duration::ZERO) {
@@ -700,11 +951,37 @@ impl ApplicationRuntime {
                     cancellation.cancel();
                 }
             }
+            let _ = self.0.force_stop.send(true);
         }
         if let Ok(models) = self.0.models.read() {
             for slot in models.values() {
                 slot.accepting.store(false, Ordering::Release);
             }
+        }
+        let mut tasks = self
+            .0
+            .schedulers
+            .lock()
+            .map(|mut schedulers| {
+                schedulers
+                    .drain()
+                    .map(|(_, task)| {
+                        let _ = task.stop.send(true);
+                        task.handle
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Ok(mut retired) = self.0.retired_schedulers.lock() {
+            tasks.extend(retired.drain(..));
+        }
+        for task in tasks {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                drop(task);
+                continue;
+            }
+            let _ = tokio::time::timeout(remaining, task).await;
         }
         let _ = self
             .0
@@ -712,6 +989,54 @@ impl ApplicationRuntime {
             .transition(LifecycleState::Stopped, Some(ReadinessReason::Stopped));
         drained
     }
+}
+
+async fn await_response(
+    control: ExecutionControl,
+    cancellation: CancellationToken,
+    mut receive: oneshot::Receiver<Result<EmbeddingOutput, EngineFailure>>,
+    mut force_stop: watch::Receiver<bool>,
+    deadline: Instant,
+) -> Result<EmbeddingOutput, EngineFailure> {
+    let mut cancel_on_drop = CancelOnDrop {
+        cancellation: cancellation.clone(),
+        armed: true,
+    };
+    let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+    tokio::pin!(sleep);
+    let mut cancellation_poll = tokio::time::interval(Duration::from_millis(1));
+    let result = loop {
+        if let Err(error) = control.ensure_active() {
+            break Err(error);
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation_poll.tick() => continue,
+            changed = force_stop.changed() => {
+                if changed.is_err() || *force_stop.borrow() {
+                    break Err(EngineFailure::public(ErrorCode::ModelUnavailable));
+                }
+            }
+            () = &mut sleep => {
+                if cancellation.is_cancelled() {
+                    break Err(EngineFailure::public(ErrorCode::Cancelled));
+                }
+                break Err(EngineFailure::public(ErrorCode::DeadlineExceeded));
+            }
+            response = &mut receive => {
+                if let Err(error) = control.ensure_active() {
+                    break Err(error);
+                }
+                break response.unwrap_or_else(|_| {
+                    Err(EngineFailure::public(ErrorCode::ModelUnavailable))
+                });
+            }
+        }
+    };
+    if result.is_ok() {
+        cancel_on_drop.armed = false;
+    }
+    result
 }
 
 fn estimate_tokens(inputs: &[String]) -> usize {
@@ -731,19 +1056,42 @@ async fn run_scheduler(
     policy: BatchPolicy,
     pool: BlockingPool,
     accepting: Arc<AtomicBool>,
+    mut stop: watch::Receiver<bool>,
 ) {
     let mut pending = VecDeque::new();
     loop {
+        if *stop.borrow() {
+            receiver.close();
+            fail_requests(pending.drain(..).collect(), ErrorCode::ModelUnavailable);
+            while let Ok(request) = receiver.try_recv() {
+                fail_requests(vec![request], ErrorCode::ModelUnavailable);
+            }
+            break;
+        }
         if pending.is_empty() {
-            match receiver.recv().await {
-                Some(request) => pending.push_back(request),
-                None => break,
+            tokio::select! {
+                biased;
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        continue;
+                    }
+                }
+                request = receiver.recv() => match request {
+                    Some(request) => pending.push_back(request),
+                    None => break,
+                }
             }
         }
         let wait = tokio::time::sleep(policy.max_batch_wait);
         tokio::pin!(wait);
         loop {
             tokio::select! {
+                biased;
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        break;
+                    }
+                }
                 () = &mut wait => break,
                 request = receiver.recv() => match request {
                     Some(request) => pending.push_back(request),
@@ -753,6 +1101,9 @@ async fn run_scheduler(
             if pending.len() >= policy.queue_depth {
                 break;
             }
+        }
+        if *stop.borrow() {
+            continue;
         }
         while !pending.is_empty() {
             let Some(first) = pending.pop_front() else {
@@ -838,7 +1189,9 @@ fn execute_batch(
     accepting: &AtomicBool,
 ) {
     let mut active = Vec::with_capacity(requests.len());
-    for request in requests {
+    for mut request in requests {
+        // Admission queue accounting ends immediately before native execution starts.
+        drop(request.queue.take());
         if !accepting.load(Ordering::Acquire) {
             let _ = request
                 .response
@@ -867,14 +1220,23 @@ fn execute_batch(
         fail_requests(requests, ErrorCode::ModelUnavailable);
         return;
     };
-    let batch_control = ExecutionControl::new(CancellationToken::default(), None);
-    let result = engine.embed(&model, &batch, &batch_control, requests[0].options);
+    let batch_control = ExecutionControl::composite(
+        requests
+            .iter()
+            .map(|request| request.control.clone())
+            .collect::<Vec<_>>(),
+    );
+    // A panic is isolated to this batch and translated to the same stable failure as other native
+    // adapter faults. The outer worker boundary provides a second line of defense.
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        engine.embed(&model, &batch, &batch_control, requests[0].options)
+    }));
     match result {
-        Ok(output) if output.vectors.len() == sizes.iter().sum::<usize>() => {
+        Ok(Ok(output)) if output.vectors.len() == sizes.iter().sum::<usize>() => {
             publish_results(requests, sizes, output.vectors, &output.model, accepting);
         }
-        Ok(_) => fail_requests(requests, ErrorCode::InferenceFailed),
-        Err(error) => fail_requests(requests, error.public_error().code),
+        Ok(Ok(_)) | Err(_) => fail_requests(requests, ErrorCode::InferenceFailed),
+        Ok(Err(error)) => fail_requests(requests, error.public_error().code),
     }
 }
 
@@ -934,6 +1296,55 @@ mod tests {
         fail: bool,
     }
 
+    struct PanicOnceEngine(AtomicUsize);
+
+    impl RuntimeEngine for PanicOnceEngine {
+        fn embed(
+            &self,
+            _model: &RequestedModel,
+            batch: &EmbeddingBatch<'_>,
+            _control: &ExecutionControl,
+            _options: EmbedOptions,
+        ) -> Result<EmbeddingOutput, EngineFailure> {
+            if self.0.fetch_add(1, Ordering::AcqRel) == 0 {
+                std::panic::resume_unwind(Box::new("native fault"));
+            }
+            Ok(EmbeddingOutput {
+                vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
+                model: ResolvedModelIdentity::new("fake", "rev", "fake@1", "artifact", "semantic")?,
+            })
+        }
+
+        fn warm(&self) -> Result<(), EngineFailure> {
+            Ok(())
+        }
+    }
+
+    struct CooperativeEngine;
+
+    impl RuntimeEngine for CooperativeEngine {
+        fn embed(
+            &self,
+            _model: &RequestedModel,
+            batch: &EmbeddingBatch<'_>,
+            control: &ExecutionControl,
+            _options: EmbedOptions,
+        ) -> Result<EmbeddingOutput, EngineFailure> {
+            for _ in 0..30 {
+                control.ensure_active()?;
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(EmbeddingOutput {
+                vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
+                model: ResolvedModelIdentity::new("fake", "rev", "fake@1", "artifact", "semantic")?,
+            })
+        }
+
+        fn warm(&self) -> Result<(), EngineFailure> {
+            Ok(())
+        }
+    }
+
     impl FakeEngine {
         fn new(block: Duration) -> Self {
             Self {
@@ -991,12 +1402,39 @@ mod tests {
     fn policy() -> BatchPolicy {
         BatchPolicy {
             queue_depth: 8,
+            max_items: 8,
+            max_tokens: 32,
             max_batch_items: 8,
             max_batch_tokens: 32,
             max_batch_wait: Duration::from_millis(10),
             blocking_concurrency: 1,
             request_timeout: Duration::from_secs(2),
         }
+    }
+
+    #[test]
+    fn server_limits_convert_without_conflating_request_and_batch_bounds() {
+        let limits = Limits {
+            max_items: 3,
+            max_tokens: 30,
+            max_batch_items: 7,
+            max_batch_tokens: 70,
+            ..Limits::default()
+        };
+        let policy = BatchPolicy::from_limits(&limits, Duration::from_millis(9));
+        assert_eq!(policy.max_items, 3);
+        assert_eq!(policy.max_tokens, 30);
+        assert_eq!(policy.max_batch_items, 7);
+        assert_eq!(policy.max_batch_tokens, 70);
+        assert_eq!(policy.queue_depth, limits.max_queue_depth);
+        assert_eq!(policy.blocking_concurrency, limits.max_concurrency);
+        assert_eq!(policy.request_timeout, limits.request_timeout);
+        let mut invalid = policy;
+        invalid.max_batch_items = 2;
+        assert!(matches!(
+            ApplicationRuntime::new(invalid),
+            Err(LifecycleError::InvalidPolicy)
+        ));
     }
 
     #[tokio::test]
@@ -1135,6 +1573,264 @@ mod tests {
             .err()
             .ok_or("expected error")?;
         assert_eq!(error.public_error().code, ErrorCode::DeadlineExceeded);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn configured_timeout_caps_a_longer_caller_deadline_and_cancel_wins()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut limits = policy();
+        limits.request_timeout = Duration::from_millis(10);
+        let runtime = ApplicationRuntime::new(limits)?;
+        runtime.register_engine("fake", Arc::new(FakeEngine::new(Duration::from_millis(80))))?;
+        let started = Instant::now();
+        let error = runtime
+            .embed(
+                "fake",
+                vec!["x".into()],
+                EmbedOptions::default(),
+                CancellationToken::default(),
+                Some(Instant::now() + Duration::from_secs(5)),
+            )
+            .await
+            .err()
+            .ok_or("expected configured timeout")?;
+        assert_eq!(error.public_error().code, ErrorCode::DeadlineExceeded);
+        assert!(started.elapsed() < Duration::from_millis(60));
+
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let error = runtime
+            .embed(
+                "fake",
+                vec!["x".into()],
+                EmbedOptions::default(),
+                cancelled,
+                Some(Instant::now()),
+            )
+            .await
+            .err()
+            .ok_or("expected cancellation")?;
+        assert_eq!(error.public_error().code, ErrorCode::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_batch_control_does_not_abort_a_surviving_constituent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        runtime.register_engine("fake", Arc::new(CooperativeEngine))?;
+        let cancelled = CancellationToken::default();
+        let cancel_copy = cancelled.clone();
+        let first = runtime.embed(
+            "fake",
+            vec!["first".into()],
+            EmbedOptions::default(),
+            cancelled,
+            None,
+        );
+        let second = runtime.embed(
+            "fake",
+            vec!["second".into()],
+            EmbedOptions::default(),
+            CancellationToken::default(),
+            None,
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            cancel_copy.cancel();
+        });
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(
+            first.err().ok_or("first must cancel")?.public_error().code,
+            ErrorCode::Cancelled
+        );
+        assert_eq!(second?.vectors.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_panic_fails_one_batch_and_worker_recovers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut limits = policy();
+        limits.max_batch_wait = Duration::ZERO;
+        let runtime = ApplicationRuntime::new(limits)?;
+        runtime.register_engine("fake", Arc::new(PanicOnceEngine(AtomicUsize::new(0))))?;
+        let first = runtime
+            .embed(
+                "fake",
+                vec!["first".into()],
+                EmbedOptions::default(),
+                CancellationToken::default(),
+                None,
+            )
+            .await
+            .err()
+            .ok_or("panic must fail")?;
+        assert_eq!(first.public_error().code, ErrorCode::InferenceFailed);
+        let second = runtime
+            .embed(
+                "fake",
+                vec!["second".into()],
+                EmbedOptions::default(),
+                CancellationToken::default(),
+                None,
+            )
+            .await?;
+        assert_eq!(second.vectors.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exact_queue_capacity_and_abort_safe_gauges() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut limits = policy();
+        limits.queue_depth = 1;
+        limits.max_batch_wait = Duration::ZERO;
+        let runtime = ApplicationRuntime::new(limits)?;
+        let slow = Arc::new(FakeEngine::new(Duration::from_millis(100)));
+        runtime.register_engine("fake", slow.clone())?;
+        let first_runtime = runtime.clone();
+        let first = tokio::spawn(async move {
+            first_runtime
+                .embed(
+                    "fake",
+                    vec!["first".into()],
+                    EmbedOptions::default(),
+                    CancellationToken::default(),
+                    None,
+                )
+                .await
+        });
+        while slow.calls.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let queued_runtime = runtime.clone();
+        let queued = tokio::spawn(async move {
+            queued_runtime
+                .embed(
+                    "fake",
+                    vec!["queued".into()],
+                    EmbedOptions::default(),
+                    CancellationToken::default(),
+                    None,
+                )
+                .await
+        });
+        while !runtime
+            .metrics()
+            .render()
+            .contains("impossible_queue_depth 1")
+        {
+            tokio::task::yield_now().await;
+        }
+        let full = runtime
+            .embed(
+                "fake",
+                vec!["full".into()],
+                EmbedOptions::default(),
+                CancellationToken::default(),
+                None,
+            )
+            .await
+            .err()
+            .ok_or("queue depth one must reject the second waiter")?;
+        assert_eq!(full.public_error().code, ErrorCode::QueueFull);
+        queued.abort();
+        let _ = queued.await;
+        first.abort();
+        let _ = first.await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let metrics = runtime.metrics().render();
+        assert!(metrics.contains("impossible_active_requests 0"));
+        assert!(metrics.contains("impossible_queue_depth 0"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_wakes_native_request_and_prevents_late_success()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let slow = Arc::new(FakeEngine::new(Duration::from_millis(100)));
+        runtime.register_engine("fake", slow.clone())?;
+        let request_runtime = runtime.clone();
+        let request = tokio::spawn(async move {
+            request_runtime
+                .embed(
+                    "fake",
+                    vec!["x".into()],
+                    EmbedOptions::default(),
+                    CancellationToken::default(),
+                    None,
+                )
+                .await
+        });
+        while slow.calls.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!runtime.shutdown(Duration::ZERO).await);
+        let error = tokio::time::timeout(Duration::from_millis(20), request)
+            .await??
+            .err()
+            .ok_or("forced shutdown must fail accepted request")?;
+        assert_eq!(error.public_error().code, ErrorCode::ModelUnavailable);
+        assert!(!runtime.health().is_live());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_register_and_unload_does_not_accumulate_health_entries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        for _ in 0..20 {
+            runtime.register_engine("fake", Arc::new(FakeEngine::new(Duration::ZERO)))?;
+            runtime.unload("fake")?;
+            assert_eq!(runtime.health().model_counts(), (0, 0));
+        }
+        assert_eq!(runtime.snapshot().registered_models, 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simultaneous_registration_and_shutdown_has_no_post_stop_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..20 {
+            let runtime = ApplicationRuntime::new(policy())?;
+            let register_runtime = runtime.clone();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let register_barrier = Arc::clone(&barrier);
+            let registration = tokio::task::spawn_blocking(move || {
+                register_barrier.wait();
+                register_runtime.register_engine("fake", Arc::new(FakeEngine::new(Duration::ZERO)))
+            });
+            barrier.wait();
+            let _ = runtime.shutdown(Duration::ZERO).await;
+            let result = registration.await?;
+            assert!(matches!(result, Ok(()) | Err(LifecycleError::ShuttingDown)));
+            assert!(!runtime.health().is_live());
+            assert!(!runtime.health().readiness().is_ready());
+            assert_eq!(
+                runtime.register_engine("late", Arc::new(FakeEngine::new(Duration::ZERO))),
+                Err(LifecycleError::ShuttingDown)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborted_tracked_operation_releases_shutdown_permit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let operation_runtime = runtime.clone();
+        let operation = tokio::spawn(async move {
+            operation_runtime
+                .install_with(std::future::pending::<Result<(), LifecycleError>>())
+                .await
+        });
+        tokio::task::yield_now().await;
+        operation.abort();
+        let _ = operation.await;
+        assert!(runtime.shutdown(Duration::from_millis(20)).await);
         Ok(())
     }
 
@@ -1318,6 +2014,8 @@ mod tests {
         assert_eq!(completed, 48);
         let metrics = runtime.metrics().render();
         assert!(metrics.contains("operation=\"embed\",outcome=\"ok\"} 48"));
+        assert!(metrics.contains("impossible_active_requests 0"));
+        assert!(metrics.contains("impossible_queue_depth 0"));
         assert!(!metrics.contains("item-"));
         assert!(!metrics.contains("model="));
         Ok(())

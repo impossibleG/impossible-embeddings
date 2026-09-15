@@ -108,6 +108,34 @@ impl Metrics {
         }
     }
 
+    /// Increment the active request gauge without a racy read/replace sequence.
+    pub fn increment_active(&self) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.active = inner.active.saturating_add(1);
+        }
+    }
+
+    /// Decrement the active request gauge, saturating defensively at zero.
+    pub fn decrement_active(&self) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.active = inner.active.saturating_sub(1);
+        }
+    }
+
+    /// Increment the aggregate pre-native waiting-request gauge.
+    pub fn increment_queue_depth(&self) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.queue_depth = inner.queue_depth.saturating_add(1);
+        }
+    }
+
+    /// Decrement the aggregate pre-native waiting-request gauge.
+    pub fn decrement_queue_depth(&self) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.queue_depth = inner.queue_depth.saturating_sub(1);
+        }
+    }
+
     /// Render deterministic Prometheus text exposition.
     #[must_use]
     pub fn render(&self) -> String {

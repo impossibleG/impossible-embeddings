@@ -345,19 +345,44 @@ impl fmt::Display for EngineFailure {
 impl Error for EngineFailure {}
 
 /// Cloneable cancellation signal shared by admission, engine, and response layers.
-#[derive(Debug, Clone, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
+#[derive(Debug)]
+enum CancellationState {
+    Single(AtomicBool),
+    Composite(Arc<[ExecutionControl]>),
+}
+
+/// Cloneable cancellation signal shared by admission, engine, and response layers.
+#[derive(Debug, Clone)]
+pub struct CancellationToken(Arc<CancellationState>);
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self(Arc::new(CancellationState::Single(AtomicBool::new(false))))
+    }
+}
 
 impl CancellationToken {
     /// Requests cancellation. Calls are idempotent.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        match self.0.as_ref() {
+            CancellationState::Single(cancelled) => cancelled.store(true, Ordering::Release),
+            CancellationState::Composite(constituents) => {
+                for control in constituents.iter() {
+                    control.cancellation.cancel();
+                }
+            }
+        }
     }
 
     /// Returns whether cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        match self.0.as_ref() {
+            CancellationState::Single(cancelled) => cancelled.load(Ordering::Acquire),
+            CancellationState::Composite(constituents) => constituents
+                .iter()
+                .all(|control| control.ensure_active().is_err()),
+        }
     }
 }
 
@@ -366,6 +391,7 @@ impl CancellationToken {
 pub struct ExecutionControl {
     cancellation: CancellationToken,
     deadline: Option<Instant>,
+    constituents: Option<Arc<[ExecutionControl]>>,
 }
 
 impl ExecutionControl {
@@ -375,6 +401,24 @@ impl ExecutionControl {
         Self {
             cancellation,
             deadline,
+            constituents: None,
+        }
+    }
+
+    /// Creates cooperative control for a native batch assembled from multiple requests.
+    ///
+    /// The composite remains active while at least one constituent can still consume the result.
+    /// It becomes inactive only after every constituent is cancelled or expired, so cancelling one
+    /// request never aborts inference needed by a surviving request.
+    #[must_use]
+    pub fn composite(constituents: impl Into<Arc<[ExecutionControl]>>) -> Self {
+        let constituents = constituents.into();
+        Self {
+            cancellation: CancellationToken(Arc::new(CancellationState::Composite(Arc::clone(
+                &constituents,
+            )))),
+            deadline: None,
+            constituents: Some(constituents),
         }
     }
 
@@ -392,6 +436,25 @@ impl ExecutionControl {
     ///
     /// Returns a stable cancelled or deadline-exceeded failure.
     pub fn ensure_active(&self) -> Result<(), EngineFailure> {
+        if let Some(constituents) = &self.constituents {
+            if constituents
+                .iter()
+                .any(|control| control.ensure_active().is_ok())
+            {
+                return Ok(());
+            }
+            // A caller cancellation wins over a simultaneous deadline throughout the API. For a
+            // mixed composite this also gives a stable result independent of iteration order.
+            let code = if constituents
+                .iter()
+                .any(|control| control.cancellation.is_cancelled())
+            {
+                ErrorCode::Cancelled
+            } else {
+                ErrorCode::DeadlineExceeded
+            };
+            return Err(EngineFailure::public(code));
+        }
         if self.cancellation.is_cancelled() {
             return Err(EngineFailure::public(ErrorCode::Cancelled));
         }
@@ -447,6 +510,7 @@ pub fn execute_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn format_error_chain(mut error: &(dyn Error + 'static)) -> String {
         let mut messages = vec![error.to_string()];
@@ -575,6 +639,34 @@ mod tests {
         };
         assert_eq!(error.public_error().code, ErrorCode::Cancelled);
         Ok(())
+    }
+
+    #[test]
+    fn composite_control_stays_active_until_every_member_is_inactive() {
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let surviving = ExecutionControl::new(
+            CancellationToken::default(),
+            Some(Instant::now() + Duration::from_secs(1)),
+        );
+        let composite =
+            ExecutionControl::composite(vec![ExecutionControl::new(cancelled, None), surviving]);
+        assert!(composite.ensure_active().is_ok());
+    }
+
+    #[test]
+    fn composite_control_uses_stable_cancellation_precedence_when_all_inactive() {
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let composite = ExecutionControl::composite(vec![
+            ExecutionControl::new(CancellationToken::default(), Some(Instant::now())),
+            ExecutionControl::new(cancelled, Some(Instant::now())),
+        ]);
+        let error = composite
+            .ensure_active()
+            .err()
+            .unwrap_or_else(|| EngineFailure::public(ErrorCode::Internal));
+        assert_eq!(error.public_error().code, ErrorCode::Cancelled);
     }
 
     #[test]

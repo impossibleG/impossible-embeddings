@@ -36,6 +36,21 @@ native inference call begins. In that case computation may finish, but the serve
 again and discards the late result rather than publishing it. Cancellation is therefore a response
 and queue-resource guarantee, not a claim that every runtime can immediately reclaim compute.
 
+The configured request timeout is an absolute server-side cap: a shorter caller deadline is
+honored, while a longer or absent caller deadline cannot bypass it. When cancellation and expiry
+are observed together, cancellation wins deterministically. For a native batch assembled from
+multiple requests, cooperative control remains active while at least one constituent request is
+active. Native execution may stop only when every constituent has been cancelled or expired;
+cancelling one member never aborts work required by surviving members. Each member is checked again
+before publication, so late output is delivered only to active callers.
+
+`max_items` and `max_tokens` are per-request validation bounds. `max_batch_items` and
+`max_batch_tokens` independently bound the aggregate native call after compatible requests are
+combined. `max_queue_depth` is enforced per loaded model across all pre-native waiting locations
+(transport channel, scheduler pending state, and native-pool wait); moving a request between those
+locations does not create extra capacity. The exported queue gauge is the aggregate number of
+requests waiting across models, while the active-request gauge counts live caller operations.
+
 ## Model identity
 
 The model string in a request is an alias or selection expression. Successful responses carry a
