@@ -1124,27 +1124,19 @@ impl ApplicationRuntime {
         let caller_control = control.clone();
         let task = tokio::spawn(async move {
             let result = operation(control.cancellation.clone(), control.commit.clone()).await;
-            drop(active);
+            // Publish the truthful terminal result before releasing lifecycle registration and
+            // admission. A shutdown unblocked by that release may publish force-stop immediately;
+            // the caller's biased receive must already be ready in that race, including the
+            // installer's already-installed fast path which never crosses the commit gate.
             let _ = send.send(result);
+            drop(active);
         });
         let mut caller = InstallCallerGuard {
             control: caller_control,
             task: task.abort_handle(),
             armed: true,
         };
-        let result = tokio::select! {
-            biased;
-            result = &mut receive => result.unwrap_or(Err(LifecycleError::InstallFailed)),
-            changed = force_stop.changed() => {
-                let _ = changed;
-                match caller.cancel_before_commit() {
-                    CommitDecision::CancelledBeforeCommit => Err(LifecycleError::ShuttingDown),
-                    CommitDecision::AlreadyCommitted => {
-                        receive.await.unwrap_or(Err(LifecycleError::InstallFailed))
-                    }
-                }
-            }
-        };
+        let result = receive_install_result(&mut receive, &mut force_stop, &caller).await;
         caller.armed = false;
         result
     }
@@ -1551,6 +1543,26 @@ impl ApplicationRuntime {
             .health
             .transition(LifecycleState::Stopped, Some(ReadinessReason::Stopped));
         drained
+    }
+}
+
+async fn receive_install_result<T>(
+    receive: &mut oneshot::Receiver<Result<T, LifecycleError>>,
+    force_stop: &mut watch::Receiver<bool>,
+    caller: &InstallCallerGuard,
+) -> Result<T, LifecycleError> {
+    tokio::select! {
+        biased;
+        result = &mut *receive => result.unwrap_or(Err(LifecycleError::InstallFailed)),
+        changed = force_stop.changed() => {
+            let _ = changed;
+            match caller.cancel_before_commit() {
+                CommitDecision::CancelledBeforeCommit => Err(LifecycleError::ShuttingDown),
+                CommitDecision::AlreadyCommitted => {
+                    (&mut *receive).await.unwrap_or(Err(LifecycleError::InstallFailed))
+                }
+            }
+        }
     }
 }
 
@@ -3487,6 +3499,75 @@ mod tests {
             .send(())
             .map_err(|()| "install receiver disappeared")?;
         assert_eq!(install.await??, 17);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn already_installed_fast_path_completes_truthfully_at_shutdown_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let install_runtime = runtime.clone();
+        let (started, wait_started) = oneshot::channel();
+        let (release, wait_release) = oneshot::channel();
+        let install = tokio::spawn(async move {
+            install_runtime
+                .install_with(move |_, _| async move {
+                    let _ = started.send(());
+                    let _ = wait_release.await;
+                    // The real Installer returns this without crossing its commit gate when the
+                    // exact identity is already installed and verified.
+                    Ok::<_, LifecycleError>(ModelStatus::IntegrityVerified)
+                })
+                .await
+        });
+        wait_started.await?;
+
+        let shutdown_runtime = runtime.clone();
+        let shutdown =
+            tokio::spawn(async move { shutdown_runtime.shutdown(Duration::from_secs(1)).await });
+        tokio::task::yield_now().await;
+        release
+            .send(())
+            .map_err(|()| "install operation disappeared")?;
+
+        assert_eq!(install.await??, ModelStatus::IntegrityVerified);
+        assert!(shutdown.await?);
+        assert!(!runtime.health().is_live());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn already_installed_result_wins_deterministic_force_stop_tie()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let control = InstallControl {
+            cancellation: InstallCancelToken::new(),
+            commit: InstallCommitGate::new(),
+        };
+        let pending = tokio::spawn(std::future::pending::<()>());
+        let mut caller = InstallCallerGuard {
+            control,
+            task: pending.abort_handle(),
+            armed: true,
+        };
+        let (result_send, mut result_receive) = oneshot::channel();
+        let (force_send, mut force_receive) = watch::channel(false);
+
+        // Model the already-installed fast path: it has a terminal verified status without ever
+        // crossing the durable commit gate. Both branches are ready before the selector is polled,
+        // making this an exact deterministic check of result-vs-forced-shutdown precedence.
+        result_send
+            .send(Ok(ModelStatus::IntegrityVerified))
+            .map_err(|_| "install result receiver disappeared")?;
+        force_send
+            .send(true)
+            .map_err(|_| "force-stop receiver disappeared")?;
+        let result =
+            receive_install_result(&mut result_receive, &mut force_receive, &caller).await?;
+        caller.armed = false;
+        pending.abort();
+
+        assert_eq!(result, ModelStatus::IntegrityVerified);
+        assert!(!caller.control.cancellation.is_cancelled());
         Ok(())
     }
 

@@ -14,6 +14,7 @@ use std::{
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
+use crate::manifest::MAX_MANIFEST_BYTES;
 use crate::{
     Artifact, Dimensions, Error, Manifest, ModelStatus, Pooling, Prefixes, Result, RuntimeMetadata,
     TensorMetadata, TokenizerMetadata,
@@ -23,6 +24,8 @@ const MANIFEST_FILE: &str = "manifest.json";
 // Durable promotion can include several metadata flushes on high-latency local filesystems. Give
 // a coalescing peer enough time to observe the committed model while keeping contention bounded.
 pub(crate) const LOCK_WAIT_LIMIT: Duration = Duration::from_secs(1);
+const MAX_DISCOVERY_ROOTS: usize = 64;
+const MAX_DISCOVERY_ENTRIES: usize = 1_024;
 static QUARANTINE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Independently supplied semantic-verification evidence.
@@ -653,20 +656,39 @@ impl ModelStore {
     ///
     /// Returns an error if an authorized root cannot be inspected.
     pub fn discover(&self, roots: &[DiscoveryRoot]) -> Result<Vec<Manifest>> {
+        if roots.len() > MAX_DISCOVERY_ROOTS {
+            return Err(Error::Invalid("model discovery root limit exceeded".into()));
+        }
         let mut found = Vec::new();
+        let mut inspected_entries = 0_usize;
         for root in roots {
             let metadata = match fs::symlink_metadata(&root.0) {
                 Ok(value) => value,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
+                Err(_) => {
+                    return Err(Error::Invalid("model discovery root is unavailable".into()));
+                }
             };
             if is_reparse(&metadata) || !metadata.is_dir() {
                 continue;
             }
-            let canonical_root = fs::canonicalize(&root.0)?;
-            for entry in fs::read_dir(&root.0)? {
-                let entry = entry?;
-                let metadata = fs::symlink_metadata(entry.path())?;
+            let canonical_root = fs::canonicalize(&root.0)
+                .map_err(|_| Error::Invalid("model discovery root is unavailable".into()))?;
+            let entries = fs::read_dir(&root.0)
+                .map_err(|_| Error::Invalid("model discovery root is unavailable".into()))?;
+            for entry in entries {
+                inspected_entries = inspected_entries
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Invalid("model discovery entry limit exceeded".into()))?;
+                if inspected_entries > MAX_DISCOVERY_ENTRIES {
+                    return Err(Error::Invalid(
+                        "model discovery entry limit exceeded".into(),
+                    ));
+                }
+                let entry = entry
+                    .map_err(|_| Error::Invalid("model discovery entry is unavailable".into()))?;
+                let metadata = fs::symlink_metadata(entry.path())
+                    .map_err(|_| Error::Invalid("model discovery entry is unavailable".into()))?;
                 if is_reparse(&metadata) || !metadata.is_dir() {
                     continue;
                 }
@@ -796,27 +818,64 @@ fn remove_deletion_tombstone(
 /// Reads an identity record only after both the containing directory and manifest file have been
 /// proven to be regular, non-reparse filesystem objects within the same canonical directory.
 fn read_contained_manifest(directory: &Path) -> Result<Manifest> {
-    let directory_metadata = fs::symlink_metadata(directory)?;
+    let directory_metadata = fs::symlink_metadata(directory)
+        .map_err(|_| Error::Invalid("manifest directory is unavailable".into()))?;
     if is_reparse(&directory_metadata) || !directory_metadata.is_dir() {
         return Err(Error::Invalid(
             "manifest directory cannot be a symlink or reparse point".into(),
         ));
     }
-    let canonical_directory = fs::canonicalize(directory)?;
+    let canonical_directory = fs::canonicalize(directory)
+        .map_err(|_| Error::Invalid("manifest directory is unavailable".into()))?;
     let path = directory.join(MANIFEST_FILE);
-    let metadata = fs::symlink_metadata(&path)?;
-    if is_reparse(&metadata) || !metadata.is_file() {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_no_follow(&mut options);
+    let mut file = options
+        .open(&path)
+        .map_err(|_| Error::Invalid("manifest is unavailable".into()))?;
+    let initial = file
+        .metadata()
+        .map_err(|_| Error::Invalid("manifest is unavailable".into()))?;
+    if is_reparse(&initial) || !initial.is_file() || initial.len() > MAX_MANIFEST_BYTES as u64 {
         return Err(Error::Invalid(
-            "manifest must be a regular non-reparse file".into(),
+            "manifest must be a bounded regular non-reparse file".into(),
         ));
     }
-    let canonical_path = fs::canonicalize(&path)?;
-    if canonical_path.parent() != Some(canonical_directory.as_path()) {
+
+    // The file is read through the same no-follow handle whose metadata was checked. One extra
+    // byte detects growth past the hard bound without allocating from attacker-controlled size.
+    let initial_len = usize::try_from(initial.len())
+        .map_err(|_| Error::Invalid("manifest exceeds the supported size".into()))?;
+    let mut bytes = Vec::with_capacity(initial_len);
+    Read::by_ref(&mut file)
+        .take(MAX_MANIFEST_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::Invalid("manifest is unavailable".into()))?;
+    let final_metadata = file
+        .metadata()
+        .map_err(|_| Error::Invalid("manifest is unavailable".into()))?;
+    if is_reparse(&final_metadata)
+        || !final_metadata.is_file()
+        || bytes.len() > MAX_MANIFEST_BYTES
+        || final_metadata.len() != initial.len()
+        || final_metadata.len() != bytes.len() as u64
+    {
         return Err(Error::Invalid(
-            "manifest escaped its containing directory".into(),
+            "manifest changed while it was being read".into(),
         ));
     }
-    Manifest::from_json(&fs::read(canonical_path)?)
+    // Retain the directory containment proof for the authorized parent. The opened leaf itself
+    // is never canonicalized or reopened, avoiding a check/open race.
+    if fs::canonicalize(directory)
+        .map_err(|_| Error::Invalid("manifest directory is unavailable".into()))?
+        != canonical_directory
+    {
+        return Err(Error::Invalid(
+            "manifest directory changed while it was being read".into(),
+        ));
+    }
+    Manifest::from_json(&bytes)
 }
 
 fn acquire_store_lock(layout: &CacheLayout, manifest: &Manifest) -> Result<fs::File> {
@@ -940,7 +999,8 @@ fn configure_no_follow(options: &mut OpenOptions) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // O_NONBLOCK prevents a regular-file-to-FIFO swap from stalling the process at open.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -949,9 +1009,10 @@ fn configure_no_follow(options: &mut OpenOptions) {
         const FILE_SHARE_READ: u32 = 0x0000_0001;
         const FILE_SHARE_WRITE: u32 = 0x0000_0002;
         const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         options
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
     }
 }
 
@@ -2269,6 +2330,65 @@ mod transaction_tests {
         assert_eq!(status, ModelStatus::Loadable);
         let verified = store.verified_model(&manifest)?;
         assert_eq!(verified.artifact_bytes("weights/model.bin")?, body);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_reads_are_bounded_and_discovery_work_is_capped() -> Result<()> {
+        let oversized = TempDir::new()?;
+        fs::write(
+            oversized.path().join(MANIFEST_FILE),
+            vec![b'x'; MAX_MANIFEST_BYTES + 1],
+        )?;
+        let Err(error) = read_contained_manifest(oversized.path()) else {
+            return Err(Error::Invalid(
+                "test fixture unexpectedly accepted oversized manifest".into(),
+            ));
+        };
+        assert!(matches!(error, Error::Invalid(_)));
+        let rendered = format!("{error} {error:?}");
+        assert!(!rendered.contains(oversized.path().to_string_lossy().as_ref()));
+
+        let cache = TempDir::new()?;
+        let store = ModelStore::new(cache.path().join("cache"))?;
+        let discovery = cache.path().join("discovery");
+        fs::create_dir(&discovery)?;
+        for index in 0..=MAX_DISCOVERY_ENTRIES {
+            fs::write(discovery.join(format!("entry-{index}")), [])?;
+        }
+        let Err(error) = store.discover(&[DiscoveryRoot::new(&discovery)]) else {
+            return Err(Error::Invalid(
+                "test fixture unexpectedly exceeded discovery work bound".into(),
+            ));
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid model data: model discovery entry limit exceeded"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains(discovery.to_string_lossy().as_ref())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_root_count_is_bounded_before_filesystem_work() -> Result<()> {
+        let cache = TempDir::new()?;
+        let store = ModelStore::new(cache.path().join("cache"))?;
+        let roots = (0..=MAX_DISCOVERY_ROOTS)
+            .map(|index| DiscoveryRoot::new(cache.path().join(format!("missing-{index}"))))
+            .collect::<Vec<_>>();
+        let Err(error) = store.discover(&roots) else {
+            return Err(Error::Invalid(
+                "test fixture unexpectedly exceeded discovery root bound".into(),
+            ));
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid model data: model discovery root limit exceeded"
+        );
         Ok(())
     }
 }

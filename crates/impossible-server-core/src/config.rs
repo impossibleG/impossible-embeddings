@@ -3,11 +3,15 @@
 use std::{
     collections::BTreeMap,
     env, fmt, fs,
+    fs::OpenOptions,
+    io::Read,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
 };
 use url::{Origin, Url};
+
+const MAX_CONFIG_FILE_BYTES: usize = 256 * 1024;
 
 /// A non-secret reference to where a credential is stored.
 #[derive(Clone, PartialEq, Eq)]
@@ -389,8 +393,7 @@ impl ServerConfig {
     {
         let mut config = Self::default();
         if let Some(path) = toml_path {
-            let contents =
-                fs::read_to_string(path).map_err(|_| ConfigError::ConfigFileUnavailable)?;
+            let contents = read_config_file(path)?;
             parse_toml(&contents)?.apply(&mut config)?;
         }
         parse_environment(environment)?.apply(&mut config)?;
@@ -433,6 +436,74 @@ impl ServerConfig {
         }
         Ok(())
     }
+}
+
+fn read_config_file(path: &Path) -> Result<String, ConfigError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_config_no_follow(&mut options);
+    let mut file = options
+        .open(path)
+        .map_err(|_| ConfigError::ConfigFileUnavailable)?;
+    let initial = file
+        .metadata()
+        .map_err(|_| ConfigError::ConfigFileUnavailable)?;
+    if !safe_regular_config(&initial) || initial.len() > MAX_CONFIG_FILE_BYTES as u64 {
+        return Err(ConfigError::ConfigFileUnavailable);
+    }
+    let initial_len =
+        usize::try_from(initial.len()).map_err(|_| ConfigError::ConfigFileUnavailable)?;
+    let mut bytes = Vec::with_capacity(initial_len);
+    file.by_ref()
+        .take(MAX_CONFIG_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ConfigError::ConfigFileUnavailable)?;
+    let final_metadata = file
+        .metadata()
+        .map_err(|_| ConfigError::ConfigFileUnavailable)?;
+    if !safe_regular_config(&final_metadata)
+        || bytes.len() > MAX_CONFIG_FILE_BYTES
+        || final_metadata.len() != initial.len()
+        || final_metadata.len() != bytes.len() as u64
+    {
+        return Err(ConfigError::ConfigFileUnavailable);
+    }
+    String::from_utf8(bytes).map_err(|_| ConfigError::ConfigFileUnavailable)
+}
+
+#[cfg(unix)]
+fn configure_config_no_follow(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Non-blocking open prevents a path swapped to a FIFO from stalling startup.
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+}
+
+#[cfg(windows)]
+fn configure_config_no_follow(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_config_no_follow(_options: &mut OpenOptions) {}
+
+fn safe_regular_config(metadata: &fs::Metadata) -> bool {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 fn parse_toml(input: &str) -> Result<Patch, ConfigError> {
@@ -982,6 +1053,67 @@ mod tests {
             );
             assert!(error.diagnostic().code.starts_with("config_"));
         }
+    }
+
+    #[test]
+    fn config_file_reads_are_bounded_regular_and_sanitized() {
+        let base =
+            std::env::temp_dir().join(format!("impossible-config-bounds-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("fixture directory");
+
+        let oversized = base.join("private-oversized.toml");
+        fs::write(&oversized, vec![b'x'; MAX_CONFIG_FILE_BYTES + 1]).expect("oversized fixture");
+        let error = ServerConfig::load(
+            Some(&oversized),
+            std::iter::empty::<(&str, &str)>(),
+            std::iter::empty::<&str>(),
+        )
+        .expect_err("oversized config must fail before parsing");
+        assert_eq!(error, ConfigError::ConfigFileUnavailable);
+        assert!(!format!("{error} {error:?}").contains("private-oversized"));
+
+        let directory = base.join("config-directory");
+        fs::create_dir(&directory).expect("directory fixture");
+        assert_eq!(
+            ServerConfig::load(
+                Some(&directory),
+                std::iter::empty::<(&str, &str)>(),
+                std::iter::empty::<&str>(),
+            ),
+            Err(ConfigError::ConfigFileUnavailable)
+        );
+        fs::remove_dir_all(base).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn config_file_symlinks_are_not_followed() {
+        let base =
+            std::env::temp_dir().join(format!("impossible-config-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("fixture directory");
+        let target = base.join("target.toml");
+        let link = base.join("configured.toml");
+        fs::write(&target, "bind = \"127.0.0.1:8080\"\n").expect("target fixture");
+
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &link).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+        #[cfg(not(any(unix, windows)))]
+        let linked = false;
+
+        if linked {
+            assert_eq!(
+                ServerConfig::load(
+                    Some(&link),
+                    std::iter::empty::<(&str, &str)>(),
+                    std::iter::empty::<&str>(),
+                ),
+                Err(ConfigError::ConfigFileUnavailable)
+            );
+        }
+        fs::remove_dir_all(base).expect("fixture cleanup");
     }
 
     #[test]

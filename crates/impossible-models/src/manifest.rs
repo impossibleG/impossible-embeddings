@@ -11,6 +11,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_ARTIFACTS: usize = 64;
 /// Hard schema bound for the sum of all declared artifact sizes (16 GiB).
 pub const MAX_TOTAL_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub(crate) const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_METADATA_TEXT_BYTES: usize = 4 * 1024;
+const MAX_URL_BYTES: usize = 8 * 1024;
+const MAX_TENSOR_NAME_BYTES: usize = 256;
+const MAX_MATRYOSHKA_DIMENSIONS: usize = 64;
 
 /// Immutable description of one model revision and all files required to load it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +188,9 @@ impl Manifest {
     ///
     /// Returns an error if JSON decoding or any schema invariant fails.
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(Error::Invalid("manifest exceeds the supported size".into()));
+        }
         let manifest: Self = serde_json::from_slice(bytes)?;
         manifest.validate()?;
         Ok(manifest)
@@ -195,7 +203,11 @@ impl Manifest {
     /// Returns an error if validation or serialization fails.
     pub fn to_json(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        Ok(serde_json::to_vec_pretty(self)?)
+        let encoded = serde_json::to_vec_pretty(self)?;
+        if encoded.len() > MAX_MANIFEST_BYTES {
+            return Err(Error::Invalid("manifest exceeds the supported size".into()));
+        }
+        Ok(encoded)
     }
 
     /// Validates all identity, path, URL, size, hash, and tensor invariants.
@@ -208,6 +220,7 @@ impl Manifest {
             return Err(Error::Invalid("unsupported schema_version".into()));
         }
         validate_id(&self.canonical_id)?;
+        validate_bounded_fields(self)?;
         if self.revision.len() != 40
             || !self
                 .revision
@@ -229,6 +242,7 @@ impl Manifest {
             return Err(Error::Invalid("tokenizer metadata is incomplete".into()));
         }
         if self.dimensions.native == 0
+            || self.dimensions.matryoshka.len() > MAX_MATRYOSHKA_DIMENSIONS
             || self
                 .dimensions
                 .matryoshka
@@ -314,6 +328,11 @@ fn validate_artifacts(artifacts: &[Artifact]) -> Result<()> {
                 "artifact paths cannot be ancestors of other artifacts".into(),
             ));
         }
+        if artifact.url.len() > MAX_URL_BYTES {
+            return Err(Error::Invalid(
+                "artifact URL exceeds the supported length".into(),
+            ));
+        }
         let url = Url::parse(&artifact.url)
             .map_err(|_| Error::Invalid("artifact URL is invalid".into()))?;
         let loopback_test_url = url.scheme() == "http"
@@ -336,6 +355,51 @@ fn validate_artifacts(artifacts: &[Artifact]) -> Result<()> {
         {
             return Err(Error::Invalid(
                 "artifact requires SHA-256 and non-zero size".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_bounded_fields(manifest: &Manifest) -> Result<()> {
+    let semantic_text = match &manifest.semantic_verification {
+        SemanticVerification::Verified { evidence } => evidence,
+        SemanticVerification::Unverified { reason } => reason,
+    };
+    let metadata_fields = [
+        manifest.license.spdx.as_str(),
+        semantic_text.as_str(),
+        manifest.tokenizer.kind.as_str(),
+        manifest.prefixes.query.as_str(),
+        manifest.prefixes.document.as_str(),
+        manifest.tensors.format.as_str(),
+        manifest.tensors.dtype.as_str(),
+        manifest.tensors.architecture.as_str(),
+    ];
+    if metadata_fields
+        .into_iter()
+        .any(|field| field.len() > MAX_METADATA_TEXT_BYTES)
+        || manifest.license.source_url.len() > MAX_URL_BYTES
+    {
+        return Err(Error::Invalid(
+            "manifest metadata exceeds the supported length".into(),
+        ));
+    }
+
+    if let RuntimeMetadata::Onnx { inputs, output, .. } = &manifest.runtime {
+        let tensor_names = [
+            Some(inputs.input_ids.as_str()),
+            inputs.attention_mask.as_deref(),
+            inputs.token_type_ids.as_deref(),
+            Some(output.as_str()),
+        ];
+        if tensor_names
+            .into_iter()
+            .flatten()
+            .any(|name| name.len() > MAX_TENSOR_NAME_BYTES)
+        {
+            return Err(Error::Invalid(
+                "runtime tensor name exceeds the supported length".into(),
             ));
         }
     }
@@ -420,7 +484,7 @@ pub(crate) fn validate_relative_path(value: &str) -> Result<()> {
                 || is_windows_device_name(component)
         })
     {
-        return Err(Error::Invalid(format!("unsafe artifact path: {value}")));
+        return Err(Error::Invalid("artifact path is unsafe".into()));
     }
     Ok(())
 }
@@ -611,6 +675,38 @@ mod tests {
         let mut oversized = base;
         oversized["artifacts"][0]["size"] = (MAX_TOTAL_ARTIFACT_BYTES + 1).into();
         assert!(Manifest::from_json(&serde_json::to_vec(&oversized).unwrap_or_default()).is_err());
+    }
+
+    #[test]
+    fn variable_length_manifest_fields_have_explicit_bounds() {
+        let base: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../manifests/bge-small-en.json"))
+                .unwrap_or_default();
+
+        let mut oversized_metadata = base.clone();
+        oversized_metadata["prefixes"]["query"] = "q".repeat(MAX_METADATA_TEXT_BYTES + 1).into();
+        assert!(
+            Manifest::from_json(&serde_json::to_vec(&oversized_metadata).unwrap_or_default())
+                .is_err()
+        );
+
+        let mut oversized_url = base.clone();
+        oversized_url["artifacts"][0]["url"] =
+            format!("https://example.invalid/{}", "a".repeat(MAX_URL_BYTES)).into();
+        assert!(
+            Manifest::from_json(&serde_json::to_vec(&oversized_url).unwrap_or_default()).is_err()
+        );
+
+        let mut too_many_dimensions = base;
+        too_many_dimensions["dimensions"]["matryoshka"] = serde_json::Value::Array(
+            (1..=MAX_MATRYOSHKA_DIMENSIONS + 1)
+                .map(|dimension| serde_json::json!(dimension))
+                .collect(),
+        );
+        assert!(
+            Manifest::from_json(&serde_json::to_vec(&too_many_dimensions).unwrap_or_default())
+                .is_err()
+        );
     }
 
     #[test]
