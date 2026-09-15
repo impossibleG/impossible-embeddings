@@ -8,12 +8,24 @@ service EmbeddingService {
 }
 
 message EmbedRequest {
+  // A user-facing alias or canonical model id. The response always reports the
+  // immutable identity that was actually used.
   string model = 1;
   repeated string input = 2;
 }
 
 message EmbedResponse {
   repeated DenseVector embeddings = 1;
+  ResolvedModelIdentity model = 2;
+}
+
+// The immutable model identity used for inference. Clients should persist this
+// value, rather than the requested alias, when reproducibility matters.
+message ResolvedModelIdentity {
+  string canonical_id = 1;
+  string revision = 2;
+  string runtime = 3;
+  string artifact_fingerprint = 4;
 }
 
 message DenseVector {

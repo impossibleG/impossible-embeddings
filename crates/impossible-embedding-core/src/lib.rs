@@ -1,8 +1,15 @@
 //! Engine-neutral embedding domain contracts.
 
-use std::borrow::Cow;
-
-use thiserror::Error;
+use std::{
+    borrow::Cow,
+    error::Error,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 
 /// A validated batch of non-empty text inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,11 +22,11 @@ impl<'a> EmbeddingBatch<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`EmbeddingError::EmptyBatch`] when no inputs are provided.
-    pub fn new(inputs: impl IntoIterator<Item = Cow<'a, str>>) -> Result<Self, EmbeddingError> {
+    /// Returns a stable invalid-request failure when no inputs are provided.
+    pub fn new(inputs: impl IntoIterator<Item = Cow<'a, str>>) -> Result<Self, EngineFailure> {
         let inputs = inputs.into_iter().collect::<Vec<_>>();
         if inputs.is_empty() {
-            return Err(EmbeddingError::EmptyBatch);
+            return Err(EngineFailure::public(ErrorCode::InvalidRequest));
         }
         Ok(Self { inputs })
     }
@@ -31,51 +38,493 @@ impl<'a> EmbeddingBatch<'a> {
     }
 }
 
+/// A user-supplied model alias or canonical id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestedModel(String);
+
+impl RequestedModel {
+    /// Validates a requested model name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-request failure when the name is blank.
+    pub fn new(value: impl Into<String>) -> Result<Self, EngineFailure> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(EngineFailure::public(ErrorCode::InvalidRequest));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the alias exactly as requested.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Immutable identity of the exact model artifact and runtime used for inference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelIdentity {
+    /// Registry-qualified or locally assigned canonical model id.
+    pub canonical_id: String,
+    /// Immutable upstream revision or content-addressed local revision.
+    pub revision: String,
+    /// Runtime adapter and compatibility version.
+    pub runtime: String,
+    /// Content fingerprint covering all inference-affecting artifacts.
+    pub artifact_fingerprint: String,
+}
+
+impl ResolvedModelIdentity {
+    /// Creates an identity only when every reproducibility field is present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal failure when a resolver produces an incomplete identity.
+    pub fn new(
+        canonical_id: impl Into<String>,
+        revision: impl Into<String>,
+        runtime: impl Into<String>,
+        artifact_fingerprint: impl Into<String>,
+    ) -> Result<Self, EngineFailure> {
+        let identity = Self {
+            canonical_id: canonical_id.into(),
+            revision: revision.into(),
+            runtime: runtime.into(),
+            artifact_fingerprint: artifact_fingerprint.into(),
+        };
+        if [
+            &identity.canonical_id,
+            &identity.revision,
+            &identity.runtime,
+            &identity.artifact_fingerprint,
+        ]
+        .into_iter()
+        .any(|value| value.trim().is_empty())
+        {
+            return Err(EngineFailure::public(ErrorCode::Internal));
+        }
+        Ok(identity)
+    }
+}
+
 /// Output vectors in the same order as their inputs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingOutput {
     /// Dense vectors, ordered by request input.
     pub vectors: Vec<Vec<f32>>,
+    /// Exact model identity used to produce the vectors.
+    pub model: ResolvedModelIdentity,
 }
 
-/// Stable engine failures that transports can map without engine-specific types.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum EmbeddingError {
-    /// An embedding request contained no inputs.
-    #[error("the embedding batch must contain at least one input")]
-    EmptyBatch,
-    /// The selected model is unavailable.
-    #[error("the requested model is unavailable")]
+/// Stable, privacy-safe codes exposed by every transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorCode {
+    /// The request is structurally or semantically invalid.
+    InvalidRequest,
+    /// The selected model cannot currently serve requests.
     ModelUnavailable,
-    /// The engine could not complete inference.
-    #[error("embedding inference failed")]
-    Inference,
+    /// The bounded admission queue has no capacity.
+    QueueFull,
+    /// The caller cancelled the request.
+    Cancelled,
+    /// The request deadline elapsed.
+    DeadlineExceeded,
+    /// The runtime failed during inference.
+    InferenceFailed,
+    /// An unexpected server failure occurred.
+    Internal,
+}
+
+impl ErrorCode {
+    /// Returns the stable wire representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::ModelUnavailable => "model_unavailable",
+            Self::QueueFull => "queue_full",
+            Self::Cancelled => "cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::InferenceFailed => "inference_failed",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// Whether retrying a failed request can be useful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retryability {
+    /// Retrying unchanged cannot succeed.
+    Never,
+    /// Retrying later may succeed.
+    Retryable,
+    /// The server cannot safely make a retry claim.
+    Unknown,
+}
+
+/// Stable error data that is safe to serialize to clients and normal logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicError {
+    /// Machine-readable stable code.
+    pub code: ErrorCode,
+    /// Retry guidance independent of transport status codes.
+    pub retryability: Retryability,
+    /// Privacy-reviewed message containing no engine diagnostics or local paths.
+    pub message: &'static str,
+}
+
+impl PublicError {
+    /// Returns the canonical privacy-reviewed representation for a stable code.
+    #[must_use]
+    pub const fn for_code(code: ErrorCode) -> Self {
+        match code {
+            ErrorCode::InvalidRequest => Self::new(
+                code,
+                Retryability::Never,
+                "the embedding request is invalid",
+            ),
+            ErrorCode::ModelUnavailable => Self::new(
+                code,
+                Retryability::Retryable,
+                "the requested model is unavailable",
+            ),
+            ErrorCode::QueueFull => {
+                Self::new(code, Retryability::Retryable, "the request queue is full")
+            }
+            ErrorCode::Cancelled => {
+                Self::new(code, Retryability::Never, "the request was cancelled")
+            }
+            ErrorCode::DeadlineExceeded => Self::new(
+                code,
+                Retryability::Never,
+                "the request deadline was exceeded",
+            ),
+            ErrorCode::InferenceFailed => {
+                Self::new(code, Retryability::Unknown, "embedding inference failed")
+            }
+            ErrorCode::Internal => Self::new(
+                code,
+                Retryability::Unknown,
+                "an internal server error occurred",
+            ),
+        }
+    }
+
+    const fn new(code: ErrorCode, retryability: Retryability, message: &'static str) -> Self {
+        Self {
+            code,
+            retryability,
+            message,
+        }
+    }
+}
+
+/// An engine failure with strictly separated public and internal detail.
+///
+/// Transports must serialize only [`Self::public_error`]. The diagnostic source is intended for
+/// access-controlled debug telemetry and may contain sensitive runtime information.
+pub struct EngineFailure {
+    public: PublicError,
+    source: Option<Box<dyn Error + Send + Sync + 'static>>,
+}
+
+impl EngineFailure {
+    /// Creates a failure without internal diagnostics.
+    #[must_use]
+    pub const fn public(code: ErrorCode) -> Self {
+        Self {
+            public: PublicError::for_code(code),
+            source: None,
+        }
+    }
+
+    /// Attaches a private diagnostic source to a stable public failure.
+    #[must_use]
+    pub fn with_source(code: ErrorCode, source: impl Error + Send + Sync + 'static) -> Self {
+        Self {
+            public: PublicError::for_code(code),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// Returns the only error representation transports may expose.
+    #[must_use]
+    pub const fn public_error(&self) -> &PublicError {
+        &self.public
+    }
+
+    /// Returns private diagnostics for explicitly access-controlled telemetry.
+    #[must_use]
+    pub fn diagnostic_source(&self) -> Option<&(dyn Error + Send + Sync + 'static)> {
+        self.source.as_deref()
+    }
+}
+
+impl fmt::Debug for EngineFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EngineFailure")
+            .field("public", &self.public)
+            .field("has_diagnostic_source", &self.source.is_some())
+            .finish()
+    }
+}
+
+impl fmt::Display for EngineFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.public.message)
+    }
+}
+
+impl Error for EngineFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn Error + 'static))
+    }
+}
+
+/// Cloneable cancellation signal shared by admission, engine, and response layers.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    /// Requests cancellation. Calls are idempotent.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Returns whether cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Admission and publication constraints for one request.
+#[derive(Debug, Clone)]
+pub struct ExecutionControl {
+    cancellation: CancellationToken,
+    deadline: Option<Instant>,
+}
+
+impl ExecutionControl {
+    /// Creates request controls with an optional absolute monotonic deadline.
+    #[must_use]
+    pub const fn new(cancellation: CancellationToken, deadline: Option<Instant>) -> Self {
+        Self {
+            cancellation,
+            deadline,
+        }
+    }
+
+    /// Returns the shared cancellation token.
+    #[must_use]
+    pub const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    /// Checks whether queued work may start or completed work may be published.
+    ///
+    /// Cancellation wins when both cancellation and deadline are observed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable cancelled or deadline-exceeded failure.
+    pub fn ensure_active(&self) -> Result<(), EngineFailure> {
+        if self.cancellation.is_cancelled() {
+            return Err(EngineFailure::public(ErrorCode::Cancelled));
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(EngineFailure::public(ErrorCode::DeadlineExceeded));
+        }
+        Ok(())
+    }
 }
 
 /// Engine boundary implemented by in-process and delegated runtimes.
 pub trait EmbeddingEngine: Send + Sync {
     /// Produces one dense vector for each input, preserving order.
     ///
+    /// Implementations must check `control` immediately before invoking native inference. Native
+    /// runtimes are not required to support interruption after invocation begins.
+    ///
     /// # Errors
     ///
-    /// Returns a stable [`EmbeddingError`] rather than an engine-private error.
-    fn embed(&self, batch: &EmbeddingBatch<'_>) -> Result<EmbeddingOutput, EmbeddingError>;
+    /// Returns a stable failure, optionally carrying a private diagnostic source.
+    fn embed(
+        &self,
+        requested_model: &RequestedModel,
+        batch: &EmbeddingBatch<'_>,
+        control: &ExecutionControl,
+    ) -> Result<EmbeddingOutput, EngineFailure>;
+}
+
+/// Executes an admitted request and prevents late native results from being published.
+///
+/// This wrapper checks control state before dispatch and after inference. If cancellation or a
+/// deadline occurs while a non-interruptible runtime is executing, the runtime may finish, but its
+/// result is discarded here.
+///
+/// # Errors
+///
+/// Returns cancellation/deadline failures around the engine's own stable failures.
+pub fn execute_embedding(
+    engine: &dyn EmbeddingEngine,
+    requested_model: &RequestedModel,
+    batch: &EmbeddingBatch<'_>,
+    control: &ExecutionControl,
+) -> Result<EmbeddingOutput, EngineFailure> {
+    control.ensure_active()?;
+    let result = engine.embed(requested_model, batch, control)?;
+    control.ensure_active()?;
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn rejects_empty_batches() {
-        let result = EmbeddingBatch::new(Vec::<Cow<'_, str>>::new());
-        assert_eq!(result, Err(EmbeddingError::EmptyBatch));
+    fn identity() -> Result<ResolvedModelIdentity, EngineFailure> {
+        ResolvedModelIdentity::new(
+            "registry.example/model",
+            "revision-sha256",
+            "test-runtime@1",
+            "sha256:artifact",
+        )
+    }
+
+    struct CancelsDuringInference;
+
+    struct MustNotRun;
+
+    impl EmbeddingEngine for MustNotRun {
+        fn embed(
+            &self,
+            _requested_model: &RequestedModel,
+            _batch: &EmbeddingBatch<'_>,
+            _control: &ExecutionControl,
+        ) -> Result<EmbeddingOutput, EngineFailure> {
+            Err(EngineFailure::public(ErrorCode::Internal))
+        }
+    }
+
+    impl EmbeddingEngine for CancelsDuringInference {
+        fn embed(
+            &self,
+            _requested_model: &RequestedModel,
+            _batch: &EmbeddingBatch<'_>,
+            control: &ExecutionControl,
+        ) -> Result<EmbeddingOutput, EngineFailure> {
+            control.ensure_active()?;
+            control.cancellation().cancel();
+            Ok(EmbeddingOutput {
+                vectors: vec![vec![1.0]],
+                model: identity()?,
+            })
+        }
     }
 
     #[test]
-    fn preserves_input_order() -> Result<(), EmbeddingError> {
-        let batch = EmbeddingBatch::new([Cow::Borrowed("first"), Cow::Borrowed("second")])?;
-        assert_eq!(batch.inputs(), ["first", "second"]);
+    fn rejects_empty_batches_with_stable_public_error() -> Result<(), &'static str> {
+        let result = EmbeddingBatch::new(Vec::<Cow<'_, str>>::new());
+        let Some(error) = result.err() else {
+            return Err("empty batches must fail");
+        };
+        assert_eq!(error.public_error().code, ErrorCode::InvalidRequest);
+        assert_eq!(error.public_error().retryability, Retryability::Never);
+        assert!(error.diagnostic_source().is_none());
         Ok(())
+    }
+
+    #[test]
+    fn preserves_requested_alias_separately_from_resolved_identity() -> Result<(), EngineFailure> {
+        let requested = RequestedModel::new("default")?;
+        let resolved = identity()?;
+        assert_eq!(requested.as_str(), "default");
+        assert_eq!(resolved.canonical_id, "registry.example/model");
+        assert_eq!(resolved.revision, "revision-sha256");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_queued_work_after_deadline() -> Result<(), &'static str> {
+        let control = ExecutionControl::new(CancellationToken::default(), Some(Instant::now()));
+        let Some(error) = control.ensure_active().err() else {
+            return Err("expired work must fail");
+        };
+        assert_eq!(error.public_error().code, ErrorCode::DeadlineExceeded);
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_queued_work_never_reaches_engine() -> Result<(), EngineFailure> {
+        let batch = EmbeddingBatch::new([Cow::Borrowed("input")])?;
+        let requested = RequestedModel::new("default")?;
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let control = ExecutionControl::new(cancellation, None);
+        let Some(error) = execute_embedding(&MustNotRun, &requested, &batch, &control).err() else {
+            return Err(EngineFailure::public(ErrorCode::Internal));
+        };
+        assert_eq!(error.public_error().code, ErrorCode::Cancelled);
+        Ok(())
+    }
+
+    #[test]
+    fn discards_late_native_result_after_cancellation() -> Result<(), EngineFailure> {
+        let batch = EmbeddingBatch::new([Cow::Borrowed("input")])?;
+        let requested = RequestedModel::new("default")?;
+        let control = ExecutionControl::new(CancellationToken::default(), None);
+        let Some(error) =
+            execute_embedding(&CancelsDuringInference, &requested, &batch, &control).err()
+        else {
+            return Err(EngineFailure::public(ErrorCode::Internal));
+        };
+        assert_eq!(error.public_error().code, ErrorCode::Cancelled);
+        Ok(())
+    }
+
+    #[test]
+    fn public_error_codes_have_stable_wire_values() {
+        assert_eq!(ErrorCode::InvalidRequest.as_str(), "invalid_request");
+        assert_eq!(ErrorCode::ModelUnavailable.as_str(), "model_unavailable");
+        assert_eq!(ErrorCode::QueueFull.as_str(), "queue_full");
+        assert_eq!(ErrorCode::Cancelled.as_str(), "cancelled");
+        assert_eq!(ErrorCode::DeadlineExceeded.as_str(), "deadline_exceeded");
+        assert_eq!(ErrorCode::InferenceFailed.as_str(), "inference_failed");
+        assert_eq!(ErrorCode::Internal.as_str(), "internal");
+        assert_eq!(
+            PublicError::for_code(ErrorCode::QueueFull).retryability,
+            Retryability::Retryable
+        );
+        assert_eq!(
+            PublicError::for_code(ErrorCode::InferenceFailed).retryability,
+            Retryability::Unknown
+        );
+    }
+
+    #[test]
+    fn debug_output_never_formats_private_source() {
+        #[derive(Debug)]
+        struct SensitiveDiagnostic;
+        impl fmt::Display for SensitiveDiagnostic {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("private local path")
+            }
+        }
+        impl Error for SensitiveDiagnostic {}
+
+        let failure = EngineFailure::with_source(ErrorCode::InferenceFailed, SensitiveDiagnostic);
+        let debug = format!("{failure:?}");
+        assert!(!debug.contains("private local path"));
+        assert_eq!(failure.to_string(), "embedding inference failed");
+        assert!(failure.diagnostic_source().is_some());
     }
 }

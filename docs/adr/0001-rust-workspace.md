@@ -18,3 +18,8 @@ libraries or supervised processes; the public contract must not expose an engine
 
 Rust owns reliability and packaging, while model compatibility remains replaceable. An engine can
 use another implementation language later when that materially improves model support.
+
+The workspace pins Rust 1.85.1 and exact versions of the Tonic code-generation family that support
+that compiler. Exact pins prevent compatible-looking patch upgrades from silently raising the
+minimum supported Rust version; dependency upgrades must pass the pinned-toolchain checks before
+the manifest and lockfile move together.
