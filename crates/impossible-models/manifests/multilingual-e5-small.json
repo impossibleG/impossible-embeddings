@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "canonical_id": "intfloat/multilingual-e5-small",
+  "revision": "7cf867cae19b6df205046e9c11907797649fb552",
+  "license": { "spdx": "MIT", "source_url": "https://huggingface.co/intfloat/multilingual-e5-small" },
+  "semantic_verification": { "status": "unverified", "reason": "Artifact integrity is pinned; golden-vector runtime verification is pending." },
+  "tokenizer": { "kind": "xlm-roberta", "max_tokens": 512, "lowercase": false },
+  "pooling": "mean",
+  "prefixes": { "query": "query: ", "document": "passage: " },
+  "dimensions": { "native": 384, "matryoshka": [] },
+  "tensors": { "format": "safetensors", "dtype": "float32", "architecture": "XLMRobertaModel" },
+  "artifacts": [{
+    "path": "model.safetensors",
+    "url": "https://huggingface.co/intfloat/multilingual-e5-small/resolve/7cf867cae19b6df205046e9c11907797649fb552/model.safetensors",
+    "sha256": "1a55775f53449dac10a2bcbc312469fac40b96d53198c407081a831f81c98477",
+    "size": 470641600
+  }]
+}

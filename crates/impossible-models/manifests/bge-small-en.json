@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "canonical_id": "BAAI/bge-small-en-v1.5",
+  "revision": "5e62ea33e012fda8c02802b906664c915ebd1bb1",
+  "license": { "spdx": "MIT", "source_url": "https://huggingface.co/BAAI/bge-small-en-v1.5" },
+  "semantic_verification": { "status": "unverified", "reason": "Artifact integrity is pinned; golden-vector runtime verification is pending." },
+  "tokenizer": { "kind": "bert-wordpiece", "max_tokens": 512, "lowercase": true },
+  "pooling": "cls",
+  "prefixes": { "query": "Represent this sentence for searching relevant passages: ", "document": "" },
+  "dimensions": { "native": 384, "matryoshka": [] },
+  "tensors": { "format": "safetensors", "dtype": "float32", "architecture": "BertModel" },
+  "artifacts": [{
+    "path": "model.safetensors",
+    "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5e62ea33e012fda8c02802b906664c915ebd1bb1/model.safetensors",
+    "sha256": "3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad",
+    "size": 133466304
+  }]
+}

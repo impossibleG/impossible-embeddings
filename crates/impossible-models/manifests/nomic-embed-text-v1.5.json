@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "canonical_id": "nomic-ai/nomic-embed-text-v1.5",
+  "revision": "0a3f1bfa99207a5448900a6daaaf6add10eaa058",
+  "license": { "spdx": "Apache-2.0", "source_url": "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5" },
+  "semantic_verification": { "status": "unverified", "reason": "Artifact integrity is pinned; golden-vector runtime verification is pending and remote code is never executed." },
+  "tokenizer": { "kind": "bert-wordpiece", "max_tokens": 8192, "lowercase": true },
+  "pooling": "mean",
+  "prefixes": { "query": "search_query: ", "document": "search_document: " },
+  "dimensions": { "native": 768, "matryoshka": [64, 128, 256, 512, 768] },
+  "tensors": { "format": "safetensors", "dtype": "float32", "architecture": "NomicBertModel" },
+  "artifacts": [{
+    "path": "model.safetensors",
+    "url": "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/0a3f1bfa99207a5448900a6daaaf6add10eaa058/model.safetensors",
+    "sha256": "9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c",
+    "size": 546938168
+  }]
+}

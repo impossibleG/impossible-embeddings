@@ -1,0 +1,24 @@
+[package]
+name = "impossible-models"
+description = "Secure model catalog and local artifact lifecycle for Impossible Embedding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fs2 = "=0.4.3"
+reqwest = { version = "=0.12.24", default-features = false, features = ["rustls-tls", "stream"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+sha2 = "=0.10.9"
+tokio = { version = "=1.48.0", features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
+url = "=2.4.1"
+
+[dev-dependencies]
+tempfile = "=3.23.0"
+tokio = { version = "=1.48.0", features = ["macros", "net", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

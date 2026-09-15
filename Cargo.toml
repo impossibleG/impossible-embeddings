@@ -2,6 +2,7 @@
 members = [
     "crates/impossible-embedding-core",
     "crates/impossible-embedding-onnx",
+    "crates/impossible-models",
     "crates/impossible-protocol",
     "crates/impossible-server-core",
     "crates/impossible-server",
