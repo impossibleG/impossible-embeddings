@@ -20,6 +20,7 @@ use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    sync::oneshot,
 };
 use url::Url;
 
@@ -100,6 +101,39 @@ async fn server(
     Ok((Url::parse(&format!("http://{address}/artifact"))?, handle))
 }
 
+async fn server_paused_after_prefix(
+    body: Vec<u8>,
+    prefix: usize,
+    requests: Arc<AtomicUsize>,
+) -> TestResult<(Url, oneshot::Receiver<()>, tokio::task::JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (prefix_sent, prefix_observed) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            requests.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(header.as_bytes()).await.is_ok()
+                && stream.write_all(&body[..prefix]).await.is_ok()
+                && stream.flush().await.is_ok()
+            {
+                let _ = prefix_sent.send(());
+                std::future::pending::<()>().await;
+            }
+        }
+    });
+    Ok((
+        Url::parse(&format!("http://{address}/artifact"))?,
+        prefix_observed,
+        handle,
+    ))
+}
+
 fn installer(temp: &TempDir, origin: &Url, offline: bool) -> TestResult<Installer> {
     let store = ModelStore::new(temp.path())?;
     let origin = Url::parse(&format!("{}/", origin.origin().ascii_serialization()))?;
@@ -112,6 +146,21 @@ fn installer(temp: &TempDir, origin: &Url, offline: bool) -> TestResult<Installe
         max_total_artifact_bytes: 16 * 1024 * 1024,
     };
     Ok(Installer::new(store, options)?)
+}
+
+fn staged_artifact_size(cache: &std::path::Path) -> Option<u64> {
+    std::fs::read_dir(cache.join("staging"))
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .find_map(|entry| {
+            entry
+                .path()
+                .join("weights/model.bin")
+                .metadata()
+                .ok()
+                .map(|metadata| metadata.len())
+                .filter(|length| *length > 0)
+        })
 }
 
 fn assert_http_error_is_redacted(error: &impossible_models::Error, secret: &str) {
@@ -174,11 +223,12 @@ async fn hash_mismatch_never_promotes() -> TestResult {
 }
 
 #[tokio::test]
-async fn cancellation_leaves_only_partial_state_and_retry_recovers() -> TestResult {
+async fn cancellation_before_commit_leaves_no_installed_state_and_retry_recovers() -> TestResult {
     let temp = TempDir::new()?;
     let body = vec![42_u8; 64 * 1024];
     let requests = Arc::new(AtomicUsize::new(0));
-    let (slow_url, slow_task) = server(body.clone(), Some(1024), Arc::clone(&requests)).await?;
+    let (slow_url, prefix_sent, slow_task) =
+        server_paused_after_prefix(body.clone(), 1024, Arc::clone(&requests)).await?;
     let manifest = fixture(slow_url.to_string(), &body, None);
     let cancel = CancelToken::new();
     let pending = {
@@ -187,7 +237,17 @@ async fn cancellation_leaves_only_partial_state_and_retry_recovers() -> TestResu
         let cancel = cancel.clone();
         tokio::spawn(async move { installer.install(&manifest, &cancel).await })
     };
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    prefix_sent.await?;
+    let partial_size = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(size) = staged_artifact_size(temp.path()) {
+                break size;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert!(partial_size < u64::try_from(body.len())?);
     cancel.cancel();
     assert!(matches!(
         pending.await,
@@ -199,13 +259,8 @@ async fn cancellation_leaves_only_partial_state_and_retry_recovers() -> TestResu
             .ok(),
         Some(ModelStatus::Missing)
     );
-    assert!(
-        temp.path()
-            .join("staging")
-            .read_dir()
-            .map(|mut entries| entries.next().is_some())
-            .unwrap_or(false)
-    );
+    // Cancellation can race before file creation, after creation, or after a partial write. Every
+    // state is valid while staging remains non-loadable and a retry starts from a clean directory.
     slow_task.abort();
 
     let retry_requests = Arc::new(AtomicUsize::new(0));

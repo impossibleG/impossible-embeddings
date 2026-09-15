@@ -158,6 +158,16 @@ impl Installer {
     /// Returns a validation, policy, cancellation, network, integrity, or filesystem error. Failed
     /// transfers are never promoted into the installed-model directory.
     pub async fn install(&self, manifest: &Manifest, cancel: &CancelToken) -> Result<ModelStatus> {
+        self.install_with_commit_observer(manifest, cancel, || {})
+            .await
+    }
+
+    async fn install_with_commit_observer(
+        &self,
+        manifest: &Manifest,
+        cancel: &CancelToken,
+        after_commit_boundary: impl FnOnce(),
+    ) -> Result<ModelStatus> {
         manifest.validate()?;
         self.validate_install_size(manifest)?;
         let existing = self.status(manifest, cancel).await?;
@@ -203,6 +213,9 @@ impl Installer {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        // This final cancellation observation is the commit point. Once all downloaded bytes have
+        // been authenticated, cancellation must not turn a durable promotion into a false failure.
+        after_commit_boundary();
         let manifest_path = staging.join("manifest.json");
         tokio::fs::write(&manifest_path, manifest.to_json()?).await?;
         let manifest_file = OpenOptions::new()
@@ -213,7 +226,7 @@ impl Installer {
         drop(manifest_file);
         promote(self.store.layout(), manifest, &staging)?;
         drop(lock);
-        self.status(manifest, cancel).await
+        self.status_non_cancellable(manifest).await
     }
 
     fn validate_install_size(&self, manifest: &Manifest) -> Result<()> {
@@ -252,6 +265,14 @@ impl Installer {
         })
         .await
         .map_err(|_| Error::Invalid("model verification worker failed".into()))?
+    }
+
+    async fn status_non_cancellable(&self, manifest: &Manifest) -> Result<ModelStatus> {
+        let store = self.store.clone();
+        let manifest = manifest.clone();
+        tokio::task::spawn_blocking(move || store.status(&manifest))
+            .await
+            .map_err(|_| Error::Invalid("model verification worker failed".into()))?
     }
 
     async fn download(
@@ -390,12 +411,15 @@ async fn acquire_lock(path: impl AsRef<Path>, cancel: &CancelToken) -> Result<fs
             .ok_or_else(|| Error::Invalid("lock directory has no cache root".into()))?;
         crate::store::reject_reparse_components(root, Path::new("locks"))?;
     }
-    if fs::symlink_metadata(path.as_ref())
-        .is_ok_and(|metadata| metadata.file_type().is_symlink() || is_windows_reparse(&metadata))
-    {
-        return Err(Error::Invalid(
-            "lock file cannot be a symlink or reparse point".into(),
-        ));
+    match fs::symlink_metadata(path.as_ref()) {
+        Ok(metadata) if metadata.file_type().is_symlink() || is_windows_reparse(&metadata) => {
+            return Err(Error::Invalid(
+                "lock file cannot be a symlink or reparse point".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let deadline = tokio::time::Instant::now() + crate::store::LOCK_WAIT_LIMIT;
     loop {
@@ -453,7 +477,75 @@ fn is_lock_contention(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        Artifact, Dimensions, License, Pooling, Prefixes, RuntimeMetadata, SemanticVerification,
+        TensorMetadata, TokenizerMetadata,
+    };
     use tempfile::TempDir;
+    use tokio::{io::AsyncReadExt, net::TcpListener};
+
+    fn fixture_manifest(url: String, body: &[u8]) -> Manifest {
+        Manifest {
+            schema_version: 1,
+            canonical_id: "tests/commit-boundary".into(),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            license: License {
+                spdx: "MIT".into(),
+                source_url: "https://example.invalid/license".into(),
+            },
+            semantic_verification: SemanticVerification::Unverified {
+                reason: "test fixture".into(),
+            },
+            tokenizer: TokenizerMetadata {
+                kind: "fixture".into(),
+                max_tokens: 8,
+                lowercase: false,
+            },
+            pooling: Pooling::Mean,
+            prefixes: Prefixes {
+                query: String::new(),
+                document: String::new(),
+            },
+            dimensions: Dimensions {
+                native: 2,
+                matryoshka: vec![],
+            },
+            tensors: TensorMetadata {
+                format: "fixture".into(),
+                dtype: "bytes".into(),
+                architecture: "identity".into(),
+            },
+            runtime: RuntimeMetadata::CatalogOnly,
+            artifacts: vec![Artifact {
+                path: "weights/model.bin".into(),
+                url,
+                sha256: format!("{:x}", Sha256::digest(body)),
+                size: u64::try_from(body.len()).unwrap_or_default(),
+            }],
+        }
+    }
+
+    async fn fixture_server(body: Vec<u8>) -> Result<(Url, tokio::task::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        });
+        Ok((
+            Url::parse(&format!("http://{address}/artifact"))
+                .map_err(|_| Error::Invalid("test URL did not parse".into()))?,
+            handle,
+        ))
+    }
 
     #[test]
     fn rejects_non_origin_allowlist_entries_and_redacts_debug() -> Result<()> {
@@ -560,6 +652,40 @@ mod tests {
         assert!(!temp.path().join("models").exists());
         assert!(!temp.path().join("staging").exists());
         assert!(!temp.path().join("locks").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_commit_boundary_cannot_turn_install_into_false_failure()
+    -> Result<()> {
+        let temp = TempDir::new()?;
+        let body = b"authenticated fixture bytes".to_vec();
+        let (url, server) = fixture_server(body.clone()).await?;
+        let origin = Url::parse(&format!("{}/", url.origin().ascii_serialization()))
+            .map_err(|_| Error::Invalid("test origin did not parse".into()))?;
+        let manifest = fixture_manifest(url.to_string(), &body);
+        let store = ModelStore::new(temp.path())?;
+        let installer = Installer::new(
+            store.clone(),
+            InstallOptions {
+                allowed_origins: vec![origin],
+                max_artifact_bytes: 1024,
+                max_total_artifact_bytes: 1024,
+                ..InstallOptions::default()
+            },
+        )?;
+        let cancel = CancelToken::new();
+        let trigger = cancel.clone();
+        let result = installer
+            .install_with_commit_observer(&manifest, &cancel, move || trigger.cancel())
+            .await;
+
+        assert_eq!(result?, ModelStatus::IntegrityVerified);
+        assert!(cancel.is_cancelled());
+        assert_eq!(store.status(&manifest)?, ModelStatus::IntegrityVerified);
+        server
+            .await
+            .map_err(|_| Error::Invalid("test server failed".into()))?;
         Ok(())
     }
 }

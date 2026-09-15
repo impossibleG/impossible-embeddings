@@ -484,8 +484,12 @@ impl ModelStore {
             if reject_reparse_components(&directory, Path::new(&artifact.path)).is_err() {
                 return Ok(ModelStatus::Invalid);
             }
-            let Ok(metadata) = fs::symlink_metadata(&path) else {
-                return Ok(ModelStatus::Invalid);
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(ModelStatus::Invalid);
+                }
+                Err(error) => return Err(error.into()),
             };
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
@@ -747,8 +751,8 @@ fn acquire_store_lock_with_cancel(
         .ok_or_else(|| Error::Invalid("lock path has no parent".into()))?;
     fs::create_dir_all(parent)?;
     reject_reparse_components(&layout.root, Path::new("locks"))?;
-    if is_reparse(&fs::symlink_metadata(parent)?)
-        || fs::symlink_metadata(&path).is_ok_and(|metadata| is_reparse(&metadata))
+    let lock_metadata = symlink_metadata_if_exists(&path)?;
+    if is_reparse(&fs::symlink_metadata(parent)?) || lock_metadata.as_ref().is_some_and(is_reparse)
     {
         return Err(Error::Invalid("model lock path cannot be a symlink".into()));
     }
@@ -989,7 +993,7 @@ pub(crate) fn prepare_staging(layout: &CacheLayout, staging: &Path) -> Result<()
         fs::create_dir_all(&directory)?;
         ensure_contained_directory(&layout.root, &directory)?;
     }
-    if let Ok(metadata) = fs::symlink_metadata(staging) {
+    if let Some(metadata) = symlink_metadata_if_exists(staging)? {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(Error::Invalid("unsafe staging path".into()));
         }
@@ -1029,10 +1033,22 @@ fn promote_with_observer(
     staging: &Path,
     mut observe: impl FnMut(PromotionPhase) -> Result<()>,
 ) -> Result<()> {
+    promote_with_operations(layout, manifest, staging, &mut observe, |from, to| {
+        fs::rename(from, to)
+    })
+}
+
+fn promote_with_operations(
+    layout: &CacheLayout,
+    manifest: &Manifest,
+    staging: &Path,
+    observe: &mut impl FnMut(PromotionPhase) -> Result<()>,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
     let final_path = layout.model_dir(manifest)?;
     reconcile_repair_inner(layout, manifest)?;
-    if fs::symlink_metadata(&final_path).is_err() {
-        fs::rename(staging, final_path)?;
+    if symlink_metadata_if_exists(&final_path)?.is_none() {
+        rename(staging, &final_path)?;
         return Ok(());
     }
     reject_reparse_components(
@@ -1046,7 +1062,9 @@ fn promote_with_observer(
     ensure_contained_directory(&layout.root, &transaction_root)?;
     let marker = layout.repair_marker(manifest)?;
     let backup = layout.repair_backup(manifest)?;
-    if fs::symlink_metadata(&backup).is_ok() || fs::symlink_metadata(&marker).is_ok() {
+    if symlink_metadata_if_exists(&backup)?.is_some()
+        || symlink_metadata_if_exists(&marker)?.is_some()
+    {
         return Err(Error::Invalid(
             "repair transaction state is not clean".into(),
         ));
@@ -1057,16 +1075,28 @@ fn promote_with_observer(
         .open(&marker)?;
     marker_file.sync_all()?;
     observe(PromotionPhase::MarkerDurable)?;
-    if let Err(error) = fs::rename(&final_path, &backup) {
-        let _ = fs::remove_file(&marker);
+    if let Err(error) = rename(&final_path, &backup) {
+        verify_transaction_final(&final_path)?;
+        fs::remove_file(&marker)?;
         return Err(error.into());
     }
     observe(PromotionPhase::PreviousDisplaced)?;
-    if let Err(error) = fs::rename(staging, &final_path) {
-        let _ = fs::rename(&backup, &final_path);
-        let _ = fs::remove_file(&marker);
-        return Err(error.into());
+    if rename(staging, &final_path).is_err() {
+        if rename(&backup, &final_path).is_err() {
+            // The durable marker is intentionally retained. A later status/load/install call can
+            // now reconcile the unambiguous (missing final, complete staging, complete backup)
+            // transaction instead of silently losing the only recovery signal.
+            return Err(Error::Invalid(
+                "repair promotion was interrupted and requires reconciliation".into(),
+            ));
+        }
+        verify_transaction_final(&final_path)?;
+        fs::remove_file(&marker)?;
+        return Err(Error::Invalid(
+            "replacement promotion failed; the previous model was restored".into(),
+        ));
     }
+    verify_transaction_final(&final_path)?;
     observe(PromotionPhase::ReplacementPromoted)?;
     quarantine_backup(layout, manifest, &backup)?;
     fs::remove_file(marker)?;
@@ -1074,7 +1104,7 @@ fn promote_with_observer(
 }
 
 fn quarantine_backup(layout: &CacheLayout, manifest: &Manifest, backup: &Path) -> Result<()> {
-    if fs::symlink_metadata(backup).is_err() {
+    if symlink_metadata_if_exists(backup)?.is_none() {
         return Ok(());
     }
     let quarantine_root = layout.root.join("quarantine");
@@ -1111,9 +1141,9 @@ fn reconcile_repair_inner(layout: &CacheLayout, manifest: &Manifest) -> Result<(
     let final_path = layout.model_dir(manifest)?;
     let staging = layout.staging_dir(manifest)?;
     let backup = layout.repair_backup(manifest)?;
-    let final_exists = fs::symlink_metadata(&final_path).is_ok();
-    let staging_exists = fs::symlink_metadata(&staging).is_ok();
-    let backup_exists = fs::symlink_metadata(&backup).is_ok();
+    let final_exists = symlink_metadata_if_exists(&final_path)?.is_some();
+    let staging_exists = symlink_metadata_if_exists(&staging)?.is_some();
+    let backup_exists = symlink_metadata_if_exists(&backup)?.is_some();
 
     match (final_exists, staging_exists, backup_exists) {
         // Crash after marker creation: resume the intended replacement.
@@ -1133,14 +1163,26 @@ fn reconcile_repair_inner(layout: &CacheLayout, manifest: &Manifest) -> Result<(
             ));
         }
     }
-    if fs::symlink_metadata(&final_path).is_ok() {
-        quarantine_backup(layout, manifest, &backup)?;
-        fs::remove_file(marker)?;
-        Ok(())
-    } else {
-        Err(Error::Invalid(
-            "repair transaction did not restore an installed state".into(),
-        ))
+    verify_transaction_final(&final_path)?;
+    quarantine_backup(layout, manifest, &backup)?;
+    fs::remove_file(marker)?;
+    Ok(())
+}
+
+fn symlink_metadata_if_exists(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn verify_transaction_final(path: &Path) -> Result<()> {
+    match symlink_metadata_if_exists(path)? {
+        Some(metadata) if metadata.is_dir() && !is_reparse(&metadata) => Ok(()),
+        _ => Err(Error::Invalid(
+            "repair transaction did not restore a safe installed state".into(),
+        )),
     }
 }
 
@@ -1360,6 +1402,45 @@ mod transaction_tests {
             assert!(!layout.repair_marker(&manifest)?.exists());
             assert!(!layout.repair_backup(&manifest)?.exists());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_promotion_and_failed_rollback_retain_marker_for_later_recovery() -> Result<()> {
+        let temp = TempDir::new()?;
+        let layout = CacheLayout::new(temp.path())?;
+        let manifest = manifest()?;
+        let final_path = layout.model_dir(&manifest)?;
+        let staging = layout.staging_dir(&manifest)?;
+        fs::create_dir_all(&final_path)?;
+        fs::write(final_path.join("state"), b"old")?;
+        prepare_staging(&layout, &staging)?;
+        fs::write(staging.join("state"), b"new")?;
+
+        let mut rename_count = 0_u8;
+        let mut observer = |_| Ok(());
+        let result =
+            promote_with_operations(&layout, &manifest, &staging, &mut observer, |from, to| {
+                rename_count = rename_count.saturating_add(1);
+                if matches!(rename_count, 2 | 3) {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected rename failure",
+                    ))
+                } else {
+                    fs::rename(from, to)
+                }
+            });
+        assert!(matches!(result, Err(Error::Invalid(_))));
+        assert!(layout.repair_marker(&manifest)?.is_file());
+        assert!(!final_path.exists());
+        assert!(staging.is_dir());
+        assert!(layout.repair_backup(&manifest)?.is_dir());
+
+        reconcile_repair_inner(&layout, &manifest)?;
+        assert_eq!(fs::read(final_path.join("state"))?, b"new");
+        assert!(!layout.repair_marker(&manifest)?.exists());
+        assert!(!layout.repair_backup(&manifest)?.exists());
         Ok(())
     }
 
