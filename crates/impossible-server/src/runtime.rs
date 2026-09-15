@@ -309,6 +309,12 @@ struct Inner {
     active: Arc<AtomicUsize>,
     active_zero: Arc<Notify>,
     queued: Arc<AtomicUsize>,
+    shutdown_flight: Mutex<Option<ShutdownFlight>>,
+}
+
+struct ShutdownFlight {
+    completion: watch::Receiver<Option<bool>>,
+    _task: JoinHandle<()>,
 }
 
 #[derive(Clone, Copy)]
@@ -506,6 +512,7 @@ impl ApplicationRuntime {
             active: Arc::new(AtomicUsize::new(0)),
             active_zero: Arc::new(Notify::new()),
             queued: Arc::new(AtomicUsize::new(0)),
+            shutdown_flight: Mutex::new(None),
         })))
     }
 
@@ -546,6 +553,11 @@ impl ApplicationRuntime {
         if model_id.trim().is_empty() {
             return Err(LifecycleError::LoadFailed);
         }
+        // Registration publishes a scheduler-backed model. Resolve the executor before acquiring
+        // lifecycle locks or mutating any registry so a synchronous caller outside Tokio gets a
+        // stable failure rather than a panic after partial publication.
+        let executor =
+            tokio::runtime::Handle::try_current().map_err(|_| LifecycleError::LoadFailed)?;
         let _admin = self
             .0
             .admin
@@ -591,7 +603,7 @@ impl ApplicationRuntime {
         let policy = self.0.policy;
         let pool = self.0.pool.clone();
         let (stop, stop_rx) = watch::channel(false);
-        let handle = tokio::spawn(run_scheduler(
+        let handle = executor.spawn(run_scheduler(
             receiver, model_id, engine, policy, pool, accepting, stop_rx,
         ));
         self.0
@@ -1076,18 +1088,51 @@ impl ApplicationRuntime {
 
     /// Reject new work, allow accepted work to drain, then cancel and discard remaining work.
     pub async fn shutdown(&self, timeout: Duration) -> bool {
-        let Ok(admin) = self.0.admin.lock() else {
-            return false;
+        let mut completion = {
+            let Ok(admin) = self.0.admin.lock() else {
+                return false;
+            };
+            let Ok(mut flight) = self.0.shutdown_flight.lock() else {
+                return false;
+            };
+            if let Some(existing) = flight.as_ref() {
+                existing.completion.clone()
+            } else {
+                self.0.draining.store(true, Ordering::Release);
+                let _ = self
+                    .0
+                    .health
+                    .transition(LifecycleState::Draining, Some(ReadinessReason::Draining));
+                self.0.shutdown.begin();
+                let (finished, completion) = watch::channel(None);
+                let runtime = self.clone();
+                let task = tokio::spawn(async move {
+                    let result = runtime.finish_shutdown(timeout).await;
+                    let _ = finished.send(Some(result));
+                });
+                *flight = Some(ShutdownFlight {
+                    completion: completion.clone(),
+                    _task: task,
+                });
+                drop(admin);
+                completion
+            }
         };
-        if self.0.draining.swap(true, Ordering::AcqRel) {
-            return self.0.shutdown.wait(Duration::ZERO);
+
+        loop {
+            if let Some(result) = *completion.borrow() {
+                return result;
+            }
+            if completion.changed().await.is_err() {
+                // The tracked task retains its sender until it records a terminal result. A
+                // closed channel here means the task failed unexpectedly; keep the public API
+                // bounded and conservative.
+                return false;
+            }
         }
-        let _ = self
-            .0
-            .health
-            .transition(LifecycleState::Draining, Some(ReadinessReason::Draining));
-        self.0.shutdown.begin();
-        drop(admin);
+    }
+
+    async fn finish_shutdown(&self, timeout: Duration) -> bool {
         let started = Instant::now();
         while started.elapsed() < timeout {
             if self.0.shutdown.wait(Duration::ZERO) {
@@ -1629,6 +1674,30 @@ mod tests {
             ApplicationRuntime::new(invalid),
             Err(LifecycleError::InvalidPolicy)
         ));
+    }
+
+    #[test]
+    fn registration_without_tokio_is_a_stable_atomic_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            runtime.register_engine("fake", Arc::new(FakeEngine::new(Duration::ZERO)))
+        }));
+
+        let Ok(registration) = result else {
+            return Err("registration panicked without Tokio".into());
+        };
+        assert_eq!(registration, Err(LifecycleError::LoadFailed));
+        assert_eq!(runtime.snapshot().registered_models, 0);
+        assert_eq!(runtime.health().model_counts(), (0, 0));
+        assert!(
+            runtime
+                .0
+                .schedulers
+                .lock()
+                .is_ok_and(|schedulers| schedulers.is_empty())
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2361,6 +2430,72 @@ mod tests {
             runtime.register_engine("other", Arc::new(FakeEngine::new(Duration::ZERO))),
             Err(LifecycleError::ShuttingDown)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_survives_first_caller_abort_and_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let permit = runtime
+            .0
+            .shutdown
+            .admit()
+            .ok_or("test work was not admitted")?;
+
+        let first_runtime = runtime.clone();
+        let first =
+            tokio::spawn(async move { first_runtime.shutdown(Duration::from_millis(20)).await });
+        while !runtime.snapshot().draining {
+            tokio::task::yield_now().await;
+        }
+        first.abort();
+        let _ = first.await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(permit);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            runtime.shutdown(Duration::from_secs(5)),
+        )
+        .await?;
+        assert!(!result);
+        assert!(!runtime.health().is_live());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_shutdown_callers_share_one_terminal_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let permit = runtime
+            .0
+            .shutdown
+            .admit()
+            .ok_or("test work was not admitted")?;
+
+        let first_runtime = runtime.clone();
+        let second_runtime = runtime.clone();
+        let first =
+            tokio::spawn(async move { first_runtime.shutdown(Duration::from_millis(20)).await });
+        let second =
+            tokio::spawn(async move { second_runtime.shutdown(Duration::from_millis(20)).await });
+        while !runtime.snapshot().draining {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(permit);
+        let (first, second) = tokio::join!(first, second);
+
+        if first? || second? {
+            return Err("concurrent forced shutdown reported a graceful drain".into());
+        }
+        if runtime.health().is_live() {
+            return Err("runtime remained live after concurrent shutdown".into());
+        }
+        if runtime.shutdown(Duration::ZERO).await {
+            return Err("repeated shutdown changed the terminal result".into());
+        }
         Ok(())
     }
 
