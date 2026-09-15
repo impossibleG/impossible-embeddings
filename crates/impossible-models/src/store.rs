@@ -20,7 +20,9 @@ use crate::{
 };
 
 const MANIFEST_FILE: &str = "manifest.json";
-pub(crate) const LOCK_WAIT_LIMIT: Duration = Duration::from_millis(500);
+// Durable promotion can include several metadata flushes on high-latency local filesystems. Give
+// a coalescing peer enough time to observe the committed model while keeping contention bounded.
+pub(crate) const LOCK_WAIT_LIMIT: Duration = Duration::from_secs(1);
 static QUARANTINE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Independently supplied semantic-verification evidence.
@@ -155,6 +157,12 @@ impl CacheLayout {
             .root
             .join("transactions")
             .join(format!("{}.previous", Self::key(manifest)?)))
+    }
+    fn deletion_tombstone(&self, manifest: &Manifest) -> Result<PathBuf> {
+        Ok(self
+            .root
+            .join("transactions")
+            .join(format!("{}.deleted", Self::key(manifest)?)))
     }
 }
 
@@ -621,7 +629,15 @@ impl ModelStore {
                 }
                 copy_import_artifact(&canonical, &target, artifact, || source_opened(&from))?;
             }
-            fs::write(staging.join(MANIFEST_FILE), manifest.to_json()?)?;
+            let manifest_path = staging.join(MANIFEST_FILE);
+            let mut manifest_options = OpenOptions::new();
+            manifest_options.write(true).create_new(true);
+            configure_no_follow(&mut manifest_options);
+            let mut manifest_file = manifest_options.open(&manifest_path)?;
+            manifest_file.write_all(&manifest.to_json()?)?;
+            manifest_file.flush()?;
+            manifest_file.sync_all()?;
+            drop(manifest_file);
             promote(&self.layout, manifest, &staging)
         })();
         if result.is_err() {
@@ -677,10 +693,46 @@ impl ModelStore {
     pub fn delete(&self, manifest: &Manifest) -> Result<bool> {
         manifest.validate()?;
         let _lock = acquire_delete_lock(&self.layout, manifest)?;
+        self.delete_locked_with_operations(
+            manifest,
+            &mut |_| Ok(()),
+            &mut |from, to| fs::rename(from, to),
+            &mut |path| fs::remove_dir_all(path),
+            &mut sync_directory,
+        )
+    }
+
+    fn delete_locked_with_operations(
+        &self,
+        manifest: &Manifest,
+        observe: &mut impl FnMut(DeletionPhase) -> Result<()>,
+        rename: &mut impl FnMut(&Path, &Path) -> std::io::Result<()>,
+        remove_dir_all: &mut impl FnMut(&Path) -> std::io::Result<()>,
+        sync_dir: &mut impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> Result<bool> {
+        // A replacement transaction and deletion use the same exclusive identity lock. Complete
+        // any durable repair record first so no later recovery can recreate a model that this
+        // operation has successfully removed.
+        reconcile_repair_with_operations(&self.layout, manifest, rename, sync_dir)?;
+        observe(DeletionPhase::RepairReconciled)?;
+
+        let transaction_root = self.layout.root.join("transactions");
+        fs::create_dir_all(&transaction_root)?;
+        ensure_contained_directory(&self.layout.root, &transaction_root)?;
+        sync_dir(&transaction_root)?;
+        sync_dir(&self.layout.root)?;
+        let tombstone = self.layout.deletion_tombstone(manifest)?;
+        let pending_deletion = symlink_metadata_if_exists(&tombstone)?.is_some();
+        if pending_deletion {
+            remove_deletion_tombstone(&tombstone, &transaction_root, remove_dir_all, sync_dir)?;
+        }
+
         let target = self.layout.model_dir(manifest)?;
         let metadata = match fs::symlink_metadata(&target) {
             Ok(value) => value,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(pending_deletion);
+            }
             Err(error) => return Err(error.into()),
         };
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -705,9 +757,40 @@ impl ModelStore {
                 "stored manifest does not exactly match deletion request".into(),
             ));
         }
-        fs::remove_dir_all(target)?;
+        durable_rename(&target, &tombstone, rename, sync_dir)?;
+        observe(DeletionPhase::TombstoneDurable)?;
+        remove_deletion_tombstone(&tombstone, &transaction_root, remove_dir_all, sync_dir)?;
+        observe(DeletionPhase::TombstoneRemoved)?;
         Ok(true)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeletionPhase {
+    RepairReconciled,
+    TombstoneDurable,
+    TombstoneRemoved,
+}
+
+fn remove_deletion_tombstone(
+    tombstone: &Path,
+    transaction_root: &Path,
+    remove_dir_all: &mut impl FnMut(&Path) -> std::io::Result<()>,
+    sync_dir: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let metadata = match fs::symlink_metadata(tombstone) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(Error::Invalid(
+            "deletion tombstone is not a regular directory".into(),
+        ));
+    }
+    remove_dir_all(tombstone)?;
+    sync_dir(transaction_root)?;
+    Ok(())
 }
 
 /// Reads an identity record only after both the containing directory and manifest file have been
@@ -863,7 +946,12 @@ fn configure_no_follow(options: &mut OpenOptions) {
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
 }
 
@@ -992,15 +1080,29 @@ pub(crate) fn prepare_staging(layout: &CacheLayout, staging: &Path) -> Result<()
     ] {
         fs::create_dir_all(&directory)?;
         ensure_contained_directory(&layout.root, &directory)?;
+        sync_directory(&directory)?;
     }
+    sync_directory(&layout.root)?;
     if let Some(metadata) = symlink_metadata_if_exists(staging)? {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(Error::Invalid("unsafe staging path".into()));
         }
         fs::remove_dir_all(staging)?;
+        sync_directory(
+            staging
+                .parent()
+                .ok_or_else(|| Error::Invalid("staging path has no parent".into()))?,
+        )?;
     }
     fs::create_dir_all(staging)?;
     ensure_contained_directory(&layout.root, staging)?;
+    sync_directory(staging)?;
+    sync_directory(
+        staging
+            .parent()
+            .ok_or_else(|| Error::Invalid("staging path has no parent".into()))?,
+    )?;
+    sync_directory(&layout.root)?;
     Ok(())
 }
 
@@ -1039,6 +1141,7 @@ fn promote_with_observer(
         staging,
         &mut observe,
         |from, to| fs::rename(from, to),
+        sync_regular_file,
         sync_directory,
     )
 }
@@ -1049,10 +1152,16 @@ fn promote_with_operations(
     staging: &Path,
     observe: &mut impl FnMut(PromotionPhase) -> Result<()>,
     mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    mut sync_file: impl FnMut(&Path) -> std::io::Result<()>,
     mut sync_dir: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<()> {
     let final_path = layout.model_dir(manifest)?;
     reconcile_repair_inner(layout, manifest)?;
+    // Promotion is the commit boundary. Persist every file and every directory entry in the
+    // staged tree before making it reachable from `models`, then persist both rename parents.
+    // This remains deliberately centralized here so future import/install paths cannot omit a
+    // durability barrier by mistake.
+    sync_staged_tree_with_operations(layout, staging, &mut sync_file, &mut sync_dir)?;
     if symlink_metadata_if_exists(&final_path)?.is_none() {
         durable_rename(staging, &final_path, &mut rename, &mut sync_dir)?;
         return Ok(());
@@ -1114,6 +1223,61 @@ fn promote_with_operations(
     Ok(())
 }
 
+fn sync_staged_directory_with_operations(
+    directory: &Path,
+    sync_file: &mut impl FnMut(&Path) -> std::io::Result<()>,
+    sync_dir: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(Error::Invalid(
+            "staged tree contains an unsafe directory".into(),
+        ));
+    }
+    let mut entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if is_reparse(&metadata) {
+            return Err(Error::Invalid(
+                "staged tree contains a symlink or reparse point".into(),
+            ));
+        }
+        if metadata.is_dir() {
+            sync_staged_directory_with_operations(&path, sync_file, sync_dir)?;
+        } else if metadata.is_file() {
+            sync_file(&path)?;
+        } else {
+            return Err(Error::Invalid(
+                "staged tree contains a special filesystem entry".into(),
+            ));
+        }
+    }
+    sync_dir(directory)?;
+    Ok(())
+}
+
+fn sync_staged_tree_with_operations(
+    layout: &CacheLayout,
+    staging: &Path,
+    sync_file: &mut impl FnMut(&Path) -> std::io::Result<()>,
+    sync_dir: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let staging_parent = staging
+        .parent()
+        .ok_or_else(|| Error::Invalid("staging path has no parent".into()))?;
+    if staging_parent != layout.root.join("staging") {
+        return Err(Error::Invalid("staging path escaped cache layout".into()));
+    }
+    ensure_contained_directory(&layout.root, staging)?;
+
+    sync_staged_directory_with_operations(staging, sync_file, sync_dir)?;
+    sync_dir(staging_parent)?;
+    sync_dir(&layout.root)?;
+    Ok(())
+}
+
 fn durable_rename(
     from: &Path,
     to: &Path,
@@ -1148,6 +1312,21 @@ fn durable_rename(
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> std::io::Result<()> {
     fs::File::open(path)?.sync_all()
+}
+
+fn sync_regular_file(path: &Path) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    configure_no_follow(&mut options);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "durability target is not a regular file",
+        ));
+    }
+    file.sync_all()
 }
 
 #[cfg(windows)]
@@ -1528,6 +1707,7 @@ mod transaction_tests {
                     fs::rename(from, to)
                 }
             },
+            sync_regular_file,
             sync_directory,
         );
         assert!(matches!(result, Err(Error::Invalid(_))));
@@ -1577,6 +1757,7 @@ mod transaction_tests {
                 ));
                 fs::rename(from, to)
             },
+            sync_regular_file,
             move |path| {
                 sync_events.borrow_mut().push(format!(
                     "sync:{}",
@@ -1592,7 +1773,6 @@ mod transaction_tests {
                 .first()
                 .is_some_and(|event| event.starts_with("sync:"))
         );
-        assert_eq!(events.get(1).map(String::as_str), Some("sync:transactions"));
         let metadata_events = events
             .iter()
             .filter(|event| {
@@ -1628,6 +1808,303 @@ mod transaction_tests {
     }
 
     #[test]
+    fn staged_tree_is_persisted_bottom_up_before_first_rename() -> Result<()> {
+        let temp = TempDir::new()?;
+        let layout = CacheLayout::new(temp.path())?;
+        let manifest = manifest()?;
+        let staging = layout.staging_dir(&manifest)?;
+        prepare_staging(&layout, &staging)?;
+        fs::create_dir_all(staging.join("nested/deep"))?;
+        fs::write(staging.join(MANIFEST_FILE), b"manifest")?;
+        fs::write(staging.join("nested/deep/artifact.bin"), b"artifact")?;
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let rename_events = Rc::clone(&events);
+        let file_events = Rc::clone(&events);
+        let directory_events = Rc::clone(&events);
+        let root_for_files = layout.root.clone();
+        let root_for_directories = layout.root.clone();
+        promote_with_operations(
+            &layout,
+            &manifest,
+            &staging,
+            &mut |_| Ok(()),
+            move |from, to| {
+                rename_events.borrow_mut().push("rename".to_owned());
+                fs::rename(from, to)
+            },
+            move |path| {
+                file_events.borrow_mut().push(format!(
+                    "file:{}",
+                    path.strip_prefix(&root_for_files)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                ));
+                Ok(())
+            },
+            move |path| {
+                directory_events.borrow_mut().push(format!(
+                    "dir:{}",
+                    path.strip_prefix(&root_for_directories)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                ));
+                Ok(())
+            },
+        )?;
+
+        let events = events.borrow();
+        let rename_index = events
+            .iter()
+            .position(|event| event == "rename")
+            .ok_or_else(|| Error::Invalid("missing rename event".into()))?;
+        let before_rename = &events[..rename_index];
+        let expected_manifest = format!(
+            "file:staging/{}/manifest.json",
+            staging
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+        );
+        assert!(
+            before_rename
+                .iter()
+                .any(|event| event == &expected_manifest)
+        );
+        let artifact_index = before_rename
+            .iter()
+            .position(|event| event.ends_with("/nested/deep/artifact.bin"))
+            .ok_or_else(|| Error::Invalid("missing artifact barrier".into()))?;
+        let deep_index = before_rename
+            .iter()
+            .position(|event| event.ends_with("/nested/deep"))
+            .ok_or_else(|| Error::Invalid("missing deep directory barrier".into()))?;
+        let nested_index = before_rename
+            .iter()
+            .position(|event| event.ends_with("/nested"))
+            .ok_or_else(|| Error::Invalid("missing nested directory barrier".into()))?;
+        assert!(artifact_index < deep_index && deep_index < nested_index);
+        assert!(before_rename.iter().any(|event| event == "dir:staging"));
+        assert!(before_rename.iter().any(|event| event == "dir:"));
+        Ok(())
+    }
+
+    #[test]
+    fn staged_tree_barrier_failure_prevents_promotion() -> Result<()> {
+        for fail_file in [true, false] {
+            let temp = TempDir::new()?;
+            let layout = CacheLayout::new(temp.path())?;
+            let manifest = manifest()?;
+            let staging = layout.staging_dir(&manifest)?;
+            prepare_staging(&layout, &staging)?;
+            fs::create_dir_all(staging.join("nested"))?;
+            fs::write(staging.join("nested/artifact.bin"), b"artifact")?;
+            let renamed = Cell::new(false);
+
+            let result = promote_with_operations(
+                &layout,
+                &manifest,
+                &staging,
+                &mut |_| Ok(()),
+                |from, to| {
+                    renamed.set(true);
+                    fs::rename(from, to)
+                },
+                |_| {
+                    if fail_file {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "injected file sync failure",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |path| {
+                    if !fail_file && path.ends_with("nested") {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "injected directory sync failure",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(result, Err(Error::Io(_))));
+            assert!(!renamed.get());
+            assert!(staging.is_dir());
+            assert!(!layout.model_dir(&manifest)?.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn delete_reconciles_every_interrupted_repair_phase_before_removal() -> Result<()> {
+        let body = b"delete repair transaction bytes";
+        for interrupted_after in [
+            PromotionPhase::MarkerDurable,
+            PromotionPhase::PreviousDisplaced,
+            PromotionPhase::ReplacementPromoted,
+        ] {
+            let temp = TempDir::new()?;
+            let manifest = local_manifest(body);
+            let store = trusted_store(temp.path(), &manifest)?;
+            let final_path = store.layout.model_dir(&manifest)?;
+            let staging = store.layout.staging_dir(&manifest)?;
+            write_valid_model(&final_path, &manifest, body)?;
+            prepare_staging(&store.layout, &staging)?;
+            write_valid_model(&staging, &manifest, body)?;
+
+            let result = promote_with_observer(&store.layout, &manifest, &staging, |phase| {
+                if phase == interrupted_after {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(result, Err(Error::Cancelled)));
+            assert!(store.delete(&manifest)?);
+            assert!(!final_path.exists());
+            assert!(!store.layout.repair_marker(&manifest)?.exists());
+            assert!(!store.layout.repair_backup(&manifest)?.exists());
+            assert!(!store.layout.deletion_tombstone(&manifest)?.exists());
+            assert_eq!(store.status(&manifest)?, ModelStatus::Missing);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_interrupted_delete_phase_has_an_idempotent_safe_retry() -> Result<()> {
+        let body = b"delete interruption bytes";
+        for interrupted_after in [
+            DeletionPhase::RepairReconciled,
+            DeletionPhase::TombstoneDurable,
+            DeletionPhase::TombstoneRemoved,
+        ] {
+            let temp = TempDir::new()?;
+            let manifest = local_manifest(body);
+            let store = trusted_store(temp.path(), &manifest)?;
+            let final_path = store.layout.model_dir(&manifest)?;
+            write_valid_model(&final_path, &manifest, body)?;
+
+            let result = store.delete_locked_with_operations(
+                &manifest,
+                &mut |phase| {
+                    if phase == interrupted_after {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                },
+                &mut |from, to| fs::rename(from, to),
+                &mut |path| fs::remove_dir_all(path),
+                &mut sync_directory,
+            );
+            assert!(matches!(result, Err(Error::Cancelled)));
+            let retry_deleted = store.delete(&manifest)?;
+            assert_eq!(
+                retry_deleted,
+                interrupted_after != DeletionPhase::TombstoneRemoved
+            );
+            assert!(!final_path.exists());
+            assert!(!store.layout.repair_marker(&manifest)?.exists());
+            assert!(!store.layout.repair_backup(&manifest)?.exists());
+            assert!(!store.layout.deletion_tombstone(&manifest)?.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_tombstone_cleanup_is_recoverable_without_resurrection() -> Result<()> {
+        let body = b"delete cleanup failure bytes";
+        let temp = TempDir::new()?;
+        let manifest = local_manifest(body);
+        let store = trusted_store(temp.path(), &manifest)?;
+        let final_path = store.layout.model_dir(&manifest)?;
+        let tombstone = store.layout.deletion_tombstone(&manifest)?;
+        write_valid_model(&final_path, &manifest, body)?;
+
+        let result = store.delete_locked_with_operations(
+            &manifest,
+            &mut |_| Ok(()),
+            &mut |from, to| fs::rename(from, to),
+            &mut |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected tombstone cleanup failure",
+                ))
+            },
+            &mut sync_directory,
+        );
+        assert!(matches!(result, Err(Error::Io(_))));
+        assert!(!final_path.exists());
+        assert!(tombstone.is_dir());
+
+        assert!(store.delete(&manifest)?);
+        assert!(!final_path.exists());
+        assert!(!tombstone.exists());
+        assert_eq!(store.status(&manifest)?, ModelStatus::Missing);
+        Ok(())
+    }
+
+    #[test]
+    fn delete_persists_models_parent_before_tombstone_cleanup() -> Result<()> {
+        let body = b"delete ordering bytes";
+        let temp = TempDir::new()?;
+        let manifest = local_manifest(body);
+        let store = trusted_store(temp.path(), &manifest)?;
+        let final_path = store.layout.model_dir(&manifest)?;
+        write_valid_model(&final_path, &manifest, body)?;
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let rename_events = Rc::clone(&events);
+        let remove_events = Rc::clone(&events);
+        let sync_events = Rc::clone(&events);
+
+        assert!(store.delete_locked_with_operations(
+            &manifest,
+            &mut |_| Ok(()),
+            &mut move |from, to| {
+                rename_events.borrow_mut().push("rename".to_owned());
+                fs::rename(from, to)
+            },
+            &mut move |path| {
+                remove_events.borrow_mut().push("remove".to_owned());
+                fs::remove_dir_all(path)
+            },
+            &mut move |path| {
+                sync_events.borrow_mut().push(format!(
+                    "sync:{}",
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("root")
+                ));
+                Ok(())
+            },
+        )?);
+
+        let events = events.borrow();
+        let rename = events
+            .iter()
+            .position(|event| event == "rename")
+            .unwrap_or(usize::MAX);
+        let remove = events
+            .iter()
+            .position(|event| event == "remove")
+            .unwrap_or(0);
+        assert!(rename < remove);
+        assert!(
+            events[rename + 1..remove]
+                .iter()
+                .any(|event| event == "sync:models")
+        );
+        assert_eq!(events.last().map(String::as_str), Some("sync:transactions"));
+        Ok(())
+    }
+
+    #[test]
     fn failed_marker_directory_barrier_retains_repair_signal() -> Result<()> {
         let temp = TempDir::new()?;
         let layout = CacheLayout::new(temp.path())?;
@@ -1638,7 +2115,8 @@ mod transaction_tests {
         fs::write(final_path.join("state"), b"old")?;
         prepare_staging(&layout, &staging)?;
         fs::write(staging.join("state"), b"new")?;
-        let calls = Cell::new(0_u8);
+        let failed_transaction_barrier = Cell::new(false);
+        let transaction_root = layout.root.join("transactions");
 
         let result = promote_with_operations(
             &layout,
@@ -1646,9 +2124,9 @@ mod transaction_tests {
             &staging,
             &mut |_| Ok(()),
             |from, to| fs::rename(from, to),
-            |_| {
-                calls.set(calls.get() + 1);
-                if calls.get() == 2 {
+            sync_regular_file,
+            |path| {
+                if path == transaction_root && !failed_transaction_barrier.replace(true) {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         "injected sync failure",
