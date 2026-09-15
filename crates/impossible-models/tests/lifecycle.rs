@@ -108,6 +108,8 @@ fn installer(temp: &TempDir, origin: &Url, offline: bool) -> TestResult<Installe
         allowed_origins: vec![origin],
         max_redirects: 1,
         max_artifact_bytes: 1024 * 1024,
+        max_artifacts: 16,
+        max_total_artifact_bytes: 16 * 1024 * 1024,
     };
     Ok(Installer::new(store, options)?)
 }
@@ -676,6 +678,25 @@ fn manifest_link_attack_is_rejected() -> TestResult {
             .discover(&[DiscoveryRoot::new(discovery.path())])?
             .is_empty()
     );
+    Ok(())
+}
+
+#[test]
+fn import_rejects_the_original_linked_source_directory() -> TestResult {
+    let cache = TempDir::new()?;
+    let real_source = TempDir::new()?;
+    let link_parent = TempDir::new()?;
+    let linked_source = link_parent.path().join("linked-source");
+    if !create_directory_link(&linked_source, real_source.path())? {
+        return Ok(());
+    }
+    let body = b"linked import bytes";
+    let manifest = fixture("https://example.invalid/model".into(), body, None);
+    std::fs::create_dir_all(real_source.path().join("weights"))?;
+    std::fs::write(real_source.path().join("weights/model.bin"), body)?;
+    let store = trusted_store(cache.path(), &manifest)?;
+    assert!(store.import(&manifest, &linked_source).is_err());
+    assert!(!cache.path().join("staging").exists());
     Ok(())
 }
 

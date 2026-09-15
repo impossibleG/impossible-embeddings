@@ -18,6 +18,9 @@ The loader treats the manifest as an exact graph contract. Every declared input 
 unique; the session must expose exactly that supported input set; and every input must be a rank-2
 Int64 tensor. The selected output must be a unique rank-2 or rank-3 Float32 tensor whose static
 hidden width matches the manifest. Contract failures reject the load before warmup or inference.
+The v0.1 contract is deliberately single-file: all tensor weights must be embedded in the `.onnx`
+protobuf. Graphs declaring ONNX external tensor data are rejected before runtime initialization;
+sidecar weight resolution is not supported.
 
 ## Consequences
 

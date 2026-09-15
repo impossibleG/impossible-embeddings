@@ -55,6 +55,10 @@ pub struct InstallOptions {
     pub max_redirects: usize,
     /// Absolute defense-in-depth bound per artifact.
     pub max_artifact_bytes: u64,
+    /// Maximum number of artifacts accepted by one installation.
+    pub max_artifacts: usize,
+    /// Maximum checked sum of declared artifact bytes for one installation.
+    pub max_total_artifact_bytes: u64,
 }
 
 impl std::fmt::Debug for InstallOptions {
@@ -65,6 +69,8 @@ impl std::fmt::Debug for InstallOptions {
             .field("allowed_origin_count", &self.allowed_origins.len())
             .field("max_redirects", &self.max_redirects)
             .field("max_artifact_bytes", &self.max_artifact_bytes)
+            .field("max_artifacts", &self.max_artifacts)
+            .field("max_total_artifact_bytes", &self.max_total_artifact_bytes)
             .finish()
     }
 }
@@ -79,6 +85,8 @@ impl Default for InstallOptions {
                 .collect(),
             max_redirects: 3,
             max_artifact_bytes: 2 * 1024 * 1024 * 1024,
+            max_artifacts: crate::MAX_ARTIFACTS,
+            max_total_artifact_bytes: 8 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -98,6 +106,14 @@ impl Installer {
     ///
     /// Returns an error for an empty/unsafe allowlist or if the HTTP client cannot be built.
     pub fn new(store: ModelStore, options: InstallOptions) -> Result<Self> {
+        if options.max_artifact_bytes == 0
+            || options.max_artifacts == 0
+            || options.max_total_artifact_bytes == 0
+        {
+            return Err(Error::Invalid(
+                "installation limits must be non-zero".into(),
+            ));
+        }
         if options.allowed_origins.is_empty() {
             return Err(Error::Invalid(
                 "at least one download origin must be explicitly allowed".into(),
@@ -143,7 +159,8 @@ impl Installer {
     /// transfers are never promoted into the installed-model directory.
     pub async fn install(&self, manifest: &Manifest, cancel: &CancelToken) -> Result<ModelStatus> {
         manifest.validate()?;
-        let existing = self.store.status(manifest)?;
+        self.validate_install_size(manifest)?;
+        let existing = self.status(manifest, cancel).await?;
         if matches!(
             existing,
             ModelStatus::IntegrityVerified | ModelStatus::Loadable
@@ -157,7 +174,8 @@ impl Installer {
             return Err(Error::Cancelled);
         }
         let lock = acquire_lock(self.store.layout().lock_file(manifest)?, cancel).await?;
-        let existing = self.store.status(manifest)?;
+        self.store.reconcile_repair(manifest)?;
+        let existing = self.status(manifest, cancel).await?;
         if matches!(
             existing,
             ModelStatus::IntegrityVerified | ModelStatus::Loadable
@@ -168,12 +186,6 @@ impl Installer {
         let staging = self.store.layout().staging_dir(manifest)?;
         prepare_staging(self.store.layout(), &staging)?;
         for artifact in &manifest.artifacts {
-            if artifact.size > self.options.max_artifact_bytes {
-                return Err(Error::SizeLimit {
-                    expected: self.options.max_artifact_bytes,
-                    actual: artifact.size,
-                });
-            }
             let target = staging.join(&artifact.path);
             if let Some(parent) = target.parent() {
                 tokio::fs::create_dir_all(parent).await?;
@@ -201,7 +213,45 @@ impl Installer {
         drop(manifest_file);
         promote(self.store.layout(), manifest, &staging)?;
         drop(lock);
-        self.store.status(manifest)
+        self.status(manifest, cancel).await
+    }
+
+    fn validate_install_size(&self, manifest: &Manifest) -> Result<()> {
+        if manifest.artifacts.len() > self.options.max_artifacts {
+            return Err(Error::Invalid(
+                "manifest exceeds configured artifact count".into(),
+            ));
+        }
+        let mut total = 0_u64;
+        for artifact in &manifest.artifacts {
+            if artifact.size > self.options.max_artifact_bytes {
+                return Err(Error::SizeLimit {
+                    expected: self.options.max_artifact_bytes,
+                    actual: artifact.size,
+                });
+            }
+            total = total
+                .checked_add(artifact.size)
+                .ok_or_else(|| Error::Invalid("aggregate artifact size overflow".into()))?;
+        }
+        if total > self.options.max_total_artifact_bytes {
+            return Err(Error::SizeLimit {
+                expected: self.options.max_total_artifact_bytes,
+                actual: total,
+            });
+        }
+        Ok(())
+    }
+
+    async fn status(&self, manifest: &Manifest, cancel: &CancelToken) -> Result<ModelStatus> {
+        let store = self.store.clone();
+        let manifest = manifest.clone();
+        let cancel = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            store.status_with_cancel(&manifest, || cancel.is_cancelled())
+        })
+        .await
+        .map_err(|_| Error::Invalid("model verification worker failed".into()))?
     }
 
     async fn download(
@@ -485,6 +535,31 @@ mod tests {
         ));
         assert!(started.elapsed() < Duration::from_millis(400));
         FileExt::unlock(&external)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn configured_aggregate_limit_fails_before_cache_mutation() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store = ModelStore::new(temp.path())?;
+        let manifest = crate::curated_manifests()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invalid("missing test manifest".into()))?;
+        let installer = Installer::new(
+            store,
+            InstallOptions {
+                max_total_artifact_bytes: manifest.artifacts[0].size - 1,
+                ..InstallOptions::default()
+            },
+        )?;
+        assert!(matches!(
+            installer.install(&manifest, &CancelToken::new()).await,
+            Err(Error::SizeLimit { .. })
+        ));
+        assert!(!temp.path().join("models").exists());
+        assert!(!temp.path().join("staging").exists());
+        assert!(!temp.path().join("locks").exists());
         Ok(())
     }
 }

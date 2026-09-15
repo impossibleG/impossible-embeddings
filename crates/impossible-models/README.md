@@ -14,6 +14,8 @@ bytes with different inference settings cannot share cache state:
 <root>/
   locks/<identity-key>.lock
   staging/<identity-key>.partial/
+  transactions/<identity-key>.repair
+  transactions/<identity-key>.previous/
   quarantine/<identity-key>.<process>.<sequence>.invalid/
   models/<identity-key>/
     manifest.json
@@ -25,7 +27,9 @@ or interrupted transfer can leave only a `.partial` staging directory; the next 
 the same per-model lock clears it and starts from a known state.
 If the exact final identity is corrupt or its stored manifest is missing, a successful reinstall
 moves that state to `quarantine` and atomically promotes the verified replacement. Quarantine names
-contain no host or user information.
+contain no host or user information. Repair uses a durable transaction marker and deterministic
+backup path; after interruption, the next status/install/import operation completes the prepared
+promotion or restores the displaced state, then clears the transaction.
 
 Discovery searches only directories supplied as `DiscoveryRoot` values. Import reads only a
 caller-supplied directory and rejects symbolic-link artifacts. Delete derives one content-addressed
@@ -59,3 +63,10 @@ fixtures, redirects are checked hop by hop, response and streamed byte counts ar
 offline mode returns before issuing a request. Default policy permits only `https://huggingface.co`.
 
 Curated manifests contain no weights. Their licenses are upstream assertions, not legal advice.
+
+## ONNX artifact limitation
+
+The v0.1 ONNX adapter accepts one self-contained `.onnx` artifact whose tensor weights are embedded
+in the protobuf. ONNX graphs using `external_data` or `data_location = EXTERNAL` are rejected before
+ONNX Runtime is initialized. Sidecar weight files are intentionally outside the v0.1 artifact
+contract, even if they are separately declared in a manifest.

@@ -7,6 +7,11 @@ use crate::{Error, Result};
 /// Current on-disk manifest schema version.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Hard schema bound preventing manifests from causing unbounded filesystem work.
+pub const MAX_ARTIFACTS: usize = 64;
+/// Hard schema bound for the sum of all declared artifact sizes (16 GiB).
+pub const MAX_TOTAL_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// Immutable description of one model revision and all files required to load it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -259,6 +264,18 @@ impl Manifest {
         }
         if self.artifacts.is_empty() {
             return Err(Error::Invalid("manifest has no artifacts".into()));
+        }
+        if self.artifacts.len() > MAX_ARTIFACTS {
+            return Err(Error::Invalid("manifest has too many artifacts".into()));
+        }
+        let total = self
+            .artifacts
+            .iter()
+            .try_fold(0_u64, |total, artifact| total.checked_add(artifact.size));
+        if total.is_none_or(|total| total > MAX_TOTAL_ARTIFACT_BYTES) {
+            return Err(Error::Invalid(
+                "manifest aggregate artifact size exceeds the supported limit".into(),
+            ));
         }
         validate_artifacts(&self.artifacts)?;
         validate_runtime_artifacts(&self.runtime, &self.artifacts)?;
@@ -569,6 +586,31 @@ mod tests {
             );
             assert!(Manifest::from_json(&serde_json::to_vec(&json).unwrap_or_default()).is_err());
         }
+    }
+
+    #[test]
+    fn artifact_work_and_aggregate_bytes_are_hard_bounded() {
+        let base: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../manifests/bge-small-en.json"))
+                .unwrap_or_default();
+        let mut too_many = base.clone();
+        too_many["artifacts"] = serde_json::Value::Array(
+            (0..=MAX_ARTIFACTS)
+                .map(|index| {
+                    serde_json::json!({
+                        "path": format!("artifact-{index}.bin"),
+                        "url": format!("https://example.invalid/artifact-{index}"),
+                        "sha256": "a".repeat(64),
+                        "size": 1
+                    })
+                })
+                .collect(),
+        );
+        assert!(Manifest::from_json(&serde_json::to_vec(&too_many).unwrap_or_default()).is_err());
+
+        let mut oversized = base;
+        oversized["artifacts"][0]["size"] = (MAX_TOTAL_ARTIFACT_BYTES + 1).into();
+        assert!(Manifest::from_json(&serde_json::to_vec(&oversized).unwrap_or_default()).is_err());
     }
 
     #[test]

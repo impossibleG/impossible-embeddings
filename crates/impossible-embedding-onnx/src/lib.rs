@@ -15,6 +15,7 @@ use ort::{
     value::Tensor,
     value::ValueType,
 };
+use prost::Message;
 use std::{borrow::Cow, collections::BTreeSet, error::Error, fmt, path::Path, sync::Mutex};
 use tokenizers::{Encoding, Tokenizer};
 
@@ -112,6 +113,7 @@ impl OnnxEmbeddingEngine {
         let manifest = verified.manifest().clone();
         let (model_file, tokenizer_file, contract) = onnx_contract(&manifest)?;
         let model_bytes = safe_artifact_bytes(verified, &model_file, "onnx")?;
+        reject_external_data_graph(&model_bytes)?;
         let tokenizer_bytes = safe_artifact_bytes(verified, &tokenizer_file, "json")?;
         let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)
             .map_err(|e| private_error(ErrorCode::ModelUnavailable, "tokenizer parse", e))?;
@@ -447,6 +449,152 @@ fn validate_graph_contract(
     }
     Ok(())
 }
+#[derive(Clone, PartialEq, Message)]
+struct OnnxModelProbe {
+    #[prost(message, optional, tag = "7")]
+    graph: Option<OnnxGraphProbe>,
+    #[prost(message, repeated, tag = "20")]
+    training_info: Vec<OnnxTrainingProbe>,
+    #[prost(message, repeated, tag = "25")]
+    functions: Vec<OnnxFunctionProbe>,
+}
+#[derive(Clone, PartialEq, Message)]
+struct OnnxGraphProbe {
+    #[prost(message, repeated, tag = "1")]
+    nodes: Vec<OnnxNodeProbe>,
+    #[prost(message, repeated, tag = "5")]
+    initializers: Vec<OnnxTensorProbe>,
+    #[prost(message, repeated, tag = "15")]
+    sparse_initializers: Vec<OnnxSparseTensorProbe>,
+}
+#[derive(Clone, PartialEq, Message)]
+struct OnnxNodeProbe {
+    #[prost(message, repeated, tag = "5")]
+    attributes: Vec<OnnxAttributeProbe>,
+}
+#[derive(Clone, PartialEq, Message)]
+struct OnnxAttributeProbe {
+    #[prost(message, optional, tag = "5")]
+    tensor: Option<OnnxTensorProbe>,
+    #[prost(message, optional, tag = "6")]
+    graph: Option<OnnxGraphProbe>,
+    #[prost(message, repeated, tag = "10")]
+    tensors: Vec<OnnxTensorProbe>,
+    #[prost(message, repeated, tag = "11")]
+    graphs: Vec<OnnxGraphProbe>,
+    #[prost(message, optional, tag = "22")]
+    sparse_tensor: Option<OnnxSparseTensorProbe>,
+    #[prost(message, repeated, tag = "23")]
+    sparse_tensors: Vec<OnnxSparseTensorProbe>,
+}
+#[derive(Clone, PartialEq, Message)]
+struct OnnxTensorProbe {
+    #[prost(message, repeated, tag = "13")]
+    external_data: Vec<OnnxStringPairProbe>,
+    #[prost(int32, optional, tag = "14")]
+    data_location: Option<i32>,
+}
+#[derive(Clone, PartialEq, Message)]
+struct OnnxStringPairProbe {
+    #[prost(string, optional, tag = "1")]
+    key: Option<String>,
+    #[prost(string, optional, tag = "2")]
+    value: Option<String>,
+}
+#[derive(Clone, PartialEq, Message)]
+struct OnnxSparseTensorProbe {
+    #[prost(message, optional, tag = "1")]
+    values: Option<OnnxTensorProbe>,
+    #[prost(message, optional, tag = "2")]
+    indices: Option<OnnxTensorProbe>,
+}
+#[derive(Clone, PartialEq, Message)]
+struct OnnxTrainingProbe {
+    #[prost(message, optional, tag = "1")]
+    initialization: Option<OnnxGraphProbe>,
+    #[prost(message, optional, tag = "2")]
+    algorithm: Option<OnnxGraphProbe>,
+}
+#[derive(Clone, PartialEq, Message)]
+struct OnnxFunctionProbe {
+    #[prost(message, repeated, tag = "7")]
+    nodes: Vec<OnnxNodeProbe>,
+}
+
+fn reject_external_data_graph(bytes: &[u8]) -> Result<(), EngineFailure> {
+    let model = OnnxModelProbe::decode(bytes)
+        .map_err(|error| private_error(ErrorCode::ModelUnavailable, "ONNX inspection", error))?;
+    let mut graphs = Vec::new();
+    if let Some(graph) = model.graph.as_ref() {
+        graphs.push(graph);
+    }
+    for training in &model.training_info {
+        graphs.extend(training.initialization.iter());
+        graphs.extend(training.algorithm.iter());
+    }
+    if model
+        .functions
+        .iter()
+        .any(|function| nodes_use_external_data(&function.nodes, &mut graphs))
+    {
+        return Err(EngineFailure::public(ErrorCode::InvalidRequest));
+    }
+    while let Some(graph) = graphs.pop() {
+        if tensors_use_external_data(&graph.initializers)
+            || graph
+                .sparse_initializers
+                .iter()
+                .any(sparse_uses_external_data)
+            || nodes_use_external_data(&graph.nodes, &mut graphs)
+        {
+            return Err(EngineFailure::public(ErrorCode::InvalidRequest));
+        }
+    }
+    Ok(())
+}
+
+fn nodes_use_external_data<'a>(
+    nodes: &'a [OnnxNodeProbe],
+    graphs: &mut Vec<&'a OnnxGraphProbe>,
+) -> bool {
+    nodes
+        .iter()
+        .flat_map(|node| &node.attributes)
+        .any(|attribute| {
+            graphs.extend(attribute.graph.iter());
+            graphs.extend(&attribute.graphs);
+            attribute
+                .tensor
+                .as_ref()
+                .is_some_and(tensor_uses_external_data)
+                || tensors_use_external_data(&attribute.tensors)
+                || attribute
+                    .sparse_tensor
+                    .as_ref()
+                    .is_some_and(sparse_uses_external_data)
+                || attribute
+                    .sparse_tensors
+                    .iter()
+                    .any(sparse_uses_external_data)
+        })
+}
+fn tensors_use_external_data(tensors: &[OnnxTensorProbe]) -> bool {
+    tensors.iter().any(tensor_uses_external_data)
+}
+fn tensor_uses_external_data(tensor: &OnnxTensorProbe) -> bool {
+    tensor.data_location == Some(1) || !tensor.external_data.is_empty()
+}
+fn sparse_uses_external_data(tensor: &OnnxSparseTensorProbe) -> bool {
+    tensor
+        .values
+        .as_ref()
+        .is_some_and(tensor_uses_external_data)
+        || tensor
+            .indices
+            .as_ref()
+            .is_some_and(tensor_uses_external_data)
+}
+
 fn validate_dimensions(m: &Manifest, requested: Option<usize>) -> Result<(), EngineFailure> {
     if requested.is_some_and(|dimension| {
         let requested = u32::try_from(dimension).unwrap_or(u32::MAX);
@@ -584,6 +732,70 @@ mod tests {
         assert!(validate_dimensions(&manifest, Some(native)).is_ok());
         assert!(validate_dimensions(&manifest, Some(native.saturating_add(1))).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn rejects_onnx_external_tensor_data_contracts() {
+        let embedded = OnnxModelProbe {
+            graph: Some(OnnxGraphProbe {
+                nodes: Vec::new(),
+                initializers: vec![OnnxTensorProbe {
+                    external_data: Vec::new(),
+                    data_location: None,
+                }],
+                sparse_initializers: Vec::new(),
+            }),
+            training_info: Vec::new(),
+            functions: Vec::new(),
+        };
+        assert!(reject_external_data_graph(&embedded.encode_to_vec()).is_ok());
+        for tensor in [
+            OnnxTensorProbe {
+                external_data: Vec::new(),
+                data_location: Some(1),
+            },
+            OnnxTensorProbe {
+                external_data: vec![OnnxStringPairProbe {
+                    key: Some("location".into()),
+                    value: Some("weights.bin".into()),
+                }],
+                data_location: None,
+            },
+        ] {
+            let external = OnnxModelProbe {
+                graph: Some(OnnxGraphProbe {
+                    nodes: Vec::new(),
+                    initializers: vec![tensor],
+                    sparse_initializers: Vec::new(),
+                }),
+                training_info: Vec::new(),
+                functions: Vec::new(),
+            };
+            assert!(reject_external_data_graph(&external.encode_to_vec()).is_err());
+        }
+
+        let nested = OnnxModelProbe {
+            graph: Some(OnnxGraphProbe {
+                nodes: vec![OnnxNodeProbe {
+                    attributes: vec![OnnxAttributeProbe {
+                        tensor: Some(OnnxTensorProbe {
+                            external_data: Vec::new(),
+                            data_location: Some(1),
+                        }),
+                        graph: None,
+                        tensors: Vec::new(),
+                        graphs: Vec::new(),
+                        sparse_tensor: None,
+                        sparse_tensors: Vec::new(),
+                    }],
+                }],
+                initializers: Vec::new(),
+                sparse_initializers: Vec::new(),
+            }),
+            training_info: Vec::new(),
+            functions: Vec::new(),
+        };
+        assert!(reject_external_data_graph(&nested.encode_to_vec()).is_err());
     }
 
     #[test]

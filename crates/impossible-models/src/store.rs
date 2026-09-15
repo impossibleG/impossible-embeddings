@@ -144,6 +144,18 @@ impl CacheLayout {
             .join("locks")
             .join(format!("{}.lock", Self::key(manifest)?)))
     }
+    fn repair_marker(&self, manifest: &Manifest) -> Result<PathBuf> {
+        Ok(self
+            .root
+            .join("transactions")
+            .join(format!("{}.repair", Self::key(manifest)?)))
+    }
+    fn repair_backup(&self, manifest: &Manifest) -> Result<PathBuf> {
+        Ok(self
+            .root
+            .join("transactions")
+            .join(format!("{}.previous", Self::key(manifest)?)))
+    }
 }
 
 /// An explicit directory the caller authorizes for discovery.
@@ -414,7 +426,34 @@ impl ModelStore {
     ///
     /// Returns an error when validation or filesystem inspection cannot be completed safely.
     pub fn status(&self, manifest: &Manifest) -> Result<ModelStatus> {
+        self.status_with_cancel(manifest, || false)
+    }
+
+    pub(crate) fn status_with_cancel(
+        &self,
+        manifest: &Manifest,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<ModelStatus> {
         manifest.validate()?;
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        match fs::symlink_metadata(self.layout.repair_marker(manifest)?) {
+            Ok(_) => {
+                let _lock = acquire_store_lock_with_cancel(&self.layout, manifest, &cancelled)?;
+                reconcile_repair_inner(&self.layout, manifest)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.status_inner(manifest, &cancelled)
+    }
+
+    fn status_inner(
+        &self,
+        manifest: &Manifest,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<ModelStatus> {
         let directory = self.layout.model_dir(manifest)?;
         if reject_reparse_components(
             &self.layout.root,
@@ -451,7 +490,7 @@ impl ModelStore {
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
                 || metadata.len() != artifact.size
-                || hash_file(&path)? != artifact.sha256
+                || hash_file_with_cancel(&path, cancelled)? != artifact.sha256
             {
                 return Ok(ModelStatus::Invalid);
             }
@@ -461,6 +500,10 @@ impl ModelStore {
         } else {
             ModelStatus::IntegrityVerified
         })
+    }
+
+    pub(crate) fn reconcile_repair(&self, manifest: &Manifest) -> Result<()> {
+        reconcile_repair_inner(&self.layout, manifest)
     }
 
     /// Performs a complete integrity and semantic-readiness verification.
@@ -507,15 +550,16 @@ impl ModelStore {
             return Ok(existing);
         }
         let _lock = acquire_store_lock(&self.layout, manifest)?;
-        let existing = self.status(manifest)?;
+        reconcile_repair_inner(&self.layout, manifest)?;
+        let existing = self.status_inner(manifest, &|| false)?;
         if matches!(
             existing,
             ModelStatus::IntegrityVerified | ModelStatus::Loadable
         ) {
             return Ok(existing);
         }
-        let source = fs::canonicalize(source)?;
-        if fs::symlink_metadata(&source)?.file_type().is_symlink() || !source.is_dir() {
+        let source = validate_import_source(source.as_ref())?;
+        if !source.is_dir() {
             return Err(Error::Invalid(
                 "import source must be a real directory".into(),
             ));
@@ -675,6 +719,14 @@ fn read_contained_manifest(directory: &Path) -> Result<Manifest> {
 }
 
 fn acquire_store_lock(layout: &CacheLayout, manifest: &Manifest) -> Result<fs::File> {
+    acquire_store_lock_with_cancel(layout, manifest, &|| false)
+}
+
+fn acquire_store_lock_with_cancel(
+    layout: &CacheLayout,
+    manifest: &Manifest,
+    cancelled: &impl Fn() -> bool,
+) -> Result<fs::File> {
     let path = layout.lock_file(manifest)?;
     let parent = path
         .parent()
@@ -688,6 +740,9 @@ fn acquire_store_lock(layout: &CacheLayout, manifest: &Manifest) -> Result<fs::F
     }
     let deadline = Instant::now() + LOCK_WAIT_LIMIT;
     loop {
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
         match OpenOptions::new()
             .create(true)
             .read(true)
@@ -799,6 +854,7 @@ pub(crate) fn prepare_staging(layout: &CacheLayout, staging: &Path) -> Result<()
         layout.root.join("models"),
         layout.root.join("staging"),
         layout.root.join("locks"),
+        layout.root.join("transactions"),
     ] {
         fs::create_dir_all(&directory)?;
         ensure_contained_directory(&layout.root, &directory)?;
@@ -827,43 +883,135 @@ pub(crate) fn ensure_contained_directory(base: &Path, directory: &Path) -> Resul
 }
 
 pub(crate) fn promote(layout: &CacheLayout, manifest: &Manifest, staging: &Path) -> Result<()> {
+    promote_with_observer(layout, manifest, staging, |_| Ok(()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromotionPhase {
+    MarkerDurable,
+    PreviousDisplaced,
+    ReplacementPromoted,
+}
+
+fn promote_with_observer(
+    layout: &CacheLayout,
+    manifest: &Manifest,
+    staging: &Path,
+    mut observe: impl FnMut(PromotionPhase) -> Result<()>,
+) -> Result<()> {
     let final_path = layout.model_dir(manifest)?;
-    let displaced = if fs::symlink_metadata(&final_path).is_ok() {
-        reject_reparse_components(
-            &layout.root,
-            Path::new("models")
-                .join(CacheLayout::key(manifest)?)
-                .as_path(),
-        )?;
-        let quarantine_root = layout.root.join("quarantine");
-        fs::create_dir_all(&quarantine_root)?;
-        ensure_contained_directory(&layout.root, &quarantine_root)?;
-        let quarantine = loop {
-            let sequence = QUARANTINE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let candidate = quarantine_root.join(format!(
-                "{}.{}.{}.invalid",
-                CacheLayout::key(manifest)?,
-                std::process::id(),
-                sequence
-            ));
-            match fs::symlink_metadata(&candidate) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break candidate,
-                Ok(_) => {}
-                Err(error) => return Err(error.into()),
-            }
-        };
-        fs::rename(&final_path, &quarantine)?;
-        Some(quarantine)
-    } else {
-        None
-    };
-    if let Err(error) = fs::rename(staging, &final_path) {
-        if let Some(quarantine) = displaced {
-            let _ = fs::rename(quarantine, &final_path);
-        }
+    reconcile_repair_inner(layout, manifest)?;
+    if fs::symlink_metadata(&final_path).is_err() {
+        fs::rename(staging, final_path)?;
+        return Ok(());
+    }
+    reject_reparse_components(
+        &layout.root,
+        Path::new("models")
+            .join(CacheLayout::key(manifest)?)
+            .as_path(),
+    )?;
+    let transaction_root = layout.root.join("transactions");
+    fs::create_dir_all(&transaction_root)?;
+    ensure_contained_directory(&layout.root, &transaction_root)?;
+    let marker = layout.repair_marker(manifest)?;
+    let backup = layout.repair_backup(manifest)?;
+    if fs::symlink_metadata(&backup).is_ok() || fs::symlink_metadata(&marker).is_ok() {
+        return Err(Error::Invalid(
+            "repair transaction state is not clean".into(),
+        ));
+    }
+    let marker_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&marker)?;
+    marker_file.sync_all()?;
+    observe(PromotionPhase::MarkerDurable)?;
+    if let Err(error) = fs::rename(&final_path, &backup) {
+        let _ = fs::remove_file(&marker);
         return Err(error.into());
     }
+    observe(PromotionPhase::PreviousDisplaced)?;
+    if let Err(error) = fs::rename(staging, &final_path) {
+        let _ = fs::rename(&backup, &final_path);
+        let _ = fs::remove_file(&marker);
+        return Err(error.into());
+    }
+    observe(PromotionPhase::ReplacementPromoted)?;
+    quarantine_backup(layout, manifest, &backup)?;
+    fs::remove_file(marker)?;
     Ok(())
+}
+
+fn quarantine_backup(layout: &CacheLayout, manifest: &Manifest, backup: &Path) -> Result<()> {
+    if fs::symlink_metadata(backup).is_err() {
+        return Ok(());
+    }
+    let quarantine_root = layout.root.join("quarantine");
+    fs::create_dir_all(&quarantine_root)?;
+    ensure_contained_directory(&layout.root, &quarantine_root)?;
+    let quarantine = loop {
+        let sequence = QUARANTINE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = quarantine_root.join(format!(
+            "{}.{}.{}.invalid",
+            CacheLayout::key(manifest)?,
+            std::process::id(),
+            sequence
+        ));
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break candidate,
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+    };
+    fs::rename(backup, quarantine)?;
+    Ok(())
+}
+
+fn reconcile_repair_inner(layout: &CacheLayout, manifest: &Manifest) -> Result<()> {
+    let marker = layout.repair_marker(manifest)?;
+    let marker_metadata = match fs::symlink_metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if is_reparse(&marker_metadata) || !marker_metadata.is_file() {
+        return Err(Error::Invalid("repair marker is not a regular file".into()));
+    }
+    let final_path = layout.model_dir(manifest)?;
+    let staging = layout.staging_dir(manifest)?;
+    let backup = layout.repair_backup(manifest)?;
+    let final_exists = fs::symlink_metadata(&final_path).is_ok();
+    let staging_exists = fs::symlink_metadata(&staging).is_ok();
+    let backup_exists = fs::symlink_metadata(&backup).is_ok();
+
+    match (final_exists, staging_exists, backup_exists) {
+        // Crash after marker creation: resume the intended replacement.
+        (true, true, false) => {
+            fs::rename(&final_path, &backup)?;
+            fs::rename(&staging, &final_path)?;
+        }
+        // Crash after displacement: finish promoting the fully prepared replacement.
+        (false, true, true) => fs::rename(&staging, &final_path)?,
+        // The replacement vanished: restore the previous state rather than leave a hole.
+        (false, false, true) => fs::rename(&backup, &final_path)?,
+        // New state is already visible, or the marker preceded any mutation.
+        (true, _, _) => {}
+        _ => {
+            return Err(Error::Invalid(
+                "repair transaction cannot be reconciled safely".into(),
+            ));
+        }
+    }
+    if fs::symlink_metadata(&final_path).is_ok() {
+        quarantine_backup(layout, manifest, &backup)?;
+        fs::remove_file(marker)?;
+        Ok(())
+    } else {
+        Err(Error::Invalid(
+            "repair transaction did not restore an installed state".into(),
+        ))
+    }
 }
 
 pub(crate) fn reject_reparse_components(base: &Path, relative: &Path) -> Result<()> {
@@ -909,11 +1057,18 @@ fn is_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 pub(crate) fn hash_file(path: &Path) -> Result<String> {
+    hash_file_with_cancel(path, &|| false)
+}
+
+fn hash_file_with_cancel(path: &Path, cancelled: &impl Fn() -> bool) -> Result<String> {
     use std::io::Read;
     let mut file = fs::File::open(path)?;
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -921,4 +1076,104 @@ pub(crate) fn hash_file(path: &Path) -> Result<String> {
         digest.update(&buffer[..read]);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+fn validate_import_source(source: &Path) -> Result<PathBuf> {
+    if source.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(Error::Invalid(
+            "import source contains unsafe components".into(),
+        ));
+    }
+    let metadata = fs::symlink_metadata(source)?;
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(Error::Invalid(
+            "import source must be a real non-reparse directory".into(),
+        ));
+    }
+    // Inspect each existing spelling component before canonicalization, including parent
+    // components. Canonicalization alone would erase evidence that the authorized path traversed
+    // a symlink or Windows junction.
+    let mut current = PathBuf::new();
+    for component in source.components() {
+        current.push(component.as_os_str());
+        if current.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if is_reparse(&metadata) => {
+                return Err(Error::Invalid(
+                    "import source contains a symlink or reparse point".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(fs::canonicalize(source)?)
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    use std::cell::Cell;
+    use tempfile::TempDir;
+
+    fn manifest() -> Result<Manifest> {
+        crate::curated_manifests()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invalid("missing curated test manifest".into()))
+    }
+
+    #[test]
+    fn hashing_checks_cancellation_between_chunks() -> Result<()> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("large.bin");
+        fs::write(&path, vec![7_u8; 256 * 1024])?;
+        let checks = Cell::new(0_u8);
+        let result = hash_file_with_cancel(&path, &|| {
+            checks.set(checks.get().saturating_add(1));
+            checks.get() > 2
+        });
+        assert!(matches!(result, Err(Error::Cancelled)));
+        Ok(())
+    }
+
+    #[test]
+    fn every_repair_promotion_phase_is_reconciled_deterministically() -> Result<()> {
+        for interrupted_after in [
+            PromotionPhase::MarkerDurable,
+            PromotionPhase::PreviousDisplaced,
+            PromotionPhase::ReplacementPromoted,
+        ] {
+            let temp = TempDir::new()?;
+            let layout = CacheLayout::new(temp.path())?;
+            let manifest = manifest()?;
+            let final_path = layout.model_dir(&manifest)?;
+            let staging = layout.staging_dir(&manifest)?;
+            fs::create_dir_all(&final_path)?;
+            fs::write(final_path.join("state"), b"old")?;
+            prepare_staging(&layout, &staging)?;
+            fs::write(staging.join("state"), b"new")?;
+
+            let result = promote_with_observer(&layout, &manifest, &staging, |phase| {
+                if phase == interrupted_after {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(result, Err(Error::Cancelled)));
+            reconcile_repair_inner(&layout, &manifest)?;
+            assert_eq!(fs::read(final_path.join("state"))?, b"new");
+            assert!(!layout.repair_marker(&manifest)?.exists());
+            assert!(!layout.repair_backup(&manifest)?.exists());
+        }
+        Ok(())
+    }
 }
