@@ -9,5 +9,8 @@ pub mod shutdown;
 pub mod telemetry;
 
 pub use config::{ConfigError, ServerConfig};
-pub use health::{HealthRegistry, LifecycleState, ModelKey, ModelState, Readiness};
+pub use health::{
+    HealthRegistry, LifecycleState, ModelFailureReason, ModelKey, ModelState, Readiness,
+    ReadinessReason,
+};
 pub use shutdown::{ShutdownCoordinator, ShutdownState};

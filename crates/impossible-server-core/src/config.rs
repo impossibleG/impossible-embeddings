@@ -7,14 +7,24 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use url::{Origin, Url};
 
 /// A non-secret reference to where a credential is stored.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CredentialSource {
     /// Read the credential from this environment variable.
     Environment(String),
     /// Read the credential from this file at startup.
     File(PathBuf),
+}
+
+impl fmt::Debug for CredentialSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Environment(_) => formatter.write_str("Environment([REDACTED])"),
+            Self::File(_) => formatter.write_str("File([REDACTED])"),
+        }
+    }
 }
 
 /// Bounded resource policy used before requests reach an inference engine.
@@ -54,7 +64,7 @@ impl Default for Limits {
 }
 
 /// Fully merged server configuration.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     /// Listener address. Loopback is the safe default.
     pub bind: SocketAddr,
@@ -70,6 +80,21 @@ pub struct ServerConfig {
     pub model_directories: Vec<PathBuf>,
     /// Resource and time limits.
     pub limits: Limits,
+}
+
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerConfig")
+            .field("bind", &"[REDACTED]")
+            .field("allow_insecure_remote", &self.allow_insecure_remote)
+            .field("auth", &self.auth)
+            .field("admin_auth", &self.admin_auth)
+            .field("allowed_origin_count", &self.allowed_origins.len())
+            .field("model_directory_count", &self.model_directories.len())
+            .field("limits", &self.limits)
+            .finish()
+    }
 }
 
 impl Default for ServerConfig {
@@ -100,6 +125,8 @@ pub enum ConfigError {
     },
     /// A CLI option requires a following value.
     MissingValue(String),
+    /// A positional argument was supplied where only an option is valid.
+    UnexpectedArgument,
     /// A configuration file could not be accessed.
     ConfigFileUnavailable,
     /// A remote listener was configured without protection.
@@ -114,6 +141,7 @@ impl fmt::Display for ConfigError {
             Self::UnknownKey(key) => write!(f, "unknown configuration key: {key}"),
             Self::InvalidValue { key, reason } => write!(f, "invalid value for {key}: {reason}"),
             Self::MissingValue(key) => write!(f, "missing value for {key}"),
+            Self::UnexpectedArgument => f.write_str("unexpected positional argument"),
             Self::ConfigFileUnavailable => f.write_str("configuration file is unavailable"),
             Self::UnsafeRemoteBind => f.write_str(
                 "non-loopback binding requires authentication or an explicit insecure override",
@@ -375,12 +403,20 @@ where
     while let Some(argument) = args.next() {
         let argument = argument.as_ref();
         let Some(option) = argument.strip_prefix("--") else {
-            return Err(ConfigError::UnknownKey(argument.to_owned()));
+            return Err(ConfigError::UnexpectedArgument);
         };
-        if option.contains("token") || option.contains("secret") || option == "auth" {
-            return Err(ConfigError::UnknownKey(option.to_owned()));
+        let option_name = option.split_once('=').map_or(option, |(name, _)| name);
+        let normalized_name = option_name.replace('-', "_");
+        if credential_like_option(&normalized_name) {
+            return Err(ConfigError::UnknownKey(normalized_name));
         }
-        let normalized = option.replace('-', "_");
+        if option.contains('=') {
+            return Err(ConfigError::InvalidValue {
+                key: normalized_name,
+                reason: "inline option values are not supported",
+            });
+        }
+        let normalized = normalized_name;
         let key = match normalized.as_str() {
             "max_body_bytes"
             | "max_items"
@@ -402,6 +438,15 @@ where
         patch.set(&key, value.as_ref().to_owned())?;
     }
     Ok(patch)
+}
+
+fn credential_like_option(option: &str) -> bool {
+    option == "auth"
+        || option.contains("token")
+        || option.contains("secret")
+        || option.contains("password")
+        || option.contains("credential")
+        || option.contains("api_key")
 }
 
 fn apply_value(target: &mut ServerConfig, key: &str, value: &str) -> Result<(), ConfigError> {
@@ -466,14 +511,26 @@ fn split_list(value: &str) -> Vec<String> {
 }
 
 fn valid_origin(origin: &str) -> bool {
-    let authority = origin
-        .strip_prefix("https://")
-        .or_else(|| origin.strip_prefix("http://"));
-    authority.is_some_and(|value| {
-        !value.is_empty()
-            && !value.contains(['/', '?', '#', '@', '\r', '\n', ' ', '\t'])
-            && value != "*"
-    })
+    if origin.is_empty() || origin.contains('*') {
+        return false;
+    }
+    let Ok(url) = Url::parse(origin) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Origin::Tuple(_, _, _) = url.origin() else {
+        return false;
+    };
+    url.origin().ascii_serialization() == origin
 }
 fn parse_bool(value: &str) -> Option<bool> {
     match value {
@@ -669,6 +726,22 @@ mod tests {
 
     #[test]
     fn cli_rejects_inline_secrets_and_admin_aliasing() {
+        let separated = ServerConfig::load(
+            None,
+            std::iter::empty::<(&str, &str)>(),
+            ["--token=sentinel-secret"],
+        )
+        .expect_err("inline secret must fail");
+        let adjacent = ServerConfig::load(
+            None,
+            std::iter::empty::<(&str, &str)>(),
+            ["--api-key=sentinel-api-key"],
+        )
+        .expect_err("inline API key must fail");
+        let debug = format!("{separated:?} {adjacent:?}");
+        let display = format!("{separated} {adjacent}");
+        assert!(!debug.contains("sentinel"));
+        assert!(!display.contains("sentinel"));
         assert!(
             ServerConfig::load(
                 None,
@@ -687,6 +760,35 @@ mod tests {
             config.validate(),
             Err(ConfigError::InvalidAdminCredentialPolicy)
         );
+    }
+
+    #[test]
+    fn debug_redacts_credentials_network_and_configured_paths() {
+        let config = ServerConfig {
+            bind: "192.0.2.40:9123".parse().expect("address"),
+            auth: Some(CredentialSource::Environment(
+                "SENTINEL_PRIVATE_ENV".to_owned(),
+            )),
+            admin_auth: Some(CredentialSource::File(PathBuf::from(
+                "C:/sentinel/private/admin-token",
+            ))),
+            allowed_origins: vec!["https://sentinel.internal".to_owned()],
+            model_directories: vec![PathBuf::from("C:/sentinel/private/models")],
+            ..ServerConfig::default()
+        };
+        let debug = format!("{config:?}");
+        for sensitive in [
+            "192.0.2.40",
+            "SENTINEL_PRIVATE_ENV",
+            "admin-token",
+            "sentinel.internal",
+            "private/models",
+        ] {
+            assert!(!debug.contains(sensitive), "leaked {sensitive:?}: {debug}");
+        }
+        assert!(debug.contains("allowed_origin_count: 1"));
+        assert!(debug.contains("model_directory_count: 1"));
+        assert!(debug.contains("max_body_bytes"));
     }
 
     #[test]
@@ -730,6 +832,19 @@ mod tests {
             "*",
             "https://example.test/path",
             "https://example.test?x=1",
+            "https://example.test#fragment",
+            "https://user@example.test",
+            "https://user:password@example.test",
+            "https://*.example.test",
+            "https://example.test:443",
+            "https://EXAMPLE.test",
+            "https://example.test/",
+            "https://example.test:",
+            "https://example.test:99999",
+            "https://example.test%2f.evil",
+            "https://[::1",
+            "https:///missing-authority",
+            "http:example.test",
             "file://local",
             "https://ok.test\r\nInjected: yes",
         ] {
@@ -738,6 +853,20 @@ mod tests {
                 ..ServerConfig::default()
             };
             assert!(config.validate().is_err(), "accepted {origin:?}");
+        }
+
+        for origin in [
+            "https://example.test",
+            "https://example.test:8443",
+            "http://localhost:3000",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            let config = ServerConfig {
+                allowed_origins: vec![origin.to_owned()],
+                ..ServerConfig::default()
+            };
+            assert_eq!(config.validate(), Ok(()), "rejected {origin:?}");
         }
     }
 

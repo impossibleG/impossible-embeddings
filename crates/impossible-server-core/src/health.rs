@@ -33,16 +33,29 @@ pub enum ModelState {
     /// Model can accept inference requests.
     Ready,
     /// Model is unavailable with a stable reason code.
-    Failed(&'static str),
+    Failed(ModelFailureReason),
+}
+
+/// Closed, privacy-safe reasons for model unavailability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFailureReason {
+    /// Required artifacts are absent.
+    Missing,
+    /// Artifacts failed validation.
+    Invalid,
+    /// Artifacts are verified but semantic verification remains incomplete.
+    SemanticVerificationPending,
+    /// Runtime initialization failed without exposing engine details.
+    RuntimeInitializationFailed,
 }
 
 impl From<ModelVerificationStatus> for ModelState {
     fn from(status: ModelVerificationStatus) -> Self {
         match status {
-            ModelVerificationStatus::Missing => Self::Failed("model_missing"),
-            ModelVerificationStatus::Invalid => Self::Failed("model_invalid"),
+            ModelVerificationStatus::Missing => Self::Failed(ModelFailureReason::Missing),
+            ModelVerificationStatus::Invalid => Self::Failed(ModelFailureReason::Invalid),
             ModelVerificationStatus::IntegrityVerified => {
-                Self::Failed("semantic_verification_pending")
+                Self::Failed(ModelFailureReason::SemanticVerificationPending)
             }
             // Artifact readiness permits adapter loading; it does not prove an initialized runtime.
             ModelVerificationStatus::Loadable => Self::Loading,
@@ -56,14 +69,46 @@ pub struct Readiness {
     /// Current process lifecycle.
     pub state: LifecycleState,
     /// Stable, non-sensitive reason code when the service is not ready.
-    pub reason_code: Option<&'static str>,
+    pub reason_code: Option<ReadinessReason>,
+}
+
+/// Closed set of stable, privacy-safe service readiness reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessReason {
+    /// Process initialization is in progress.
+    Starting,
+    /// No model has been configured or registered.
+    NoModelsConfigured,
+    /// Models exist, but none can currently accept requests.
+    NoReadyModels,
+    /// Graceful shutdown is draining accepted work.
+    Draining,
+    /// The process has stopped.
+    Stopped,
+    /// The health registry lock could not be read.
+    HealthStateUnavailable,
+}
+
+impl ReadinessReason {
+    /// Stable wire-safe diagnostic code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::NoModelsConfigured => "no_models_configured",
+            Self::NoReadyModels => "no_ready_models",
+            Self::Draining => "draining",
+            Self::Stopped => "stopped",
+            Self::HealthStateUnavailable => "health_state_unavailable",
+        }
+    }
 }
 
 impl Readiness {
     /// Returns whether the process can accept new work.
     #[must_use]
     pub const fn is_ready(&self) -> bool {
-        matches!(self.state, LifecycleState::Ready)
+        matches!(self.state, LifecycleState::Ready) && self.reason_code.is_none()
     }
 }
 
@@ -71,7 +116,7 @@ impl Readiness {
 struct HealthState {
     live: bool,
     lifecycle: LifecycleState,
-    reason: Option<&'static str>,
+    reason: Option<ReadinessReason>,
     models: BTreeMap<ModelKey, ModelState>,
 }
 
@@ -84,7 +129,7 @@ impl Default for HealthRegistry {
         Self(Arc::new(RwLock::new(HealthState {
             live: true,
             lifecycle: LifecycleState::Starting,
-            reason: Some("starting"),
+            reason: Some(ReadinessReason::Starting),
             models: BTreeMap::new(),
         })))
     }
@@ -114,7 +159,7 @@ impl HealthRegistry {
 
     /// Transition the process lifecycle. Stopped cannot transition back to service.
     #[must_use]
-    pub fn transition(&self, next: LifecycleState, reason: Option<&'static str>) -> bool {
+    pub fn transition(&self, next: LifecycleState, reason: Option<ReadinessReason>) -> bool {
         let Ok(mut state) = self.0.write() else {
             return false;
         };
@@ -140,12 +185,27 @@ impl HealthRegistry {
         let Ok(state) = self.0.read() else {
             return Readiness {
                 state: LifecycleState::Draining,
-                reason_code: Some("health_state_unavailable"),
+                reason_code: Some(ReadinessReason::HealthStateUnavailable),
             };
+        };
+        let ready_models = state
+            .models
+            .values()
+            .filter(|model| **model == ModelState::Ready)
+            .count();
+        let reason_code = match state.lifecycle {
+            LifecycleState::Ready if state.models.is_empty() => {
+                Some(ReadinessReason::NoModelsConfigured)
+            }
+            LifecycleState::Ready if ready_models == 0 => Some(ReadinessReason::NoReadyModels),
+            LifecycleState::Ready => state.reason,
+            LifecycleState::Starting => state.reason.or(Some(ReadinessReason::Starting)),
+            LifecycleState::Draining => state.reason.or(Some(ReadinessReason::Draining)),
+            LifecycleState::Stopped => state.reason.or(Some(ReadinessReason::Stopped)),
         };
         Readiness {
             state: state.lifecycle,
-            reason_code: state.reason,
+            reason_code,
         }
     }
 
@@ -177,11 +237,33 @@ mod tests {
         health.set_model(ModelKey(1), ModelState::Ready);
         assert!(health.transition(LifecycleState::Ready, None));
         assert!(health.readiness().is_ready());
-        assert!(health.transition(LifecycleState::Draining, Some("shutdown")));
+        assert!(health.transition(LifecycleState::Draining, Some(ReadinessReason::Draining)));
         assert!(!health.readiness().is_ready());
         assert!(!health.transition(LifecycleState::Ready, None));
-        assert!(health.transition(LifecycleState::Stopped, Some("stopped")));
+        assert!(health.transition(LifecycleState::Stopped, Some(ReadinessReason::Stopped)));
         assert!(!health.is_live());
         assert!(!health.transition(LifecycleState::Starting, None));
+    }
+
+    #[test]
+    fn ready_lifecycle_requires_a_usable_model() {
+        let health = HealthRegistry::default();
+        assert!(health.transition(LifecycleState::Ready, None));
+        assert_eq!(
+            health.readiness().reason_code,
+            Some(ReadinessReason::NoModelsConfigured)
+        );
+        assert!(!health.readiness().is_ready());
+
+        health.set_model(ModelKey(1), ModelState::Loading);
+        assert_eq!(
+            health.readiness().reason_code,
+            Some(ReadinessReason::NoReadyModels)
+        );
+        assert!(!health.readiness().is_ready());
+
+        health.set_model(ModelKey(1), ModelState::Ready);
+        assert_eq!(health.readiness().reason_code, None);
+        assert!(health.readiness().is_ready());
     }
 }

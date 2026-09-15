@@ -1,6 +1,6 @@
 //! Sanitized diagnostic report types.
 
-use crate::health::{LifecycleState, Readiness};
+use crate::health::{LifecycleState, Readiness, ReadinessReason};
 
 /// Safe-by-default `doctor` report.
 ///
@@ -13,7 +13,7 @@ pub struct DoctorReport {
     /// Current lifecycle state.
     pub lifecycle: LifecycleState,
     /// Stable non-sensitive readiness reason.
-    pub reason_code: Option<&'static str>,
+    pub reason_code: Option<ReadinessReason>,
     /// Total configured model count.
     pub model_count: usize,
     /// Ready model count.

@@ -765,6 +765,7 @@ version = "0.1.0"
 dependencies = [
  "impossible-embedding-core",
  "toml",
+ "url",
 ]
 
 [[package]]
