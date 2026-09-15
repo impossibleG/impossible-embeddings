@@ -35,7 +35,7 @@ struct LoadedModel {
     manifest: Manifest,
     contract: OnnxContract,
     tokenizer: Tokenizer,
-    session: Session,
+    session: Mutex<Session>,
     identity: ResolvedModelIdentity,
     _lease: VerifiedModel,
 }
@@ -56,7 +56,7 @@ pub struct OnnxEmbeddingEngine {
 #[derive(Default)]
 struct EngineState {
     epoch: u64,
-    loaded: Option<LoadedModel>,
+    loaded: Option<std::sync::Arc<LoadedModel>>,
 }
 
 impl EngineState {
@@ -102,7 +102,7 @@ impl OnnxEmbeddingEngine {
         if !state.accepts(epoch) {
             return Err(EngineFailure::public(ErrorCode::ModelUnavailable));
         }
-        state.loaded = Some(candidate);
+        state.loaded = Some(std::sync::Arc::new(candidate));
         Ok(identity)
     }
 
@@ -137,7 +137,7 @@ impl OnnxEmbeddingEngine {
             manifest,
             contract,
             tokenizer,
-            session,
+            session: Mutex::new(session),
             identity,
             _lease: verified.clone(),
         })
@@ -163,10 +163,10 @@ impl OnnxEmbeddingEngine {
     /// # Errors
     /// Returns the same stable errors as embedding.
     pub fn warm(&self) -> Result<(), EngineFailure> {
-        let mut guard = self.state()?;
-        let model = guard
+        let model = self
+            .state()?
             .loaded
-            .as_mut()
+            .clone()
             .ok_or_else(|| EngineFailure::public(ErrorCode::ModelUnavailable))?;
         let input = model
             .prefix_for(EmbeddingTask::Document)
@@ -175,6 +175,31 @@ impl OnnxEmbeddingEngine {
         let encoding = model.encode(&input, Truncation::Truncate)?;
         drop(model.run(&[encoding], None, model.contract.normalize)?);
         Ok(())
+    }
+
+    /// Return the immutable loaded identity and native width without acquiring the inference
+    /// session mutex.
+    ///
+    /// # Errors
+    /// Returns unavailable for an unloaded or mismatched model and internal for an invalid width.
+    pub fn resolved_model_contract(
+        &self,
+        requested: &RequestedModel,
+    ) -> Result<(ResolvedModelIdentity, usize), EngineFailure> {
+        let model = self
+            .state()?
+            .loaded
+            .clone()
+            .ok_or_else(|| EngineFailure::public(ErrorCode::ModelUnavailable))?;
+        if requested.as_str() != model.manifest.canonical_id {
+            return Err(EngineFailure::public(ErrorCode::ModelUnavailable));
+        }
+        let dimensions = usize::try_from(model.manifest.dimensions.native)
+            .map_err(|error| EngineFailure::with_source(ErrorCode::Internal, error))?;
+        if dimensions == 0 {
+            return Err(EngineFailure::public(ErrorCode::Internal));
+        }
+        Ok((model.identity.clone(), dimensions))
     }
 
     /// Unloads the current model; repeated calls are safe.
@@ -202,10 +227,10 @@ impl OnnxEmbeddingEngine {
         batch: &EmbeddingBatch<'_>,
         options: EmbedOptions,
     ) -> Result<EmbeddingBatchCost, EngineFailure> {
-        let guard = self.state()?;
-        let model = guard
+        let model = self
+            .state()?
             .loaded
-            .as_ref()
+            .clone()
             .ok_or_else(|| EngineFailure::public(ErrorCode::ModelUnavailable))?;
         if requested.as_str() != model.manifest.canonical_id {
             return Err(EngineFailure::public(ErrorCode::ModelUnavailable));
@@ -242,10 +267,10 @@ impl OnnxEmbeddingEngine {
         options: EmbedOptions,
     ) -> Result<EmbeddingOutput, EngineFailure> {
         control.ensure_active()?;
-        let mut guard = self.state()?;
-        let model = guard
+        let model = self
+            .state()?
             .loaded
-            .as_mut()
+            .clone()
             .ok_or_else(|| EngineFailure::public(ErrorCode::ModelUnavailable))?;
         if requested.as_str() != model.manifest.canonical_id {
             return Err(EngineFailure::public(ErrorCode::ModelUnavailable));
@@ -308,7 +333,7 @@ impl LoadedModel {
     }
 
     fn run(
-        &mut self,
+        &self,
         encodings: &[Encoding],
         dimensions: Option<usize>,
         normalize: bool,
@@ -349,7 +374,13 @@ impl LoadedModel {
         if let Some(name) = self.contract.inputs.token_type_ids.as_deref() {
             inputs.push((Cow::Borrowed(name), types.into()));
         }
-        let outputs = self.session.run(inputs).map_err(inference_error)?;
+        let mut session = self.session.lock().map_err(|_| {
+            EngineFailure::with_source(
+                ErrorCode::InferenceFailed,
+                Diagnostic("inference session lock is poisoned".into()),
+            )
+        })?;
+        let outputs = session.run(inputs).map_err(inference_error)?;
         let output = outputs
             .get(self.contract.output.as_str())
             .ok_or_else(|| EngineFailure::public(ErrorCode::InferenceFailed))?

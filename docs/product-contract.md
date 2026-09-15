@@ -44,9 +44,14 @@ active. Native execution may stop only when every constituent has been cancelled
 cancelling one member never aborts work required by surviving members. Each member is checked again
 before publication, so late output is delivered only to active callers.
 
-`max_items` and `max_tokens` bound each request's input count and exact post-tokenization token
-count. Engines preflight each request after prefixes, truncation, dimension validation, and model
-sequence limits, so a caller-local validation failure cannot poison compatible callers.
+`max_items`, `max_input_bytes`, and `max_request_bytes` bound each request's input count, each
+decoded input's UTF-8 bytes, and the aggregate decoded UTF-8 bytes respectively. The byte bounds
+are checked with overflow-safe arithmetic before tokenization, including when truncation is
+requested; `max_input_bytes <= max_request_bytes <= max_body_bytes` is required. `max_tokens`
+then bounds exact post-tokenization tokens. Engines preflight each request on bounded blocking
+capacity after prefixes, truncation, dimension validation, and model sequence limits, so tokenizer
+work cannot stall an async executor and a caller-local validation failure cannot poison compatible
+callers.
 `max_batch_items` bounds the input rows in one native call; `max_batch_tokens` independently bounds
 its padded token cells (`combined items * longest sequence`). All cost arithmetic is checked before
 compatible requests are combined. `max_queue_depth` is enforced per loaded model across all
@@ -54,6 +59,8 @@ pre-native waiting locations
 (transport channel, scheduler pending state, and native-pool wait); moving a request between those
 locations does not create extra capacity. The exported queue gauge is the aggregate number of
 requests waiting across models, while the active-request gauge counts live caller operations.
+Successful native output is accepted only when its complete resolved identity matches the loaded
+contract, vector count and width match every constituent request, and every value is finite.
 
 ## Model identity
 

@@ -32,6 +32,10 @@ impl fmt::Debug for CredentialSource {
 pub struct Limits {
     /// Maximum encoded request body size.
     pub max_body_bytes: usize,
+    /// Maximum UTF-8 bytes in one text input after transport decoding.
+    pub max_input_bytes: usize,
+    /// Maximum aggregate UTF-8 bytes across all text inputs in one request.
+    pub max_request_bytes: usize,
     /// Maximum text inputs in one request.
     pub max_items: usize,
     /// Maximum post-tokenization, non-padding tokens across a request.
@@ -54,6 +58,8 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_body_bytes: 2 * 1024 * 1024,
+            max_input_bytes: 256 * 1024,
+            max_request_bytes: 1024 * 1024,
             max_items: 128,
             max_tokens: 32_768,
             max_queue_depth: 256,
@@ -129,6 +135,8 @@ pub enum ConfigKey {
     AllowedOrigins,
     ModelDirectories,
     MaxBodyBytes,
+    MaxInputBytes,
+    MaxRequestBytes,
     MaxItems,
     MaxTokens,
     MaxQueueDepth,
@@ -157,6 +165,8 @@ impl ConfigKey {
             Self::AllowedOrigins => "allowed_origins",
             Self::ModelDirectories => "model_directories",
             Self::MaxBodyBytes => "limits.max_body_bytes",
+            Self::MaxInputBytes => "limits.max_input_bytes",
+            Self::MaxRequestBytes => "limits.max_request_bytes",
             Self::MaxItems => "limits.max_items",
             Self::MaxTokens => "limits.max_tokens",
             Self::MaxQueueDepth => "limits.max_queue_depth",
@@ -515,6 +525,8 @@ where
             "ALLOWED_ORIGINS" => ConfigKey::AllowedOrigins,
             "MODEL_DIRECTORIES" => ConfigKey::ModelDirectories,
             "MAX_BODY_BYTES" => ConfigKey::MaxBodyBytes,
+            "MAX_INPUT_BYTES" => ConfigKey::MaxInputBytes,
+            "MAX_REQUEST_BYTES" => ConfigKey::MaxRequestBytes,
             "MAX_ITEMS" => ConfigKey::MaxItems,
             "MAX_TOKENS" => ConfigKey::MaxTokens,
             "MAX_QUEUE_DEPTH" => ConfigKey::MaxQueueDepth,
@@ -568,6 +580,8 @@ where
         }
         let normalized_name = match normalized_name.as_str() {
             "max_body_bytes" => "limits.max_body_bytes",
+            "max_input_bytes" => "limits.max_input_bytes",
+            "max_request_bytes" => "limits.max_request_bytes",
             "max_items" => "limits.max_items",
             "max_tokens" => "limits.max_tokens",
             "max_queue_depth" => "limits.max_queue_depth",
@@ -619,6 +633,8 @@ fn parse_key(key: &str) -> Option<ConfigKey> {
         "allowed_origins" => Some(ConfigKey::AllowedOrigins),
         "model_directories" => Some(ConfigKey::ModelDirectories),
         "limits.max_body_bytes" => Some(ConfigKey::MaxBodyBytes),
+        "limits.max_input_bytes" => Some(ConfigKey::MaxInputBytes),
+        "limits.max_request_bytes" => Some(ConfigKey::MaxRequestBytes),
         "limits.max_items" => Some(ConfigKey::MaxItems),
         "limits.max_tokens" => Some(ConfigKey::MaxTokens),
         "limits.max_queue_depth" => Some(ConfigKey::MaxQueueDepth),
@@ -683,6 +699,10 @@ fn apply_value(
                 .collect();
         }
         ConfigKey::MaxBodyBytes => target.limits.max_body_bytes = parse_usize(scalar()?, key)?,
+        ConfigKey::MaxInputBytes => target.limits.max_input_bytes = parse_usize(scalar()?, key)?,
+        ConfigKey::MaxRequestBytes => {
+            target.limits.max_request_bytes = parse_usize(scalar()?, key)?;
+        }
         ConfigKey::MaxItems => target.limits.max_items = parse_usize(scalar()?, key)?,
         ConfigKey::MaxTokens => target.limits.max_tokens = parse_usize(scalar()?, key)?,
         ConfigKey::MaxQueueDepth => target.limits.max_queue_depth = parse_usize(scalar()?, key)?,
@@ -782,6 +802,18 @@ fn validate_bounds(limits: &Limits) -> Result<(), ConfigError> {
     const MIB: usize = 1024 * 1024;
     for (key, value, min, max) in [
         (ConfigKey::MaxBodyBytes, limits.max_body_bytes, 1, 64 * MIB),
+        (
+            ConfigKey::MaxInputBytes,
+            limits.max_input_bytes,
+            1,
+            64 * MIB,
+        ),
+        (
+            ConfigKey::MaxRequestBytes,
+            limits.max_request_bytes,
+            1,
+            64 * MIB,
+        ),
         (ConfigKey::MaxItems, limits.max_items, 1, 4096),
         (ConfigKey::MaxTokens, limits.max_tokens, 1, 1_000_000),
         (ConfigKey::MaxQueueDepth, limits.max_queue_depth, 1, 100_000),
@@ -816,6 +848,18 @@ fn validate_bounds(limits: &Limits) -> Result<(), ConfigError> {
         return Err(ConfigError::InvalidValue {
             key: ConfigKey::MaxBatchItems,
             reason: "must be at least limits.max_items",
+        });
+    }
+    if limits.max_input_bytes > limits.max_request_bytes {
+        return Err(ConfigError::InvalidValue {
+            key: ConfigKey::MaxRequestBytes,
+            reason: "must be at least limits.max_input_bytes",
+        });
+    }
+    if limits.max_request_bytes > limits.max_body_bytes {
+        return Err(ConfigError::InvalidValue {
+            key: ConfigKey::MaxRequestBytes,
+            reason: "must not exceed limits.max_body_bytes",
         });
     }
     if limits.max_tokens > limits.max_batch_tokens {
@@ -1237,5 +1281,55 @@ mod tests {
         );
         assert!(canonical_path_within(&root, Path::new("../outside")).is_err());
         let _ = fs::remove_dir_all(fixture);
+    }
+
+    #[test]
+    fn decoded_input_byte_limits_are_configurable_and_consistent() {
+        let defaults = Limits::default();
+        assert!(defaults.max_input_bytes <= defaults.max_request_bytes);
+        assert!(defaults.max_request_bytes <= defaults.max_body_bytes);
+
+        let mut config = ServerConfig::default();
+        parse_toml(
+            "[limits]\nmax_body_bytes = 100\nmax_input_bytes = 40\nmax_request_bytes = 80\n",
+        )
+        .expect("known byte-limit keys")
+        .apply(&mut config)
+        .expect("valid byte limits");
+        assert_eq!(config.limits.max_input_bytes, 40);
+        assert_eq!(config.limits.max_request_bytes, 80);
+        assert_eq!(config.validate(), Ok(()));
+
+        let mut invalid_per_input = config.clone();
+        invalid_per_input.limits.max_input_bytes = 81;
+        assert!(matches!(
+            invalid_per_input.validate(),
+            Err(ConfigError::InvalidValue {
+                key: ConfigKey::MaxRequestBytes,
+                ..
+            })
+        ));
+        let mut invalid_aggregate = config;
+        invalid_aggregate.limits.max_request_bytes = 101;
+        assert!(matches!(
+            invalid_aggregate.validate(),
+            Err(ConfigError::InvalidValue {
+                key: ConfigKey::MaxRequestBytes,
+                ..
+            })
+        ));
+
+        let environment = parse_environment([
+            ("IMPOSSIBLE_MAX_INPUT_BYTES", "30"),
+            ("IMPOSSIBLE_MAX_REQUEST_BYTES", "60"),
+        ])
+        .expect("known environment byte limits");
+        let command_line = parse_cli(["--max-input-bytes", "20", "--max-request-bytes", "50"])
+            .expect("known command-line byte limits");
+        let mut merged = ServerConfig::default();
+        environment.apply(&mut merged).expect("environment patch");
+        command_line.apply(&mut merged).expect("command-line patch");
+        assert_eq!(merged.limits.max_input_bytes, 20);
+        assert_eq!(merged.limits.max_request_bytes, 50);
     }
 }

@@ -36,6 +36,16 @@ use tokio::{
 
 /// Engine operations required by the application layer.
 pub trait RuntimeEngine: Send + Sync + 'static {
+    /// Return the immutable identity and native output width of the loaded model.
+    ///
+    /// The runtime uses this independently of adapter output so a defective or hostile adapter
+    /// cannot substitute model identity or silently change vector width.
+    ///
+    /// # Errors
+    /// Returns a stable model, adapter, or internal failure when no complete contract is loaded.
+    fn model_contract(&self, model: &RequestedModel)
+    -> Result<RuntimeModelContract, EngineFailure>;
+
     /// Validate one caller request and return its exact post-tokenization native cost.
     ///
     /// The default is conservative for simple custom engines. Production adapters should
@@ -85,6 +95,14 @@ pub trait RuntimeEngine: Send + Sync + 'static {
 }
 
 impl RuntimeEngine for OnnxEmbeddingEngine {
+    fn model_contract(
+        &self,
+        model: &RequestedModel,
+    ) -> Result<RuntimeModelContract, EngineFailure> {
+        let (identity, native_dimensions) = self.resolved_model_contract(model)?;
+        RuntimeModelContract::new(identity, native_dimensions)
+    }
+
     fn preflight(
         &self,
         model: &RequestedModel,
@@ -109,6 +127,32 @@ impl RuntimeEngine for OnnxEmbeddingEngine {
     }
 }
 
+/// Immutable output contract captured before a request is admitted for native inference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeModelContract {
+    identity: ResolvedModelIdentity,
+    native_dimensions: usize,
+}
+
+impl RuntimeModelContract {
+    /// Construct a complete loaded-model contract.
+    ///
+    /// # Errors
+    /// Returns an internal failure for an empty identity field or zero native width.
+    pub fn new(
+        identity: ResolvedModelIdentity,
+        native_dimensions: usize,
+    ) -> Result<Self, EngineFailure> {
+        if native_dimensions == 0 || !identity_is_complete(&identity) {
+            return Err(EngineFailure::public(ErrorCode::Internal));
+        }
+        Ok(Self {
+            identity,
+            native_dimensions,
+        })
+    }
+}
+
 /// Scheduler resource limits. All bounds are enforced before native inference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchPolicy {
@@ -116,6 +160,10 @@ pub struct BatchPolicy {
     pub queue_depth: usize,
     /// Inputs allowed in one caller request.
     pub max_items: usize,
+    /// UTF-8 bytes allowed in one decoded input before tokenization.
+    pub max_input_bytes: usize,
+    /// Aggregate UTF-8 bytes allowed in one decoded request before tokenization.
+    pub max_request_bytes: usize,
     /// Post-tokenization, non-padding tokens allowed in one caller request.
     pub max_tokens: usize,
     /// Inputs in one native call.
@@ -135,6 +183,8 @@ impl Default for BatchPolicy {
         Self {
             queue_depth: 256,
             max_items: 128,
+            max_input_bytes: 256 * 1024,
+            max_request_bytes: 1024 * 1024,
             max_tokens: 32_768,
             max_batch_items: 128,
             max_batch_tokens: 32_768,
@@ -149,12 +199,15 @@ impl BatchPolicy {
     fn validate(self) -> Result<Self, LifecycleError> {
         if self.queue_depth == 0
             || self.max_items == 0
+            || self.max_input_bytes == 0
+            || self.max_request_bytes == 0
             || self.max_tokens == 0
             || self.max_batch_items == 0
             || self.max_batch_tokens == 0
             || self.blocking_concurrency == 0
             || self.request_timeout.is_zero()
             || self.max_items > self.max_batch_items
+            || self.max_input_bytes > self.max_request_bytes
             || self.max_tokens > self.max_batch_tokens
         {
             return Err(LifecycleError::InvalidPolicy);
@@ -171,6 +224,8 @@ impl BatchPolicy {
         Self {
             queue_depth: limits.max_queue_depth,
             max_items: limits.max_items,
+            max_input_bytes: limits.max_input_bytes,
+            max_request_bytes: limits.max_request_bytes,
             max_tokens: limits.max_tokens,
             max_batch_items: limits.max_batch_items,
             max_batch_tokens: limits.max_batch_tokens,
@@ -281,13 +336,37 @@ fn run_blocking_worker(receiver: &Mutex<std::sync::mpsc::Receiver<BlockingJob>>)
 struct CompatibilityKey(EmbedOptions);
 
 struct Request {
+    sequence: usize,
     inputs: Vec<String>,
     cost: EmbeddingBatchCost,
+    contract: RuntimeModelContract,
     options: EmbedOptions,
     control: ExecutionControl,
     response: oneshot::Sender<Result<EmbeddingOutput, EngineFailure>>,
     _lease: RuntimeLease,
     queue: Option<QueuePermit>,
+}
+
+struct PreflightSuccess {
+    sequence: usize,
+    inputs: Vec<String>,
+    cost: EmbeddingBatchCost,
+    contract: RuntimeModelContract,
+    lease: RuntimeLease,
+    queue: QueuePermit,
+}
+
+struct PreflightPlan {
+    sequence: usize,
+    inputs: Vec<String>,
+    options: EmbedOptions,
+    control: ExecutionControl,
+    model: RequestedModel,
+    engine: Arc<dyn RuntimeEngine>,
+    lease: RuntimeLease,
+    queue: QueuePermit,
+    max_tokens: usize,
+    max_batch_tokens: usize,
 }
 
 struct ModelSlot {
@@ -383,6 +462,7 @@ struct Inner {
     shutdown: ShutdownCoordinator,
     pool: BlockingPool,
     next_key: AtomicUsize,
+    next_request: AtomicUsize,
     draining: AtomicBool,
     admin: Mutex<()>,
     schedulers: Mutex<HashMap<ModelKey, SchedulerTask>>,
@@ -624,6 +704,7 @@ impl ApplicationRuntime {
             shutdown: ShutdownCoordinator::default(),
             pool: BlockingPool::new(policy.blocking_concurrency, policy.queue_depth)?,
             next_key: AtomicUsize::new(1),
+            next_request: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
             admin: Mutex::new(()),
             schedulers: Mutex::new(HashMap::new()),
@@ -1179,6 +1260,11 @@ impl ApplicationRuntime {
         if inputs.is_empty() || inputs.len() > self.0.policy.max_items {
             return Err(EngineFailure::public(ErrorCode::InvalidRequest));
         }
+        validate_raw_inputs(
+            &inputs,
+            self.0.policy.max_input_bytes,
+            self.0.policy.max_request_bytes,
+        )?;
         let slot = {
             let models = self
                 .0
@@ -1193,15 +1279,6 @@ impl ApplicationRuntime {
         };
         if !slot.accepting.load(Ordering::Acquire) {
             return Err(EngineFailure::public(ErrorCode::ModelUnavailable));
-        }
-        let model = RequestedModel::new(model_id.to_owned())?;
-        let batch = EmbeddingBatch::new(inputs.iter().map(|input| Cow::Borrowed(input.as_str())))?;
-        let cost = slot.engine.preflight(&model, &batch, options)?;
-        if cost.items() != inputs.len()
-            || cost.tokens() > self.0.policy.max_tokens
-            || cost.padded_tokens()? > self.0.policy.max_batch_tokens
-        {
-            return Err(EngineFailure::public(ErrorCode::InvalidRequest));
         }
         let lease = self
             .lease(model_id)
@@ -1223,15 +1300,36 @@ impl ApplicationRuntime {
             self.0.policy.queue_depth,
         )
         .ok_or_else(|| EngineFailure::public(ErrorCode::QueueFull))?;
+        let prepared = execute_preflight(
+            &self.0.pool,
+            PreflightPlan {
+                sequence: self.0.next_request.fetch_add(1, Ordering::Relaxed),
+                inputs,
+                options,
+                control: control.clone(),
+                model: RequestedModel::new(model_id.to_owned())?,
+                engine: Arc::clone(&slot.engine),
+                lease,
+                queue,
+                max_tokens: self.0.policy.max_tokens,
+                max_batch_tokens: self.0.policy.max_batch_tokens,
+            },
+            abandonment.clone(),
+            self.0.force_stop.subscribe(),
+            effective_deadline,
+        )
+        .await?;
         let (response, receive) = oneshot::channel();
         let request = Request {
-            inputs,
-            cost,
+            sequence: prepared.sequence,
+            inputs: prepared.inputs,
+            cost: prepared.cost,
+            contract: prepared.contract,
             options,
             control: control.clone(),
             response,
-            _lease: lease,
-            queue: Some(queue),
+            _lease: prepared.lease,
+            queue: Some(prepared.queue),
         };
         slot.sender.try_send(request).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => EngineFailure::public(ErrorCode::QueueFull),
@@ -1239,7 +1337,7 @@ impl ApplicationRuntime {
                 EngineFailure::public(ErrorCode::ModelUnavailable)
             }
         })?;
-        await_response(
+        await_controlled(
             control,
             abandonment,
             receive,
@@ -1503,13 +1601,104 @@ async fn wait_for_drain(
     }
 }
 
-async fn await_response(
+fn validate_raw_inputs(
+    inputs: &[String],
+    max_input_bytes: usize,
+    max_request_bytes: usize,
+) -> Result<(), EngineFailure> {
+    let mut total = 0_usize;
+    for input in inputs {
+        let bytes = input.len();
+        if bytes > max_input_bytes {
+            return Err(EngineFailure::public(ErrorCode::InvalidRequest));
+        }
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| EngineFailure::public(ErrorCode::InvalidRequest))?;
+        if total > max_request_bytes {
+            return Err(EngineFailure::public(ErrorCode::InvalidRequest));
+        }
+    }
+    Ok(())
+}
+
+fn identity_is_complete(identity: &ResolvedModelIdentity) -> bool {
+    [
+        identity.canonical_id.as_str(),
+        identity.revision.as_str(),
+        identity.runtime.as_str(),
+        identity.artifact_fingerprint.as_str(),
+        identity.semantic_fingerprint.as_str(),
+    ]
+    .into_iter()
+    .all(|value| !value.trim().is_empty())
+}
+
+fn validate_runtime_contract(
+    requested: &RequestedModel,
+    contract: &RuntimeModelContract,
+) -> Result<(), EngineFailure> {
+    if contract.native_dimensions == 0
+        || contract.identity.canonical_id != requested.as_str()
+        || !identity_is_complete(&contract.identity)
+    {
+        return Err(EngineFailure::public(ErrorCode::InferenceFailed));
+    }
+    Ok(())
+}
+
+async fn execute_preflight(
+    pool: &BlockingPool,
+    plan: PreflightPlan,
+    abandonment: CancellationToken,
+    force_stop: watch::Receiver<bool>,
+    deadline: Instant,
+) -> Result<PreflightSuccess, EngineFailure> {
+    let control = plan.control.clone();
+    let (send, receive) = oneshot::channel();
+    let job = Box::new(move || {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            plan.control.ensure_active()?;
+            let contract = plan.engine.model_contract(&plan.model)?;
+            validate_runtime_contract(&plan.model, &contract)?;
+            let batch = EmbeddingBatch::new(
+                plan.inputs
+                    .iter()
+                    .map(|input| Cow::Borrowed(input.as_str())),
+            )?;
+            let cost = plan.engine.preflight(&plan.model, &batch, plan.options)?;
+            plan.control.ensure_active()?;
+            if cost.items() != plan.inputs.len()
+                || cost.tokens() > plan.max_tokens
+                || cost.padded_tokens()? > plan.max_batch_tokens
+            {
+                return Err(EngineFailure::public(ErrorCode::InvalidRequest));
+            }
+            Ok(PreflightSuccess {
+                sequence: plan.sequence,
+                inputs: plan.inputs,
+                cost,
+                contract,
+                lease: plan.lease,
+                queue: plan.queue,
+            })
+        }))
+        .unwrap_or_else(|_| Err(EngineFailure::public(ErrorCode::InferenceFailed)));
+        let _ = send.send(result);
+    }) as BlockingJob;
+    if pool.try_execute(job).is_err() {
+        return Err(EngineFailure::public(ErrorCode::QueueFull));
+    }
+    await_controlled(control, abandonment, receive, force_stop, deadline).await
+}
+
+async fn await_controlled<T>(
     control: ExecutionControl,
     abandonment: CancellationToken,
-    mut receive: oneshot::Receiver<Result<EmbeddingOutput, EngineFailure>>,
+    mut receive: oneshot::Receiver<Result<T, EngineFailure>>,
     mut force_stop: watch::Receiver<bool>,
     deadline: Instant,
-) -> Result<EmbeddingOutput, EngineFailure> {
+) -> Result<T, EngineFailure> {
     let mut cancel_on_drop = CancelOnDrop {
         abandonment,
         armed: true,
@@ -1609,6 +1798,9 @@ async fn run_scheduler(
         if *stop.borrow() {
             continue;
         }
+        pending
+            .make_contiguous()
+            .sort_by_key(|request| request.sequence);
         while !pending.is_empty() {
             let Some(first) = pending.pop_front() else {
                 break;
@@ -1743,12 +1935,47 @@ fn execute_batch(
         engine.embed(&model, &batch, &batch_control, requests[0].options)
     }));
     match result {
-        Ok(Ok(output)) if output.vectors.len() == sizes.iter().sum::<usize>() => {
+        Ok(Ok(output)) if valid_engine_output(&output, &requests, &sizes) => {
             publish_results(requests, sizes, output.vectors, &output.model, accepting);
         }
         Ok(Ok(_)) | Err(_) => fail_requests(requests, ErrorCode::InferenceFailed),
         Ok(Err(error)) => fail_requests(requests, error.public_error().code),
     }
+}
+
+fn valid_engine_output(output: &EmbeddingOutput, requests: &[Request], sizes: &[usize]) -> bool {
+    let Some(total) = sizes
+        .iter()
+        .try_fold(0_usize, |sum, size| sum.checked_add(*size))
+    else {
+        return false;
+    };
+    if output.vectors.len() != total || !identity_is_complete(&output.model) {
+        return false;
+    }
+    let mut offset = 0_usize;
+    for (request, size) in requests.iter().zip(sizes) {
+        if request.contract.identity != output.model {
+            return false;
+        }
+        let expected_dimensions = request
+            .options
+            .dimensions
+            .unwrap_or(request.contract.native_dimensions);
+        let Some(end) = offset.checked_add(*size) else {
+            return false;
+        };
+        let Some(vectors) = output.vectors.get(offset..end) else {
+            return false;
+        };
+        if vectors.iter().any(|vector| {
+            vector.len() != expected_dimensions || !vector.iter().all(|value| value.is_finite())
+        }) {
+            return false;
+        }
+        offset = end;
+    }
+    offset == total
 }
 
 fn publish_results(
@@ -1817,6 +2044,17 @@ mod tests {
         }
     }
 
+    fn test_contract(
+        model: &RequestedModel,
+        native_dimensions: usize,
+    ) -> Result<RuntimeModelContract, EngineFailure> {
+        RuntimeModelContract::new(test_identity(model)?, native_dimensions)
+    }
+
+    fn test_identity(model: &RequestedModel) -> Result<ResolvedModelIdentity, EngineFailure> {
+        ResolvedModelIdentity::new(model.as_str(), "rev", "fake@1", "artifact", "semantic")
+    }
+
     struct FakeEngine {
         calls: AtomicUsize,
         finished: AtomicBool,
@@ -1849,6 +2087,13 @@ mod tests {
     }
 
     impl RuntimeEngine for CostAwareEngine {
+        fn model_contract(
+            &self,
+            model: &RequestedModel,
+        ) -> Result<RuntimeModelContract, EngineFailure> {
+            test_contract(model, 1)
+        }
+
         fn preflight(
             &self,
             _model: &RequestedModel,
@@ -1872,7 +2117,7 @@ mod tests {
 
         fn embed(
             &self,
-            _model: &RequestedModel,
+            model: &RequestedModel,
             batch: &EmbeddingBatch<'_>,
             _control: &ExecutionControl,
             _options: EmbedOptions,
@@ -1897,13 +2142,7 @@ mod tests {
                 .push(work);
             Ok(EmbeddingOutput {
                 vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
-                model: ResolvedModelIdentity::new(
-                    "cost-aware",
-                    "rev",
-                    "fake@1",
-                    "artifact",
-                    "semantic",
-                )?,
+                model: test_identity(model)?,
             })
         }
 
@@ -1917,9 +2156,16 @@ mod tests {
     struct OrdinaryPanicOnceEngine(AtomicUsize);
 
     impl RuntimeEngine for OrdinaryPanicOnceEngine {
+        fn model_contract(
+            &self,
+            model: &RequestedModel,
+        ) -> Result<RuntimeModelContract, EngineFailure> {
+            test_contract(model, 1)
+        }
+
         fn embed(
             &self,
-            _model: &RequestedModel,
+            model: &RequestedModel,
             batch: &EmbeddingBatch<'_>,
             _control: &ExecutionControl,
             _options: EmbedOptions,
@@ -1931,7 +2177,7 @@ mod tests {
             );
             Ok(EmbeddingOutput {
                 vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
-                model: ResolvedModelIdentity::new("fake", "rev", "fake@1", "artifact", "semantic")?,
+                model: test_identity(model)?,
             })
         }
 
@@ -1941,9 +2187,16 @@ mod tests {
     }
 
     impl RuntimeEngine for PanicOnceEngine {
+        fn model_contract(
+            &self,
+            model: &RequestedModel,
+        ) -> Result<RuntimeModelContract, EngineFailure> {
+            test_contract(model, 1)
+        }
+
         fn embed(
             &self,
-            _model: &RequestedModel,
+            model: &RequestedModel,
             batch: &EmbeddingBatch<'_>,
             _control: &ExecutionControl,
             _options: EmbedOptions,
@@ -1953,7 +2206,7 @@ mod tests {
             }
             Ok(EmbeddingOutput {
                 vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
-                model: ResolvedModelIdentity::new("fake", "rev", "fake@1", "artifact", "semantic")?,
+                model: test_identity(model)?,
             })
         }
 
@@ -1965,9 +2218,16 @@ mod tests {
     struct CooperativeEngine;
 
     impl RuntimeEngine for CooperativeEngine {
+        fn model_contract(
+            &self,
+            model: &RequestedModel,
+        ) -> Result<RuntimeModelContract, EngineFailure> {
+            test_contract(model, 1)
+        }
+
         fn embed(
             &self,
-            _model: &RequestedModel,
+            model: &RequestedModel,
             batch: &EmbeddingBatch<'_>,
             control: &ExecutionControl,
             _options: EmbedOptions,
@@ -1978,7 +2238,7 @@ mod tests {
             }
             Ok(EmbeddingOutput {
                 vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
-                model: ResolvedModelIdentity::new("fake", "rev", "fake@1", "artifact", "semantic")?,
+                model: test_identity(model)?,
             })
         }
 
@@ -2008,9 +2268,16 @@ mod tests {
     }
 
     impl RuntimeEngine for FakeEngine {
+        fn model_contract(
+            &self,
+            model: &RequestedModel,
+        ) -> Result<RuntimeModelContract, EngineFailure> {
+            test_contract(model, 2)
+        }
+
         fn embed(
             &self,
-            _model: &RequestedModel,
+            model: &RequestedModel,
             batch: &EmbeddingBatch<'_>,
             _control: &ExecutionControl,
             options: EmbedOptions,
@@ -2035,7 +2302,109 @@ mod tests {
                         vec![marker, f32::from(index)]
                     })
                     .collect(),
-                model: ResolvedModelIdentity::new("fake", "rev", "fake@1", "artifact", "semantic")?,
+                model: test_identity(model)?,
+            })
+        }
+
+        fn warm(&self) -> Result<(), EngineFailure> {
+            Ok(())
+        }
+    }
+
+    struct PreflightProbe {
+        preflights: AtomicUsize,
+        embeds: AtomicUsize,
+        delay: Duration,
+        panic_once: bool,
+    }
+
+    impl RuntimeEngine for PreflightProbe {
+        fn model_contract(
+            &self,
+            model: &RequestedModel,
+        ) -> Result<RuntimeModelContract, EngineFailure> {
+            test_contract(model, 1)
+        }
+
+        fn preflight(
+            &self,
+            _model: &RequestedModel,
+            batch: &EmbeddingBatch<'_>,
+            _options: EmbedOptions,
+        ) -> Result<EmbeddingBatchCost, EngineFailure> {
+            let call = self.preflights.fetch_add(1, Ordering::AcqRel);
+            if self.panic_once && call == 0 {
+                std::panic::resume_unwind(Box::new("private tokenizer panic"));
+            }
+            thread::sleep(self.delay);
+            EmbeddingBatchCost::new(batch.inputs().len(), batch.inputs().len(), 1)
+        }
+
+        fn embed(
+            &self,
+            model: &RequestedModel,
+            batch: &EmbeddingBatch<'_>,
+            _control: &ExecutionControl,
+            _options: EmbedOptions,
+        ) -> Result<EmbeddingOutput, EngineFailure> {
+            self.embeds.fetch_add(1, Ordering::AcqRel);
+            Ok(EmbeddingOutput {
+                vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
+                model: test_identity(model)?,
+            })
+        }
+
+        fn warm(&self) -> Result<(), EngineFailure> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum HostileOutput {
+        WrongIdentity,
+        IncompleteIdentity,
+        WrongCount,
+        RaggedWidth,
+        NonFinite,
+        IgnoresRequestedWidth,
+    }
+
+    struct HostileEngine(HostileOutput);
+
+    impl RuntimeEngine for HostileEngine {
+        fn model_contract(
+            &self,
+            model: &RequestedModel,
+        ) -> Result<RuntimeModelContract, EngineFailure> {
+            test_contract(model, 2)
+        }
+
+        fn embed(
+            &self,
+            model: &RequestedModel,
+            batch: &EmbeddingBatch<'_>,
+            _control: &ExecutionControl,
+            _options: EmbedOptions,
+        ) -> Result<EmbeddingOutput, EngineFailure> {
+            let mut identity = test_identity(model)?;
+            let mut vectors = batch
+                .inputs()
+                .iter()
+                .map(|_| vec![1.0, 2.0])
+                .collect::<Vec<_>>();
+            match self.0 {
+                HostileOutput::WrongIdentity => identity.revision = "substituted".into(),
+                HostileOutput::IncompleteIdentity => identity.runtime.clear(),
+                HostileOutput::WrongCount => vectors.push(vec![1.0, 2.0]),
+                HostileOutput::RaggedWidth => {
+                    vectors[0].pop();
+                }
+                HostileOutput::NonFinite => vectors[0][0] = f32::NAN,
+                HostileOutput::IgnoresRequestedWidth => {}
+            }
+            Ok(EmbeddingOutput {
+                vectors,
+                model: identity,
             })
         }
 
@@ -2048,6 +2417,8 @@ mod tests {
         BatchPolicy {
             queue_depth: 8,
             max_items: 8,
+            max_input_bytes: 1024,
+            max_request_bytes: 4096,
             max_tokens: 32,
             max_batch_items: 8,
             max_batch_tokens: 32,
@@ -2061,6 +2432,8 @@ mod tests {
     fn server_limits_convert_without_conflating_request_and_batch_bounds() {
         let limits = Limits {
             max_items: 3,
+            max_input_bytes: 300,
+            max_request_bytes: 600,
             max_tokens: 30,
             max_batch_items: 7,
             max_batch_tokens: 70,
@@ -2068,6 +2441,8 @@ mod tests {
         };
         let policy = BatchPolicy::from_limits(&limits, Duration::from_millis(9));
         assert_eq!(policy.max_items, 3);
+        assert_eq!(policy.max_input_bytes, 300);
+        assert_eq!(policy.max_request_bytes, 600);
         assert_eq!(policy.max_tokens, 30);
         assert_eq!(policy.max_batch_items, 7);
         assert_eq!(policy.max_batch_tokens, 70);
@@ -2076,6 +2451,12 @@ mod tests {
         assert_eq!(policy.request_timeout, limits.request_timeout);
         let mut invalid = policy;
         invalid.max_batch_items = 2;
+        assert!(matches!(
+            ApplicationRuntime::new(invalid),
+            Err(LifecycleError::InvalidPolicy)
+        ));
+        let mut invalid = policy;
+        invalid.max_input_bytes = invalid.max_request_bytes + 1;
         assert!(matches!(
             ApplicationRuntime::new(invalid),
             Err(LifecycleError::InvalidPolicy)
@@ -3582,6 +3963,219 @@ mod tests {
         assert!(metrics.contains("impossible_queue_depth 0"));
         assert!(!metrics.contains("item-"));
         assert!(!metrics.contains("model="));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preflight_never_blocks_the_tokio_executor_and_panics_are_isolated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut limits = policy();
+        limits.max_batch_wait = Duration::ZERO;
+        let runtime = ApplicationRuntime::new(limits)?;
+        let engine = Arc::new(PreflightProbe {
+            preflights: AtomicUsize::new(0),
+            embeds: AtomicUsize::new(0),
+            delay: Duration::from_millis(200),
+            panic_once: false,
+        });
+        runtime.register_engine("fake", engine.clone())?;
+        let request_runtime = runtime.clone();
+        let request = tokio::spawn(async move {
+            request_runtime
+                .embed(
+                    "fake",
+                    vec!["small".into()],
+                    EmbedOptions::default(),
+                    CancellationToken::default(),
+                    None,
+                )
+                .await
+        });
+        while engine.preflights.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_eq!(request.await??.vectors.len(), 1);
+
+        let panic_runtime = ApplicationRuntime::new(limits)?;
+        let panic_engine = Arc::new(PreflightProbe {
+            preflights: AtomicUsize::new(0),
+            embeds: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            panic_once: true,
+        });
+        panic_runtime.register_engine("fake", panic_engine.clone())?;
+        let first = panic_runtime
+            .embed(
+                "fake",
+                vec!["small".into()],
+                EmbedOptions::default(),
+                CancellationToken::default(),
+                None,
+            )
+            .await
+            .err()
+            .ok_or("preflight panic must fail")?;
+        assert_eq!(first.public_error().code, ErrorCode::InferenceFailed);
+        assert_eq!(
+            panic_runtime
+                .embed(
+                    "fake",
+                    vec!["small".into()],
+                    EmbedOptions::default(),
+                    CancellationToken::default(),
+                    None,
+                )
+                .await?
+                .vectors
+                .len(),
+            1
+        );
+        assert_eq!(panic_engine.embeds.load(Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_utf8_limits_reject_before_tokenization_even_when_truncating()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut limits = policy();
+        limits.max_input_bytes = 4;
+        limits.max_request_bytes = 6;
+        let runtime = ApplicationRuntime::new(limits)?;
+        let engine = Arc::new(PreflightProbe {
+            preflights: AtomicUsize::new(0),
+            embeds: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            panic_once: false,
+        });
+        runtime.register_engine("fake", engine.clone())?;
+        for inputs in [
+            vec!["ééé".into()],
+            vec!["abcd".into(), "abc".into()],
+            vec!["x".repeat(1_000_000)],
+        ] {
+            let error = runtime
+                .embed(
+                    "fake",
+                    inputs,
+                    EmbedOptions {
+                        truncation: impossible_embedding_core::Truncation::Truncate,
+                        ..EmbedOptions::default()
+                    },
+                    CancellationToken::default(),
+                    None,
+                )
+                .await
+                .err()
+                .ok_or("oversized request must fail")?;
+            assert_eq!(error.public_error().code, ErrorCode::InvalidRequest);
+        }
+        assert_eq!(engine.preflights.load(Ordering::Acquire), 0);
+        assert_eq!(
+            runtime
+                .embed(
+                    "fake",
+                    vec!["abc".into(), "def".into()],
+                    EmbedOptions::default(),
+                    CancellationToken::default(),
+                    None,
+                )
+                .await?
+                .vectors
+                .len(),
+            2
+        );
+        assert_eq!(engine.preflights.load(Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deadline_during_preflight_releases_accounting_and_never_reaches_inference()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut limits = policy();
+        limits.request_timeout = Duration::from_millis(15);
+        let runtime = ApplicationRuntime::new(limits)?;
+        let engine = Arc::new(PreflightProbe {
+            preflights: AtomicUsize::new(0),
+            embeds: AtomicUsize::new(0),
+            delay: Duration::from_millis(200),
+            panic_once: false,
+        });
+        runtime.register_engine("fake", engine.clone())?;
+        let started = Instant::now();
+        let error = runtime
+            .embed(
+                "fake",
+                vec!["small".into()],
+                EmbedOptions::default(),
+                CancellationToken::default(),
+                None,
+            )
+            .await
+            .err()
+            .ok_or("deadline must fail preflight")?;
+        assert_eq!(error.public_error().code, ErrorCode::DeadlineExceeded);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        assert_eq!(engine.embeds.load(Ordering::Acquire), 0);
+        assert!(
+            runtime
+                .metrics()
+                .render()
+                .contains("impossible_queue_depth 0")
+        );
+        assert_eq!(runtime.0.admitted.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hostile_success_outputs_are_rejected_at_the_runtime_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for mode in [
+            HostileOutput::WrongIdentity,
+            HostileOutput::IncompleteIdentity,
+            HostileOutput::WrongCount,
+            HostileOutput::RaggedWidth,
+            HostileOutput::NonFinite,
+        ] {
+            let runtime = ApplicationRuntime::new(policy())?;
+            runtime.register_engine("fake", Arc::new(HostileEngine(mode)))?;
+            let error = runtime
+                .embed(
+                    "fake",
+                    vec!["a".into()],
+                    EmbedOptions::default(),
+                    CancellationToken::default(),
+                    None,
+                )
+                .await
+                .err()
+                .ok_or("hostile adapter output must fail")?;
+            assert_eq!(error.public_error().code, ErrorCode::InferenceFailed);
+        }
+
+        let runtime = ApplicationRuntime::new(policy())?;
+        runtime.register_engine(
+            "fake",
+            Arc::new(HostileEngine(HostileOutput::IgnoresRequestedWidth)),
+        )?;
+        let error = runtime
+            .embed(
+                "fake",
+                vec!["a".into()],
+                EmbedOptions {
+                    dimensions: Some(1),
+                    ..EmbedOptions::default()
+                },
+                CancellationToken::default(),
+                None,
+            )
+            .await
+            .err()
+            .ok_or("wrong requested width must fail")?;
+        assert_eq!(error.public_error().code, ErrorCode::InferenceFailed);
         Ok(())
     }
 }
