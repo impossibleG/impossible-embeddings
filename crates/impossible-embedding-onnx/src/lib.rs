@@ -519,6 +519,8 @@ struct OnnxTrainingProbe {
 struct OnnxFunctionProbe {
     #[prost(message, repeated, tag = "7")]
     nodes: Vec<OnnxNodeProbe>,
+    #[prost(message, repeated, tag = "11")]
+    attributes: Vec<OnnxAttributeProbe>,
 }
 
 fn reject_external_data_graph(bytes: &[u8]) -> Result<(), EngineFailure> {
@@ -532,12 +534,12 @@ fn reject_external_data_graph(bytes: &[u8]) -> Result<(), EngineFailure> {
         graphs.extend(training.initialization.iter());
         graphs.extend(training.algorithm.iter());
     }
-    if model
-        .functions
-        .iter()
-        .any(|function| nodes_use_external_data(&function.nodes, &mut graphs))
-    {
-        return Err(EngineFailure::public(ErrorCode::InvalidRequest));
+    for function in &model.functions {
+        if nodes_use_external_data(&function.nodes, &mut graphs)
+            || attributes_use_external_data(&function.attributes, &mut graphs)
+        {
+            return Err(EngineFailure::public(ErrorCode::InvalidRequest));
+        }
     }
     while let Some(graph) = graphs.pop() {
         if tensors_use_external_data(&graph.initializers)
@@ -559,24 +561,30 @@ fn nodes_use_external_data<'a>(
 ) -> bool {
     nodes
         .iter()
-        .flat_map(|node| &node.attributes)
-        .any(|attribute| {
-            graphs.extend(attribute.graph.iter());
-            graphs.extend(&attribute.graphs);
-            attribute
-                .tensor
+        .any(|node| attributes_use_external_data(&node.attributes, graphs))
+}
+
+fn attributes_use_external_data<'a>(
+    attributes: &'a [OnnxAttributeProbe],
+    graphs: &mut Vec<&'a OnnxGraphProbe>,
+) -> bool {
+    attributes.iter().any(|attribute| {
+        graphs.extend(attribute.graph.iter());
+        graphs.extend(&attribute.graphs);
+        attribute
+            .tensor
+            .as_ref()
+            .is_some_and(tensor_uses_external_data)
+            || tensors_use_external_data(&attribute.tensors)
+            || attribute
+                .sparse_tensor
                 .as_ref()
-                .is_some_and(tensor_uses_external_data)
-                || tensors_use_external_data(&attribute.tensors)
-                || attribute
-                    .sparse_tensor
-                    .as_ref()
-                    .is_some_and(sparse_uses_external_data)
-                || attribute
-                    .sparse_tensors
-                    .iter()
-                    .any(sparse_uses_external_data)
-        })
+                .is_some_and(sparse_uses_external_data)
+            || attribute
+                .sparse_tensors
+                .iter()
+                .any(sparse_uses_external_data)
+    })
 }
 fn tensors_use_external_data(tensors: &[OnnxTensorProbe]) -> bool {
     tensors.iter().any(tensor_uses_external_data)
@@ -796,6 +804,48 @@ mod tests {
             functions: Vec::new(),
         };
         assert!(reject_external_data_graph(&nested.encode_to_vec()).is_err());
+
+        let external_tensor = || OnnxTensorProbe {
+            external_data: Vec::new(),
+            data_location: Some(1),
+        };
+        let empty_attribute = || OnnxAttributeProbe {
+            tensor: None,
+            graph: None,
+            tensors: Vec::new(),
+            graphs: Vec::new(),
+            sparse_tensor: None,
+            sparse_tensors: Vec::new(),
+        };
+        let mut direct = empty_attribute();
+        direct.tensor = Some(external_tensor());
+        let mut sparse = empty_attribute();
+        sparse.sparse_tensor = Some(OnnxSparseTensorProbe {
+            values: Some(external_tensor()),
+            indices: None,
+        });
+        let mut graph = empty_attribute();
+        graph.graph = Some(OnnxGraphProbe {
+            nodes: vec![OnnxNodeProbe {
+                attributes: vec![direct.clone()],
+            }],
+            initializers: Vec::new(),
+            sparse_initializers: Vec::new(),
+        });
+        for attribute in [direct, sparse, graph] {
+            let function_attribute = OnnxModelProbe {
+                graph: None,
+                training_info: Vec::new(),
+                functions: vec![OnnxFunctionProbe {
+                    nodes: Vec::new(),
+                    attributes: vec![attribute],
+                }],
+            };
+            assert!(
+                reject_external_data_graph(&function_attribute.encode_to_vec()).is_err(),
+                "FunctionProto.attribute_proto must be scanned recursively"
+            );
+        }
     }
 
     #[test]

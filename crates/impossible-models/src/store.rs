@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs::{self, OpenOptions},
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -522,16 +522,41 @@ impl ModelStore {
     /// Returns an error unless integrity and semantic verification both make the model loadable.
     pub fn verified_model(&self, manifest: &Manifest) -> Result<VerifiedModel> {
         manifest.validate()?;
-        let lease = acquire_shared_store_lock(&self.layout, manifest)?;
-        match self.verify(manifest)? {
-            ModelStatus::Loadable => Ok(VerifiedModel {
-                manifest: manifest.clone(),
-                root: self.layout.model_dir(manifest)?,
-                _lease: Arc::new(lease),
-            }),
-            status => Err(Error::Invalid(format!(
-                "model is not loadable after verification: {status:?}"
-            ))),
+        loop {
+            // Repair promotion is serialized by the exclusive model lock. Reconcile before
+            // retaining the shared runtime lease: attempting reconciliation while already
+            // holding that lease would contend with our own lock on some platforms.
+            match fs::symlink_metadata(self.layout.repair_marker(manifest)?) {
+                Ok(_) => {
+                    let repair_lock = acquire_store_lock(&self.layout, manifest)?;
+                    reconcile_repair_inner(&self.layout, manifest)?;
+                    drop(repair_lock);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            let lease = acquire_shared_store_lock(&self.layout, manifest)?;
+            // Close the gap between dropping the repair lock and taking the shared lease. A
+            // competing promoter can only leave a marker before our lease is granted; after it
+            // is granted, no legitimate promotion can begin.
+            match fs::symlink_metadata(self.layout.repair_marker(manifest)?) {
+                Ok(_) => {
+                    drop(lease);
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            return match self.status_inner(manifest, &|| false)? {
+                ModelStatus::Loadable => Ok(VerifiedModel {
+                    manifest: manifest.clone(),
+                    root: self.layout.model_dir(manifest)?,
+                    _lease: Arc::new(lease),
+                }),
+                status => Err(Error::Invalid(format!(
+                    "model is not loadable after verification: {status:?}"
+                ))),
+            };
         }
     }
 
@@ -541,6 +566,15 @@ impl ModelStore {
     ///
     /// Returns an error for unsafe paths, identity/integrity failures, or filesystem failures.
     pub fn import(&self, manifest: &Manifest, source: impl AsRef<Path>) -> Result<ModelStatus> {
+        self.import_with_observer(manifest, source.as_ref(), |_| Ok(()))
+    }
+
+    fn import_with_observer(
+        &self,
+        manifest: &Manifest,
+        source: &Path,
+        mut source_opened: impl FnMut(&Path) -> Result<()>,
+    ) -> Result<ModelStatus> {
         manifest.validate()?;
         let existing = self.status(manifest)?;
         if matches!(
@@ -558,7 +592,7 @@ impl ModelStore {
         ) {
             return Ok(existing);
         }
-        let source = validate_import_source(source.as_ref())?;
+        let source = validate_import_source(source)?;
         if !source.is_dir() {
             return Err(Error::Invalid(
                 "import source must be a real directory".into(),
@@ -570,38 +604,18 @@ impl ModelStore {
             for artifact in &manifest.artifacts {
                 let from = source.join(&artifact.path);
                 reject_reparse_components(&source, Path::new(&artifact.path))?;
-                let metadata = fs::symlink_metadata(&from)?;
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    return Err(Error::Invalid(format!(
-                        "artifact is not a regular file: {}",
-                        artifact.path
-                    )));
-                }
                 let canonical = fs::canonicalize(&from)?;
                 if !canonical.starts_with(&source) {
                     return Err(Error::Invalid(
                         "import artifact escaped configured source".into(),
                     ));
                 }
-                if metadata.len() != artifact.size {
-                    return Err(Error::SizeLimit {
-                        expected: artifact.size,
-                        actual: metadata.len(),
-                    });
-                }
-                let actual = hash_file(&canonical)?;
-                if actual != artifact.sha256 {
-                    return Err(Error::HashMismatch {
-                        expected: artifact.sha256.clone(),
-                        actual,
-                    });
-                }
                 let target = staging.join(&artifact.path);
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent)?;
                     ensure_contained_directory(&staging, parent)?;
                 }
-                fs::copy(canonical, target)?;
+                copy_import_artifact(&canonical, &target, artifact, || source_opened(&from))?;
             }
             fs::write(staging.join(MANIFEST_FILE), manifest.to_json()?)?;
             promote(&self.layout, manifest, &staging)
@@ -847,6 +861,122 @@ fn configure_no_follow(options: &mut OpenOptions) {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
+}
+
+fn copy_import_artifact(
+    source: &Path,
+    target: &Path,
+    artifact: &Artifact,
+    after_open: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let mut source_options = OpenOptions::new();
+    source_options.read(true);
+    configure_no_follow(&mut source_options);
+    let mut source_file = source_options.open(source)?;
+    let source_metadata = source_file.metadata()?;
+    if !source_metadata.is_file() {
+        return Err(Error::Invalid(format!(
+            "artifact is not a regular file: {}",
+            artifact.path
+        )));
+    }
+    if source_metadata.len() != artifact.size {
+        return Err(Error::SizeLimit {
+            expected: artifact.size,
+            actual: source_metadata.len(),
+        });
+    }
+
+    // Tests use this boundary to replace or mutate the pathname deterministically. All reads
+    // below remain bound to the single handle opened above.
+    after_open()?;
+
+    let mut target_options = OpenOptions::new();
+    target_options.write(true).create_new(true);
+    configure_no_follow(&mut target_options);
+    let mut target_file = target_options.open(target)?;
+    let mut digest = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = source_file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(
+                u64::try_from(read)
+                    .map_err(|_| Error::Invalid("artifact length overflow".into()))?,
+            )
+            .ok_or_else(|| Error::Invalid("artifact length overflow".into()))?;
+        if copied > artifact.size {
+            return Err(Error::SizeLimit {
+                expected: artifact.size,
+                actual: copied,
+            });
+        }
+        digest.update(&buffer[..read]);
+        target_file.write_all(&buffer[..read])?;
+    }
+    target_file.flush()?;
+    target_file.sync_all()?;
+    drop(target_file);
+
+    if copied != artifact.size {
+        return Err(Error::SizeLimit {
+            expected: artifact.size,
+            actual: copied,
+        });
+    }
+    let actual = format!("{:x}", digest.finalize());
+    if actual != artifact.sha256 {
+        return Err(Error::HashMismatch {
+            expected: artifact.sha256.clone(),
+            actual,
+        });
+    }
+
+    // Verify the exact bytes at the staging pathname after the copy is durable. Promotion never
+    // relies only on the source hash or on metadata observed before the copy.
+    let mut staged_options = OpenOptions::new();
+    staged_options.read(true);
+    configure_no_follow(&mut staged_options);
+    let mut staged_file = staged_options.open(target)?;
+    let staged_metadata = staged_file.metadata()?;
+    if !staged_metadata.is_file() || staged_metadata.len() != artifact.size {
+        return Err(Error::Invalid(
+            "staged artifact changed during import".into(),
+        ));
+    }
+    let mut staged_digest = Sha256::new();
+    let mut staged_size = 0_u64;
+    loop {
+        let read = staged_file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        staged_size = staged_size
+            .checked_add(
+                u64::try_from(read)
+                    .map_err(|_| Error::Invalid("artifact length overflow".into()))?,
+            )
+            .ok_or_else(|| Error::Invalid("artifact length overflow".into()))?;
+        if staged_size > artifact.size {
+            return Err(Error::SizeLimit {
+                expected: artifact.size,
+                actual: staged_size,
+            });
+        }
+        staged_digest.update(&buffer[..read]);
+    }
+    let staged_actual = format!("{:x}", staged_digest.finalize());
+    if staged_size != artifact.size || staged_actual != artifact.sha256 {
+        return Err(Error::HashMismatch {
+            expected: artifact.sha256.clone(),
+            actual: staged_actual,
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn prepare_staging(layout: &CacheLayout, staging: &Path) -> Result<()> {
@@ -1123,6 +1253,62 @@ mod transaction_tests {
     use std::cell::Cell;
     use tempfile::TempDir;
 
+    fn local_manifest(body: &[u8]) -> Manifest {
+        Manifest {
+            schema_version: 1,
+            canonical_id: "tests/store-transaction".into(),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            license: crate::License {
+                spdx: "MIT".into(),
+                source_url: "https://example.invalid/license".into(),
+            },
+            semantic_verification: crate::SemanticVerification::Verified {
+                evidence: "store transaction fixture".into(),
+            },
+            tokenizer: TokenizerMetadata {
+                kind: "fixture".into(),
+                max_tokens: 8,
+                lowercase: false,
+            },
+            pooling: Pooling::Mean,
+            prefixes: Prefixes {
+                query: String::new(),
+                document: String::new(),
+            },
+            dimensions: Dimensions {
+                native: 2,
+                matryoshka: Vec::new(),
+            },
+            tensors: TensorMetadata {
+                format: "fixture".into(),
+                dtype: "bytes".into(),
+                architecture: "identity".into(),
+            },
+            runtime: RuntimeMetadata::CatalogOnly,
+            artifacts: vec![Artifact {
+                path: "weights/model.bin".into(),
+                url: "https://example.invalid/model".into(),
+                sha256: format!("{:x}", Sha256::digest(body)),
+                size: u64::try_from(body.len()).unwrap_or_default(),
+            }],
+        }
+    }
+
+    fn trusted_store(root: &Path, manifest: &Manifest) -> Result<ModelStore> {
+        let trust = SemanticTrustRoot::from_evidence([TrustedSemanticEvidence {
+            manifest_fingerprint: manifest.semantic_fingerprint()?,
+            evidence: "store unit test".into(),
+        }])?;
+        ModelStore::with_trust_root(root, trust)
+    }
+
+    fn write_valid_model(directory: &Path, manifest: &Manifest, body: &[u8]) -> Result<()> {
+        fs::create_dir_all(directory.join("weights"))?;
+        fs::write(directory.join("weights/model.bin"), body)?;
+        fs::write(directory.join(MANIFEST_FILE), manifest.to_json()?)?;
+        Ok(())
+    }
+
     fn manifest() -> Result<Manifest> {
         crate::curated_manifests()?
             .into_iter()
@@ -1174,6 +1360,84 @@ mod transaction_tests {
             assert!(!layout.repair_marker(&manifest)?.exists());
             assert!(!layout.repair_backup(&manifest)?.exists());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn verified_model_reconciles_every_interrupted_promotion_before_shared_lease() -> Result<()> {
+        let body = b"verified transaction bytes";
+        for interrupted_after in [
+            PromotionPhase::MarkerDurable,
+            PromotionPhase::PreviousDisplaced,
+            PromotionPhase::ReplacementPromoted,
+        ] {
+            let temp = TempDir::new()?;
+            let manifest = local_manifest(body);
+            let store = trusted_store(temp.path(), &manifest)?;
+            let final_path = store.layout.model_dir(&manifest)?;
+            let staging = store.layout.staging_dir(&manifest)?;
+            write_valid_model(&final_path, &manifest, body)?;
+            prepare_staging(&store.layout, &staging)?;
+            write_valid_model(&staging, &manifest, body)?;
+
+            let result = promote_with_observer(&store.layout, &manifest, &staging, |phase| {
+                if phase == interrupted_after {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(result, Err(Error::Cancelled)));
+
+            let verified = store.verified_model(&manifest)?;
+            assert_eq!(verified.artifact_bytes("weights/model.bin")?, body);
+            assert!(!store.layout.repair_marker(&manifest)?.exists());
+            assert!(!store.layout.repair_backup(&manifest)?.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn import_hashes_the_open_handle_and_rejects_synchronized_mutation() -> Result<()> {
+        let cache = TempDir::new()?;
+        let source = TempDir::new()?;
+        let body = b"expected import bytes";
+        let manifest = local_manifest(body);
+        fs::create_dir_all(source.path().join("weights"))?;
+        fs::write(source.path().join("weights/model.bin"), body)?;
+        let store = trusted_store(cache.path(), &manifest)?;
+
+        let result = store.import_with_observer(&manifest, source.path(), |opened| {
+            fs::write(opened, b"malicious import byte")?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::HashMismatch { .. })));
+        assert_eq!(store.status(&manifest)?, ModelStatus::Missing);
+        Ok(())
+    }
+
+    #[test]
+    fn import_reads_exact_open_handle_when_source_path_is_replaced() -> Result<()> {
+        let cache = TempDir::new()?;
+        let source = TempDir::new()?;
+        let body = b"expected import bytes";
+        let replacement = b"malicious import byte";
+        assert_eq!(body.len(), replacement.len());
+        let manifest = local_manifest(body);
+        fs::create_dir_all(source.path().join("weights"))?;
+        let source_path = source.path().join("weights/model.bin");
+        fs::write(&source_path, body)?;
+        let store = trusted_store(cache.path(), &manifest)?;
+
+        let displaced = source.path().join("weights/original.bin");
+        let status = store.import_with_observer(&manifest, source.path(), |opened| {
+            fs::rename(opened, &displaced)?;
+            fs::write(opened, replacement)?;
+            Ok(())
+        })?;
+        assert_eq!(status, ModelStatus::Loadable);
+        let verified = store.verified_model(&manifest)?;
+        assert_eq!(verified.artifact_bytes("weights/model.bin")?, body);
         Ok(())
     }
 }
