@@ -1,8 +1,8 @@
 //! Bounded, fair application scheduling independent of HTTP, gRPC, and MCP types.
 
 use impossible_embedding_core::{
-    CancellationToken, EmbedOptions, EmbeddingBatch, EmbeddingOutput, EngineFailure, ErrorCode,
-    ExecutionControl, RequestedModel, ResolvedModelIdentity,
+    CancellationToken, EmbedOptions, EmbeddingBatch, EmbeddingBatchCost, EmbeddingOutput,
+    EngineFailure, ErrorCode, ExecutionControl, RequestedModel, ResolvedModelIdentity,
 };
 use impossible_embedding_onnx::OnnxEmbeddingEngine;
 use impossible_models::{
@@ -35,6 +35,35 @@ use tokio::{
 
 /// Engine operations required by the application layer.
 pub trait RuntimeEngine: Send + Sync + 'static {
+    /// Validate one caller request and return its exact post-tokenization native cost.
+    ///
+    /// The default is conservative for simple custom engines. Production adapters should
+    /// override it with tokenizer-exact accounting.
+    ///
+    /// # Errors
+    /// Returns a stable invalid-request failure if cost arithmetic overflows.
+    fn preflight(
+        &self,
+        _model: &RequestedModel,
+        batch: &EmbeddingBatch<'_>,
+        _options: EmbedOptions,
+    ) -> Result<EmbeddingBatchCost, EngineFailure> {
+        let mut tokens = 0_usize;
+        let mut max_sequence_length = 0_usize;
+        for input in batch.inputs() {
+            let length = input
+                .len()
+                .checked_add(2)
+                .ok_or_else(|| EngineFailure::public(ErrorCode::InvalidRequest))?
+                .max(1);
+            tokens = tokens
+                .checked_add(length)
+                .ok_or_else(|| EngineFailure::public(ErrorCode::InvalidRequest))?;
+            max_sequence_length = max_sequence_length.max(length);
+        }
+        EmbeddingBatchCost::new(batch.inputs().len(), tokens, max_sequence_length)
+    }
+
     /// Embed a batch with all semantics made explicit.
     ///
     /// # Errors
@@ -55,6 +84,15 @@ pub trait RuntimeEngine: Send + Sync + 'static {
 }
 
 impl RuntimeEngine for OnnxEmbeddingEngine {
+    fn preflight(
+        &self,
+        model: &RequestedModel,
+        batch: &EmbeddingBatch<'_>,
+        options: EmbedOptions,
+    ) -> Result<EmbeddingBatchCost, EngineFailure> {
+        self.preflight_with_options(model, batch, options)
+    }
+
     fn embed(
         &self,
         model: &RequestedModel,
@@ -77,11 +115,11 @@ pub struct BatchPolicy {
     pub queue_depth: usize,
     /// Inputs allowed in one caller request.
     pub max_items: usize,
-    /// Estimated tokens allowed in one caller request.
+    /// Post-tokenization, non-padding tokens allowed in one caller request.
     pub max_tokens: usize,
     /// Inputs in one native call.
     pub max_batch_items: usize,
-    /// Estimated tokens in one native call.
+    /// Padded token cells (`items * longest sequence`) allowed in one native call.
     pub max_batch_tokens: usize,
     /// Maximum time the oldest compatible request waits for batching.
     pub max_batch_wait: Duration,
@@ -243,7 +281,7 @@ struct CompatibilityKey(EmbedOptions);
 
 struct Request {
     inputs: Vec<String>,
-    token_estimate: usize,
+    cost: EmbeddingBatchCost,
     options: EmbedOptions,
     control: ExecutionControl,
     response: oneshot::Sender<Result<EmbeddingOutput, EngineFailure>>,
@@ -258,6 +296,7 @@ struct ModelSlot {
     accepting: Arc<AtomicBool>,
     cancellation: CancellationToken,
     queued: Arc<AtomicUsize>,
+    engine: Arc<dyn RuntimeEngine>,
 }
 
 struct SchedulerTask {
@@ -657,6 +696,7 @@ impl ApplicationRuntime {
             accepting: Arc::clone(&accepting),
             cancellation,
             queued,
+            engine: Arc::clone(&engine),
         });
         let policy = self.0.policy;
         let pool = self.0.pool.clone();
@@ -816,6 +856,7 @@ impl ApplicationRuntime {
             accepting: Arc::clone(&accepting),
             cancellation,
             queued,
+            engine: Arc::clone(&engine),
         });
         let (stop, stop_rx) = watch::channel(false);
         let (started, startup) = oneshot::channel();
@@ -1058,10 +1099,6 @@ impl ApplicationRuntime {
         if inputs.is_empty() || inputs.len() > self.0.policy.max_items {
             return Err(EngineFailure::public(ErrorCode::InvalidRequest));
         }
-        let token_estimate = estimate_tokens(&inputs);
-        if token_estimate > self.0.policy.max_tokens {
-            return Err(EngineFailure::public(ErrorCode::InvalidRequest));
-        }
         let slot = {
             let models = self
                 .0
@@ -1076,6 +1113,15 @@ impl ApplicationRuntime {
         };
         if !slot.accepting.load(Ordering::Acquire) {
             return Err(EngineFailure::public(ErrorCode::ModelUnavailable));
+        }
+        let model = RequestedModel::new(model_id.to_owned())?;
+        let batch = EmbeddingBatch::new(inputs.iter().map(|input| Cow::Borrowed(input.as_str())))?;
+        let cost = slot.engine.preflight(&model, &batch, options)?;
+        if cost.items() != inputs.len()
+            || cost.tokens() > self.0.policy.max_tokens
+            || cost.padded_tokens()? > self.0.policy.max_batch_tokens
+        {
+            return Err(EngineFailure::public(ErrorCode::InvalidRequest));
         }
         let lease = self
             .lease(model_id)
@@ -1100,7 +1146,7 @@ impl ApplicationRuntime {
         let (response, receive) = oneshot::channel();
         let request = Request {
             inputs,
-            token_estimate,
+            cost,
             options,
             control: control.clone(),
             response,
@@ -1427,16 +1473,6 @@ async fn await_response(
     result
 }
 
-fn estimate_tokens(inputs: &[String]) -> usize {
-    inputs
-        .iter()
-        // UTF-8 bytes plus a small special-token allowance is deliberately conservative for the
-        // supported subword tokenizers; a character/word heuristic could under-admit adversarial
-        // Unicode and defeat the native batch memory bound.
-        .map(|input| input.len().saturating_add(2).max(1))
-        .fold(0_usize, usize::saturating_add)
-}
-
 async fn run_scheduler(
     mut receiver: mpsc::Receiver<Request>,
     model_id: String,
@@ -1504,18 +1540,25 @@ async fn run_scheduler(
             let key = CompatibilityKey(first.options);
             let mut requests = vec![first];
             let mut items = requests[0].inputs.len();
-            let mut tokens = requests[0].token_estimate;
+            let mut max_sequence_length = requests[0].cost.max_sequence_length();
             let scan = pending.len();
             for _ in 0..scan {
                 let Some(candidate) = pending.pop_front() else {
                     break;
                 };
+                let Some(combined_items) = items.checked_add(candidate.inputs.len()) else {
+                    pending.push_back(candidate);
+                    continue;
+                };
+                let combined_sequence =
+                    max_sequence_length.max(candidate.cost.max_sequence_length());
+                let combined_work = combined_items.checked_mul(combined_sequence);
                 let compatible = CompatibilityKey(candidate.options) == key
-                    && items.saturating_add(candidate.inputs.len()) <= policy.max_batch_items
-                    && tokens.saturating_add(candidate.token_estimate) <= policy.max_batch_tokens;
+                    && combined_items <= policy.max_batch_items
+                    && combined_work.is_some_and(|work| work <= policy.max_batch_tokens);
                 if compatible {
-                    items += candidate.inputs.len();
-                    tokens += candidate.token_estimate;
+                    items = combined_items;
+                    max_sequence_length = combined_sequence;
                     requests.push(candidate);
                 } else {
                     pending.push_back(candidate);
@@ -1699,6 +1742,94 @@ mod tests {
         finished: AtomicBool,
         block: Duration,
         fail: bool,
+    }
+
+    struct CostAwareEngine {
+        calls: AtomicUsize,
+        observed_work: Mutex<Vec<usize>>,
+        reject: Option<String>,
+    }
+
+    impl CostAwareEngine {
+        fn new(reject: Option<&str>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                observed_work: Mutex::new(Vec::new()),
+                reject: reject.map(str::to_owned),
+            }
+        }
+
+        fn sequence_length(input: &str) -> Result<usize, EngineFailure> {
+            input
+                .strip_prefix('s')
+                .and_then(|length| length.parse::<usize>().ok())
+                .filter(|length| *length > 0)
+                .ok_or_else(|| EngineFailure::public(ErrorCode::InvalidRequest))
+        }
+    }
+
+    impl RuntimeEngine for CostAwareEngine {
+        fn preflight(
+            &self,
+            _model: &RequestedModel,
+            batch: &EmbeddingBatch<'_>,
+            _options: EmbedOptions,
+        ) -> Result<EmbeddingBatchCost, EngineFailure> {
+            let mut tokens = 0_usize;
+            let mut longest = 0_usize;
+            for input in batch.inputs() {
+                if self.reject.as_deref() == Some(input.as_ref()) {
+                    return Err(EngineFailure::public(ErrorCode::InvalidRequest));
+                }
+                let length = Self::sequence_length(input)?;
+                tokens = tokens
+                    .checked_add(length)
+                    .ok_or_else(|| EngineFailure::public(ErrorCode::InvalidRequest))?;
+                longest = longest.max(length);
+            }
+            EmbeddingBatchCost::new(batch.inputs().len(), tokens, longest)
+        }
+
+        fn embed(
+            &self,
+            _model: &RequestedModel,
+            batch: &EmbeddingBatch<'_>,
+            _control: &ExecutionControl,
+            _options: EmbedOptions,
+        ) -> Result<EmbeddingOutput, EngineFailure> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let longest = batch
+                .inputs()
+                .iter()
+                .map(|input| Self::sequence_length(input))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(1);
+            let work = batch
+                .inputs()
+                .len()
+                .checked_mul(longest)
+                .ok_or_else(|| EngineFailure::public(ErrorCode::InvalidRequest))?;
+            self.observed_work
+                .lock()
+                .map_err(|_| EngineFailure::public(ErrorCode::Internal))?
+                .push(work);
+            Ok(EmbeddingOutput {
+                vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
+                model: ResolvedModelIdentity::new(
+                    "cost-aware",
+                    "rev",
+                    "fake@1",
+                    "artifact",
+                    "semantic",
+                )?,
+            })
+        }
+
+        fn warm(&self) -> Result<(), EngineFailure> {
+            Ok(())
+        }
     }
 
     struct PanicOnceEngine(AtomicUsize);
@@ -2111,6 +2242,140 @@ mod tests {
         assert_eq!(a?.vectors, vec![vec![2.0, 0.0], vec![2.0, 1.0]]);
         assert_eq!(b?.vectors, vec![vec![2.0, 2.0]]);
         assert_eq!(engine.calls.load(Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_preflight_is_isolated_from_concurrent_valid_callers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut limits = policy();
+        limits.max_batch_wait = Duration::from_millis(25);
+        let runtime = ApplicationRuntime::new(limits)?;
+        let engine = Arc::new(CostAwareEngine::new(Some("invalid")));
+        runtime.register_engine("fake", engine.clone())?;
+
+        let valid_a = runtime.embed(
+            "fake",
+            vec!["s2".into()],
+            EmbedOptions::default(),
+            CancellationToken::default(),
+            None,
+        );
+        let invalid = runtime.embed(
+            "fake",
+            vec!["invalid".into()],
+            EmbedOptions::default(),
+            CancellationToken::default(),
+            None,
+        );
+        let valid_b = runtime.embed(
+            "fake",
+            vec!["s3".into()],
+            EmbedOptions::default(),
+            CancellationToken::default(),
+            None,
+        );
+        let (valid_a, invalid, valid_b) = tokio::join!(valid_a, invalid, valid_b);
+
+        assert_eq!(valid_a?.vectors.len(), 1);
+        assert_eq!(valid_b?.vectors.len(), 1);
+        assert_eq!(
+            invalid
+                .err()
+                .ok_or("invalid request must fail")?
+                .public_error()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(engine.calls.load(Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heterogeneous_padding_never_exceeds_native_work_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut limits = policy();
+        limits.max_items = 4;
+        limits.max_tokens = 16;
+        limits.max_batch_items = 4;
+        limits.max_batch_tokens = 16;
+        limits.max_batch_wait = Duration::from_millis(20);
+        let runtime = ApplicationRuntime::new(limits)?;
+        let engine = Arc::new(CostAwareEngine::new(None));
+        runtime.register_engine("fake", engine.clone())?;
+
+        // Each request fits independently (3x1 and 1x10), and their non-padding sum is 13. A
+        // sum-based scheduler would construct a 4x10 tensor under this 16-token cap; the
+        // padded-work scheduler must split them at the configured 16-cell bound.
+        let short = runtime.embed(
+            "fake",
+            vec!["s1".into(), "s1".into(), "s1".into()],
+            EmbedOptions::default(),
+            CancellationToken::default(),
+            None,
+        );
+        let long = runtime.embed(
+            "fake",
+            vec!["s10".into()],
+            EmbedOptions::default(),
+            CancellationToken::default(),
+            None,
+        );
+        let (short, long) = tokio::join!(short, long);
+        assert_eq!(short?.vectors.len(), 3);
+        assert_eq!(long?.vectors.len(), 1);
+        assert_eq!(engine.calls.load(Ordering::Acquire), 2);
+        assert!(
+            engine
+                .observed_work
+                .lock()
+                .is_ok_and(|work| work.iter().all(|value| *value <= 16))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn padding_bound_holds_across_adversarial_concurrent_lengths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut limits = policy();
+        limits.queue_depth = 64;
+        limits.max_items = 8;
+        limits.max_tokens = 32;
+        limits.max_batch_items = 8;
+        limits.max_batch_tokens = 32;
+        limits.max_batch_wait = Duration::from_millis(5);
+        let runtime = ApplicationRuntime::new(limits)?;
+        let engine = Arc::new(CostAwareEngine::new(None));
+        runtime.register_engine("fake", engine.clone())?;
+
+        for round in 0..20_usize {
+            let requests = (0..16_usize)
+                .map(|index| {
+                    let runtime = runtime.clone();
+                    let length = 1 + ((index * 17 + round * 11) % 31);
+                    tokio::spawn(async move {
+                        runtime
+                            .embed(
+                                "fake",
+                                vec![format!("s{length}")],
+                                EmbedOptions::default(),
+                                CancellationToken::default(),
+                                None,
+                            )
+                            .await
+                    })
+                })
+                .collect::<Vec<_>>();
+            for request in requests {
+                assert_eq!(request.await??.vectors.len(), 1);
+            }
+        }
+        let work = engine
+            .observed_work
+            .lock()
+            .map_err(|_| "poisoned work log")?;
+        assert!(!work.is_empty());
+        assert!(work.iter().all(|value| *value <= 32));
         Ok(())
     }
 

@@ -17,6 +17,83 @@ pub struct EmbeddingBatch<'a> {
     inputs: Vec<Cow<'a, str>>,
 }
 
+/// Exact tokenization cost of an embedding batch before native inference.
+///
+/// Engines produce this value after applying model prefixes, truncation, and manifest
+/// validation. Schedulers can therefore bound both aggregate tokens and the padded tensor shape
+/// without knowing anything about a tokenizer or transport request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingBatchCost {
+    items: usize,
+    tokens: usize,
+    max_sequence_length: usize,
+}
+
+impl EmbeddingBatchCost {
+    /// Construct a validated cost description.
+    ///
+    /// # Errors
+    /// Returns an invalid-request failure for zero-sized or arithmetically inconsistent costs.
+    pub fn new(
+        items: usize,
+        tokens: usize,
+        max_sequence_length: usize,
+    ) -> Result<Self, EngineFailure> {
+        let padded_tokens = items
+            .checked_mul(max_sequence_length)
+            .ok_or_else(|| EngineFailure::public(ErrorCode::InvalidRequest))?;
+        if items == 0 || max_sequence_length == 0 || tokens > padded_tokens {
+            return Err(EngineFailure::public(ErrorCode::InvalidRequest));
+        }
+        Ok(Self {
+            items,
+            tokens,
+            max_sequence_length,
+        })
+    }
+
+    /// Number of input rows.
+    #[must_use]
+    pub const fn items(self) -> usize {
+        self.items
+    }
+
+    /// Sum of non-padding tokens.
+    #[must_use]
+    pub const fn tokens(self) -> usize {
+        self.tokens
+    }
+
+    /// Longest tokenized row, including model-added special tokens and prefixes.
+    #[must_use]
+    pub const fn max_sequence_length(self) -> usize {
+        self.max_sequence_length
+    }
+
+    /// Number of token cells allocated by a padded native tensor.
+    ///
+    /// # Errors
+    /// Returns an invalid-request failure if the multiplication overflows.
+    pub fn padded_tokens(self) -> Result<usize, EngineFailure> {
+        self.items
+            .checked_mul(self.max_sequence_length)
+            .ok_or_else(|| EngineFailure::public(ErrorCode::InvalidRequest))
+    }
+
+    /// Compute the padded token cells for a combined batch.
+    ///
+    /// # Errors
+    /// Returns an invalid-request failure if item addition or multiplication overflows.
+    pub fn combined_padded_tokens(self, other: Self) -> Result<usize, EngineFailure> {
+        self.items
+            .checked_add(other.items)
+            .and_then(|items| {
+                items.checked_mul(self.max_sequence_length.max(other.max_sequence_length))
+            })
+            .ok_or_else(|| EngineFailure::public(ErrorCode::InvalidRequest))
+    }
+}
+
 /// Semantic purpose of an embedding input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EmbeddingTask {
@@ -553,6 +630,21 @@ mod tests {
             "sha256:artifact",
             "sha256:semantics",
         )
+    }
+
+    #[test]
+    fn batch_cost_rejects_inconsistent_and_overflowing_shapes() -> Result<(), EngineFailure> {
+        let cost = EmbeddingBatchCost::new(3, 5, 2)?;
+        assert_eq!(cost.padded_tokens()?, 6);
+        assert!(EmbeddingBatchCost::new(0, 0, 1).is_err());
+        assert!(EmbeddingBatchCost::new(2, 5, 2).is_err());
+        assert!(EmbeddingBatchCost::new(usize::MAX, 1, 2).is_err());
+        assert!(
+            EmbeddingBatchCost::new(usize::MAX, 1, 1)?
+                .combined_padded_tokens(EmbeddingBatchCost::new(1, 1, 1)?)
+                .is_err()
+        );
+        Ok(())
     }
 
     struct CancelsDuringInference;

@@ -354,6 +354,16 @@ fn embed(
         .vectors)
 }
 
+fn preflight(
+    engine: &OnnxEmbeddingEngine,
+    inputs: &[&str],
+    options: EmbedOptions,
+) -> Result<impossible_embedding_core::EmbeddingBatchCost> {
+    let requested = RequestedModel::new("fixture/cast-embedding")?;
+    let batch = EmbeddingBatch::new(inputs.iter().map(|value| Cow::Borrowed(*value)))?;
+    Ok(engine.preflight_with_options(&requested, &batch, options)?)
+}
+
 #[test]
 fn lifecycle_and_real_in_process_ort_execution() -> Result<()> {
     let (_directory, engine) = setup()?;
@@ -470,6 +480,43 @@ fn handles_empty_unicode_prefixes_limits_and_dimensions() -> Result<()> {
     );
     assert!(
         embed(
+            &engine,
+            &["hello"],
+            EmbedOptions {
+                dimensions: Some(3),
+                ..defaults
+            }
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn preflight_reports_exact_padded_cost_and_enforces_manifest_semantics() -> Result<()> {
+    let (_directory, engine) = setup()?;
+    let defaults = EmbedOptions::default();
+    let cost = preflight(&engine, &["hello", "hello world"], defaults)?;
+    assert_eq!(cost.items(), 2);
+    assert_eq!(cost.tokens(), 7);
+    assert_eq!(cost.max_sequence_length(), 4);
+    assert_eq!(cost.padded_tokens()?, 8);
+
+    let overlong = ["hello world hello world"];
+    assert!(preflight(&engine, &overlong, defaults).is_err());
+    let truncated = preflight(
+        &engine,
+        &overlong,
+        EmbedOptions {
+            truncation: Truncation::Truncate,
+            dimensions: Some(2),
+            ..defaults
+        },
+    )?;
+    assert_eq!(truncated.max_sequence_length(), 5);
+    assert_eq!(truncated.padded_tokens()?, 5);
+    assert!(
+        preflight(
             &engine,
             &["hello"],
             EmbedOptions {

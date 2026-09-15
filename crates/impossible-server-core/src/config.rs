@@ -34,13 +34,13 @@ pub struct Limits {
     pub max_body_bytes: usize,
     /// Maximum text inputs in one request.
     pub max_items: usize,
-    /// Maximum estimated tokens across a request.
+    /// Maximum post-tokenization, non-padding tokens across a request.
     pub max_tokens: usize,
     /// Maximum requests waiting for admission.
     pub max_queue_depth: usize,
     /// Maximum inputs combined by dynamic batching.
     pub max_batch_items: usize,
-    /// Maximum estimated tokens combined by dynamic batching.
+    /// Maximum padded token cells in one dynamically assembled native batch.
     pub max_batch_tokens: usize,
     /// Maximum concurrent inference calls.
     pub max_concurrency: usize,

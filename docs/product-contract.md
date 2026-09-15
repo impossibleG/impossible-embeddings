@@ -44,9 +44,13 @@ active. Native execution may stop only when every constituent has been cancelled
 cancelling one member never aborts work required by surviving members. Each member is checked again
 before publication, so late output is delivered only to active callers.
 
-`max_items` and `max_tokens` are per-request validation bounds. `max_batch_items` and
-`max_batch_tokens` independently bound the aggregate native call after compatible requests are
-combined. `max_queue_depth` is enforced per loaded model across all pre-native waiting locations
+`max_items` and `max_tokens` bound each request's input count and exact post-tokenization token
+count. Engines preflight each request after prefixes, truncation, dimension validation, and model
+sequence limits, so a caller-local validation failure cannot poison compatible callers.
+`max_batch_items` bounds the input rows in one native call; `max_batch_tokens` independently bounds
+its padded token cells (`combined items * longest sequence`). All cost arithmetic is checked before
+compatible requests are combined. `max_queue_depth` is enforced per loaded model across all
+pre-native waiting locations
 (transport channel, scheduler pending state, and native-pool wait); moving a request between those
 locations does not create extra capacity. The exported queue gauge is the aggregate number of
 requests waiting across models, while the active-request gauge counts live caller operations.

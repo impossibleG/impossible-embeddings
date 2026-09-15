@@ -5,8 +5,8 @@
 
 pub use impossible_embedding_core::{EmbedOptions, EmbeddingTask, Truncation};
 use impossible_embedding_core::{
-    EmbeddingBatch, EmbeddingEngine, EmbeddingOutput, EngineFailure, ErrorCode, ExecutionControl,
-    RequestedModel, ResolvedModelIdentity,
+    EmbeddingBatch, EmbeddingBatchCost, EmbeddingEngine, EmbeddingOutput, EngineFailure, ErrorCode,
+    ExecutionControl, RequestedModel, ResolvedModelIdentity,
 };
 use impossible_models::{Manifest, OnnxInputNames, Pooling, RuntimeMetadata, VerifiedModel};
 use ort::{
@@ -186,6 +186,48 @@ impl OnnxEmbeddingEngine {
         state.reserve_transition();
         state.loaded = None;
         Ok(())
+    }
+
+    /// Validate request semantics and return the exact post-tokenization native batch cost.
+    ///
+    /// This performs no inference. It allows a transport-independent scheduler to reject one bad
+    /// request in isolation and account for padding before combining callers.
+    ///
+    /// # Errors
+    /// Returns a stable request or availability failure when model identity, options,
+    /// tokenization, truncation, or checked cost arithmetic is invalid.
+    pub fn preflight_with_options(
+        &self,
+        requested: &RequestedModel,
+        batch: &EmbeddingBatch<'_>,
+        options: EmbedOptions,
+    ) -> Result<EmbeddingBatchCost, EngineFailure> {
+        let guard = self.state()?;
+        let model = guard
+            .loaded
+            .as_ref()
+            .ok_or_else(|| EngineFailure::public(ErrorCode::ModelUnavailable))?;
+        if requested.as_str() != model.manifest.canonical_id {
+            return Err(EngineFailure::public(ErrorCode::ModelUnavailable));
+        }
+        validate_dimensions(&model.manifest, options.dimensions)?;
+        let max_manifest_tokens = usize::try_from(model.manifest.tokenizer.max_tokens)
+            .map_err(|error| EngineFailure::with_source(ErrorCode::Internal, error))?;
+        let mut tokens = 0_usize;
+        let mut max_sequence_length = 0_usize;
+        for text in batch.inputs() {
+            let prepared = apply_prefix(text, model.prefix_for(options.task));
+            let encoding = model.encode(&prepared, options.truncation)?;
+            let length = encoding.len().max(1);
+            if length > max_manifest_tokens {
+                return Err(EngineFailure::public(ErrorCode::InvalidRequest));
+            }
+            tokens = tokens
+                .checked_add(length)
+                .ok_or_else(|| EngineFailure::public(ErrorCode::InvalidRequest))?;
+            max_sequence_length = max_sequence_length.max(length);
+        }
+        EmbeddingBatchCost::new(batch.inputs().len(), tokens, max_sequence_length)
     }
 
     /// Embeds with explicit task, truncation, and dimension controls.
