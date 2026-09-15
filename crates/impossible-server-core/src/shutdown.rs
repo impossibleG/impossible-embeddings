@@ -79,6 +79,19 @@ impl ShutdownCoordinator {
         self.0.1.notify_all();
     }
 
+    /// Mark shutdown terminal without waiting for retained or non-cooperative work permits.
+    ///
+    /// This is the forced-shutdown boundary. Existing permits remain memory-safe RAII values,
+    /// but they no longer prevent the service lifecycle from becoming terminal. Dropping them
+    /// later only reduces the retained-work count and cannot make the coordinator run again.
+    pub fn force_stop(&self) {
+        let Ok(mut state) = self.0.0.lock() else {
+            return;
+        };
+        state.shutdown = ShutdownState::Stopped;
+        self.0.1.notify_all();
+    }
+
     /// Wait until all tracked work completes or the deadline expires.
     #[must_use]
     pub fn wait(&self, timeout: Duration) -> bool {
@@ -144,5 +157,17 @@ mod tests {
         let shutdown = ShutdownCoordinator::default();
         shutdown.begin();
         assert!(shutdown.wait(Duration::ZERO));
+    }
+
+    #[test]
+    fn forced_shutdown_is_terminal_with_retained_permits() {
+        let shutdown = ShutdownCoordinator::default();
+        let permit = shutdown.admit().expect("admitted");
+        shutdown.begin();
+        shutdown.force_stop();
+        assert!(shutdown.wait(Duration::ZERO));
+        assert_eq!(shutdown.state(), ShutdownState::Stopped);
+        drop(permit);
+        assert_eq!(shutdown.state(), ShutdownState::Stopped);
     }
 }

@@ -350,7 +350,8 @@ struct Inner {
     force_stop: watch::Sender<bool>,
     metrics: Metrics,
     active: Arc<AtomicUsize>,
-    active_zero: Arc<Notify>,
+    admitted: Arc<AtomicUsize>,
+    admitted_zero: Arc<Notify>,
     queued: Arc<AtomicUsize>,
     shutdown_flight: Mutex<Option<ShutdownFlight>>,
 }
@@ -371,16 +372,10 @@ struct GaugeGuard {
     counter: Arc<AtomicUsize>,
     metrics: Metrics,
     kind: GaugeKind,
-    zero_latch: Option<Arc<Notify>>,
 }
 
 impl GaugeGuard {
-    fn increment(
-        counter: Arc<AtomicUsize>,
-        metrics: Metrics,
-        kind: GaugeKind,
-        zero_latch: Option<Arc<Notify>>,
-    ) -> Self {
+    fn increment(counter: Arc<AtomicUsize>, metrics: Metrics, kind: GaugeKind) -> Self {
         counter.fetch_add(1, Ordering::AcqRel);
         match kind {
             GaugeKind::Active => metrics.increment_active(),
@@ -390,7 +385,6 @@ impl GaugeGuard {
             counter,
             metrics,
             kind,
-            zero_latch,
         }
     }
 }
@@ -402,27 +396,24 @@ impl Drop for GaugeGuard {
             GaugeKind::Active => self.metrics.decrement_active(),
             GaugeKind::Queue => self.metrics.decrement_queue_depth(),
         }
-        if previous == 1 {
-            if let Some(latch) = &self.zero_latch {
-                // `notify_one` stores a permit when the shutdown waiter is between creating and
-                // polling its notification future, so the final active completion cannot be lost.
-                latch.notify_one();
-            }
-        }
+        debug_assert!(previous != 0, "gauge guard underflow");
     }
 }
 
-async fn wait_for_active_zero(active: &AtomicUsize, latch: &Notify) {
-    while active.load(Ordering::Acquire) != 0 {
-        // Register before rechecking the predicate. This closes the interval in which the final
-        // decrement could otherwise notify an unregistered waiter and leave shutdown asleep.
-        let notified = latch.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if active.load(Ordering::Acquire) == 0 {
-            break;
+struct RuntimeWorkPermit {
+    _shutdown: WorkPermit,
+    admitted: Arc<AtomicUsize>,
+    zero_latch: Arc<Notify>,
+}
+
+impl Drop for RuntimeWorkPermit {
+    fn drop(&mut self) {
+        let previous = self.admitted.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0, "runtime work permit underflow");
+        if previous == 1 {
+            // `notify_one` retains a permit when no waiter is currently registered.
+            self.zero_latch.notify_one();
         }
-        notified.await;
     }
 }
 
@@ -445,7 +436,7 @@ impl QueuePermit {
             .ok()?;
         Some(Self {
             local,
-            _global: GaugeGuard::increment(global, metrics, GaugeKind::Queue, None),
+            _global: GaugeGuard::increment(global, metrics, GaugeKind::Queue),
         })
     }
 }
@@ -474,7 +465,7 @@ struct InstallRegistration {
 
 struct ActiveInstall {
     _registration: InstallRegistration,
-    _permit: WorkPermit,
+    _permit: RuntimeWorkPermit,
     cancellation: InstallCancelToken,
 }
 
@@ -559,10 +550,32 @@ impl ApplicationRuntime {
             force_stop,
             metrics: Metrics::default(),
             active: Arc::new(AtomicUsize::new(0)),
-            active_zero: Arc::new(Notify::new()),
+            admitted: Arc::new(AtomicUsize::new(0)),
+            admitted_zero: Arc::new(Notify::new()),
             queued: Arc::new(AtomicUsize::new(0)),
             shutdown_flight: Mutex::new(None),
         })))
+    }
+
+    fn admit_work(&self) -> Option<RuntimeWorkPermit> {
+        let _admin = self.0.admin.lock().ok()?;
+        if self.0.draining.load(Ordering::Acquire) {
+            return None;
+        }
+        self.admit_work_locked()
+    }
+
+    // Callers must hold `admin`, which serializes the coordinator admission and async counter
+    // increment with the shutdown boundary. Consequently shutdown can never observe zero between
+    // those two halves of an accepted operation.
+    fn admit_work_locked(&self) -> Option<RuntimeWorkPermit> {
+        let shutdown = self.0.shutdown.admit()?;
+        self.0.admitted.fetch_add(1, Ordering::AcqRel);
+        Some(RuntimeWorkPermit {
+            _shutdown: shutdown,
+            admitted: Arc::clone(&self.0.admitted),
+            zero_latch: Arc::clone(&self.0.admitted_zero),
+        })
     }
 
     /// Shared health registry for transport-specific health presentation.
@@ -722,11 +735,7 @@ impl ApplicationRuntime {
         // The permit and reservation deliberately remain owned by this public future. Native
         // initialization is not interruptible, but forced shutdown can terminate this future,
         // release lifecycle accounting, and drop the sole capability that can publish its result.
-        let _permit = self
-            .0
-            .shutdown
-            .admit()
-            .ok_or(LifecycleError::ShuttingDown)?;
+        let _permit = self.admit_work().ok_or(LifecycleError::ShuttingDown)?;
         let key_value = self.0.next_key.fetch_add(1, Ordering::Relaxed);
         let key = ModelKey(u64::try_from(key_value).unwrap_or(u64::MAX));
         // Construct cleanup ownership before publishing the reservation. Cancellation at every
@@ -901,11 +910,7 @@ impl ApplicationRuntime {
     where
         F: Future<Output = Result<T, LifecycleError>>,
     {
-        let _permit = self
-            .0
-            .shutdown
-            .admit()
-            .ok_or(LifecycleError::ShuttingDown)?;
+        let _permit = self.admit_work().ok_or(LifecycleError::ShuttingDown)?;
         let mut force_stop = self.0.force_stop.subscribe();
         if *force_stop.borrow() {
             return Err(LifecycleError::ShuttingDown);
@@ -962,9 +967,7 @@ impl ApplicationRuntime {
             return Err(LifecycleError::ShuttingDown);
         }
         let permit = self
-            .0
-            .shutdown
-            .admit()
+            .admit_work_locked()
             .ok_or(LifecycleError::ShuttingDown)?;
         let operation = self.0.next_key.fetch_add(1, Ordering::Relaxed);
         let cancellation = InstallCancelToken::new();
@@ -1014,7 +1017,6 @@ impl ApplicationRuntime {
             Arc::clone(&self.0.active),
             self.0.metrics.clone(),
             GaugeKind::Active,
-            Some(Arc::clone(&self.0.active_zero)),
         );
         let result = self
             .embed_inner(model_id, inputs, options, cancellation, deadline)
@@ -1051,9 +1053,7 @@ impl ApplicationRuntime {
             .checked_add(self.0.policy.request_timeout)
             .ok_or_else(|| EngineFailure::public(ErrorCode::Internal))?;
         let _permit = self
-            .0
-            .shutdown
-            .admit()
+            .admit_work()
             .ok_or_else(|| EngineFailure::public(ErrorCode::ModelUnavailable))?;
         if inputs.is_empty() || inputs.len() > self.0.policy.max_items {
             return Err(EngineFailure::public(ErrorCode::InvalidRequest));
@@ -1235,11 +1235,14 @@ impl ApplicationRuntime {
                     .health
                     .transition(LifecycleState::Draining, Some(ReadinessReason::Draining));
                 self.0.shutdown.begin();
+                let initially_drained = self.0.admitted.load(Ordering::Acquire) == 0;
                 let (finished, completion) = watch::channel(None);
                 let (deadline, deadline_updates) = watch::channel(requested_deadline);
                 let runtime = self.clone();
                 let task = executor.spawn(async move {
-                    let result = runtime.finish_shutdown(deadline_updates).await;
+                    let result = runtime
+                        .finish_shutdown(deadline_updates, initially_drained)
+                        .await;
                     let _ = finished.send(Some(result));
                 });
                 *flight = Some(ShutdownFlight {
@@ -1265,28 +1268,16 @@ impl ApplicationRuntime {
         }
     }
 
-    async fn finish_shutdown(&self, mut deadline: watch::Receiver<Option<Instant>>) -> bool {
-        loop {
-            if self.0.shutdown.wait(Duration::ZERO) {
-                break;
-            }
-            if deadline
-                .borrow()
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                break;
-            }
-            tokio::select! {
-                biased;
-                changed = deadline.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                }
-                () = tokio::task::yield_now() => {}
-            }
-        }
-        let drained = self.0.shutdown.wait(Duration::ZERO);
+    async fn finish_shutdown(
+        &self,
+        mut deadline: watch::Receiver<Option<Instant>>,
+        initially_drained: bool,
+    ) -> bool {
+        let drained = if initially_drained {
+            true
+        } else {
+            wait_for_drain(&self.0.admitted, &self.0.admitted_zero, &mut deadline).await
+        };
         if let Ok(models) = self.0.models.read() {
             for slot in models.values() {
                 slot.accepting.store(false, Ordering::Release);
@@ -1301,6 +1292,10 @@ impl ApplicationRuntime {
             }
             let _ = self.0.force_stop.send(true);
         }
+        // Forced shutdown is a lifecycle fence, not a demand that arbitrary retained futures be
+        // dropped. Existing RAII guards remain valid and clean up normally whenever their owners
+        // resume or disappear, but they cannot hold the public service in Draining indefinitely.
+        self.0.shutdown.force_stop();
         let mut tasks = self
             .0
             .schedulers
@@ -1326,21 +1321,59 @@ impl ApplicationRuntime {
             // jobs are separately fenced by `accepting` and may finish internally.
             let _ = (&mut task).await;
         }
-        if !drained {
-            // The force-stop watch makes every admitted public request future terminal without
-            // waiting for a non-cooperative native call. Do not publish Stopped before they have
-            // observed that terminal state and released their shutdown permits.
-            wait_for_active_zero(&self.0.active, &self.0.active_zero).await;
-            while !self.0.shutdown.wait(Duration::ZERO) {
-                tokio::task::yield_now().await;
-            }
-        }
         self.0.health.clear_models();
         let _ = self
             .0
             .health
             .transition(LifecycleState::Stopped, Some(ReadinessReason::Stopped));
         drained
+    }
+}
+
+async fn wait_for_drain(
+    admitted: &AtomicUsize,
+    zero_latch: &Notify,
+    deadline: &mut watch::Receiver<Option<Instant>>,
+) -> bool {
+    loop {
+        // Register first, then check the predicate. The stored `notify_one` permit closes the
+        // final-completion race without periodically waking or consuming a CPU core.
+        let notified = zero_latch.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let current_deadline = *deadline.borrow();
+        if current_deadline.is_some_and(|at| Instant::now() >= at) {
+            return false;
+        }
+        if admitted.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        if let Some(at) = current_deadline {
+            let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(at));
+            tokio::pin!(timer);
+            tokio::select! {
+                biased;
+                changed = deadline.changed() => {
+                    if changed.is_err() {
+                        return false;
+                    }
+                }
+                () = &mut timer => {
+                    return false;
+                }
+                () = &mut notified => {}
+            }
+        } else {
+            tokio::select! {
+                biased;
+                changed = deadline.changed() => {
+                    if changed.is_err() {
+                        return false;
+                    }
+                }
+                () = &mut notified => {}
+            }
+        }
     }
 }
 
@@ -1651,6 +1684,14 @@ mod tests {
 
     impl Wake for NoopWake {
         fn wake(self: Arc<Self>) {}
+    }
+
+    struct CountingWake(AtomicUsize);
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     struct FakeEngine {
@@ -2569,23 +2610,134 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn active_zero_latch_cannot_miss_final_completion()
+    #[tokio::test]
+    async fn forced_shutdown_is_bounded_with_retained_embed_future()
     -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        runtime.register_engine(
+            "retained-embed",
+            Arc::new(FakeEngine::new(Duration::from_millis(100))),
+        )?;
+        let request_runtime = runtime.clone();
+        let mut request = Box::pin(async move {
+            request_runtime
+                .embed(
+                    "retained-embed",
+                    vec!["x".into()],
+                    EmbedOptions::default(),
+                    CancellationToken::default(),
+                    None,
+                )
+                .await
+        });
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(request.as_mut().poll(&mut context), Poll::Pending));
+
+        let drained =
+            tokio::time::timeout(Duration::from_millis(250), runtime.shutdown(Duration::ZERO))
+                .await?;
+        assert!(!drained);
+        assert!(!runtime.health().is_live());
+        // The future is intentionally retained and never repolled until after terminal shutdown.
+        drop(request);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_is_bounded_with_retained_load_future()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let observer = runtime.clone();
+        let (started, wait_started) = std::sync::mpsc::sync_channel(0);
+        let (release, wait_release) = std::sync::mpsc::sync_channel(0);
+        let mut load = Box::pin(async move {
+            runtime
+                .load_with("retained-load".into(), move || {
+                    started.send(()).map_err(|_| LifecycleError::LoadFailed)?;
+                    wait_release
+                        .recv()
+                        .map_err(|_| LifecycleError::LoadFailed)?;
+                    Ok(Arc::new(FakeEngine::new(Duration::ZERO)) as Arc<dyn RuntimeEngine>)
+                })
+                .await
+        });
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(load.as_mut().poll(&mut context), Poll::Pending));
+        wait_started.recv_timeout(Duration::from_secs(1))?;
+
+        let drained = tokio::time::timeout(
+            Duration::from_millis(250),
+            observer.shutdown(Duration::ZERO),
+        )
+        .await?;
+        assert!(!drained);
+        assert!(!observer.health().is_live());
+        assert_eq!(observer.snapshot().registered_models, 0);
+
+        release.send(())?;
+        drop(load);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_is_bounded_with_retained_install_future()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let install_runtime = runtime.clone();
+        let mut install = Box::pin(async move {
+            install_runtime
+                .install_with(std::future::pending::<Result<(), LifecycleError>>())
+                .await
+        });
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(install.as_mut().poll(&mut context), Poll::Pending));
+
+        let drained =
+            tokio::time::timeout(Duration::from_millis(250), runtime.shutdown(Duration::ZERO))
+                .await?;
+        assert!(!drained);
+        assert!(!runtime.health().is_live());
+        drop(install);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_latch_cannot_miss_final_completion() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..500 {
-            let active = Arc::new(AtomicUsize::new(1));
+            let admitted = Arc::new(AtomicUsize::new(1));
             let latch = Arc::new(Notify::new());
-            let wait_active = Arc::clone(&active);
+            let wait_admitted = Arc::clone(&admitted);
             let wait_latch = Arc::clone(&latch);
+            let (_deadline_tx, mut deadline_rx) = watch::channel(None);
             let waiter = tokio::spawn(async move {
-                wait_for_active_zero(&wait_active, &wait_latch).await;
+                wait_for_drain(&wait_admitted, &wait_latch, &mut deadline_rx).await
             });
             tokio::task::yield_now().await;
-            let previous = active.fetch_sub(1, Ordering::AcqRel);
+            let previous = admitted.fetch_sub(1, Ordering::AcqRel);
             assert_eq!(previous, 1);
             latch.notify_one();
-            tokio::time::timeout(Duration::from_millis(50), waiter).await??;
+            assert!(tokio::time::timeout(Duration::from_millis(50), waiter).await??);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drain_wait_does_not_self_wake_or_busy_poll() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let admitted = AtomicUsize::new(1);
+        let latch = Notify::new();
+        let (_deadline_tx, mut deadline_rx) = watch::channel(None);
+        let mut drain = Box::pin(wait_for_drain(&admitted, &latch, &mut deadline_rx));
+        let wake_counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let task_waker = Waker::from(Arc::clone(&wake_counter));
+        let mut context = Context::from_waker(&task_waker);
+
+        assert!(matches!(drain.as_mut().poll(&mut context), Poll::Pending));
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(wake_counter.0.load(Ordering::Acquire), 0);
         Ok(())
     }
 
@@ -2786,11 +2938,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let runtime = ApplicationRuntime::new(policy())?;
         runtime.register_engine("fake", Arc::new(FakeEngine::new(Duration::ZERO)))?;
-        let permit = runtime
-            .0
-            .shutdown
-            .admit()
-            .ok_or("test work was not admitted")?;
+        let permit = runtime.admit_work().ok_or("test work was not admitted")?;
         let mut forced = runtime.0.force_stop.subscribe();
 
         let long_runtime = runtime.clone();
@@ -2827,11 +2975,7 @@ mod tests {
     async fn shutdown_survives_first_caller_abort_and_retry()
     -> Result<(), Box<dyn std::error::Error>> {
         let runtime = ApplicationRuntime::new(policy())?;
-        let permit = runtime
-            .0
-            .shutdown
-            .admit()
-            .ok_or("test work was not admitted")?;
+        let permit = runtime.admit_work().ok_or("test work was not admitted")?;
 
         let first_runtime = runtime.clone();
         let first =
@@ -2849,8 +2993,12 @@ mod tests {
             runtime.shutdown(Duration::from_secs(5)),
         )
         .await?;
-        assert!(!result);
-        assert!(!runtime.health().is_live());
+        if result {
+            return Err("retry changed forced shutdown into graceful shutdown".into());
+        }
+        if runtime.health().is_live() {
+            return Err("runtime remained live after shutdown retry".into());
+        }
         Ok(())
     }
 
@@ -2858,11 +3006,7 @@ mod tests {
     async fn concurrent_shutdown_callers_share_one_terminal_result()
     -> Result<(), Box<dyn std::error::Error>> {
         let runtime = ApplicationRuntime::new(policy())?;
-        let permit = runtime
-            .0
-            .shutdown
-            .admit()
-            .ok_or("test work was not admitted")?;
+        let permit = runtime.admit_work().ok_or("test work was not admitted")?;
 
         let first_runtime = runtime.clone();
         let second_runtime = runtime.clone();
