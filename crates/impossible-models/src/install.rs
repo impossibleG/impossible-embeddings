@@ -4,10 +4,69 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
+
+const COMMIT_OPEN: u8 = 0;
+const COMMIT_CANCELLED: u8 = 1;
+const COMMIT_CROSSED: u8 = 2;
+
+/// Shared handshake separating a cancellable transfer from its durable commit phase.
+///
+/// Cancellation and the commit boundary race through one atomic transition. Consequently, a
+/// caller that wins cancellation knows no promotion can start, while a caller that observes
+/// [`CommitDecision::AlreadyCommitted`] must await the installation's truthful terminal result.
+#[derive(Debug, Clone, Default)]
+pub struct InstallCommitGate(Arc<AtomicU8>);
+
+/// Result of requesting cancellation through an [`InstallCommitGate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitDecision {
+    /// Cancellation won before any durable cache mutation began.
+    CancelledBeforeCommit,
+    /// The durable commit phase has begun and must be allowed to finish.
+    AlreadyCommitted,
+}
+
+impl InstallCommitGate {
+    /// Create an open commit gate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Atomically cancel before commit, or report that commit already owns the transaction.
+    #[must_use]
+    pub fn request_cancel(&self) -> CommitDecision {
+        match self.0.compare_exchange(
+            COMMIT_OPEN,
+            COMMIT_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(COMMIT_CANCELLED) => CommitDecision::CancelledBeforeCommit,
+            Err(COMMIT_CROSSED) => CommitDecision::AlreadyCommitted,
+            Err(_) => unreachable!("install commit gate has an invalid state"),
+        }
+    }
+
+    /// Attempt to enter the non-cancellable durable phase.
+    ///
+    /// Returns `false` when cancellation already won and the caller must not mutate durable state.
+    #[must_use]
+    pub fn begin_commit(&self) -> bool {
+        self.0
+            .compare_exchange(
+                COMMIT_OPEN,
+                COMMIT_CROSSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
 
 use fs2::FileExt;
 use reqwest::{
@@ -158,14 +217,23 @@ impl Installer {
     /// Returns a validation, policy, cancellation, network, integrity, or filesystem error. Failed
     /// transfers are never promoted into the installed-model directory.
     pub async fn install(&self, manifest: &Manifest, cancel: &CancelToken) -> Result<ModelStatus> {
-        self.install_with_commit_observer(manifest, cancel, || {})
+        self.install_transaction(manifest, cancel, &InstallCommitGate::new(), || {})
             .await
     }
 
-    async fn install_with_commit_observer(
+    /// Install using an explicit cancellation/commit handshake.
+    ///
+    /// The observer runs only after the gate has atomically crossed into its non-cancellable
+    /// durable phase. It is intended for lifecycle owners that need deterministic coordination.
+    ///
+    /// # Errors
+    /// Returns [`Error::Cancelled`] if cancellation wins the gate, otherwise the same errors as
+    /// [`Installer::install`].
+    pub async fn install_transaction(
         &self,
         manifest: &Manifest,
         cancel: &CancelToken,
+        commit: &InstallCommitGate,
         after_commit_boundary: impl FnOnce(),
     ) -> Result<ModelStatus> {
         manifest.validate()?;
@@ -215,6 +283,9 @@ impl Installer {
         }
         // This final cancellation observation is the commit point. Once all downloaded bytes have
         // been authenticated, cancellation must not turn a durable promotion into a false failure.
+        if !commit.begin_commit() {
+            return Err(Error::Cancelled);
+        }
         after_commit_boundary();
         let manifest_path = staging.join("manifest.json");
         tokio::fs::write(&manifest_path, manifest.to_json()?).await?;
@@ -477,6 +548,20 @@ fn is_lock_contention(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_gate_has_one_atomic_winner() {
+        let cancelled = InstallCommitGate::new();
+        assert_eq!(
+            cancelled.request_cancel(),
+            CommitDecision::CancelledBeforeCommit
+        );
+        assert!(!cancelled.begin_commit());
+
+        let committed = InstallCommitGate::new();
+        assert!(committed.begin_commit());
+        assert_eq!(committed.request_cancel(), CommitDecision::AlreadyCommitted);
+    }
     use crate::{
         Artifact, Dimensions, License, Pooling, Prefixes, RuntimeMetadata, SemanticVerification,
         TensorMetadata, TokenizerMetadata,
@@ -675,9 +760,10 @@ mod tests {
             },
         )?;
         let cancel = CancelToken::new();
+        let commit = InstallCommitGate::new();
         let trigger = cancel.clone();
         let result = installer
-            .install_with_commit_observer(&manifest, &cancel, move || trigger.cancel())
+            .install_transaction(&manifest, &cancel, &commit, move || trigger.cancel())
             .await;
 
         assert_eq!(result?, ModelStatus::IntegrityVerified);

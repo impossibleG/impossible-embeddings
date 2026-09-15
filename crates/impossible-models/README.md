@@ -30,6 +30,10 @@ moves that state to `quarantine` and atomically promotes the verified replacemen
 contain no host or user information. Repair uses a durable transaction marker and deterministic
 backup path; after interruption, the next status/install/import operation completes the prepared
 promotion or restores the displaced state, then clears the transaction.
+Promotion and recovery flush the marker file and affected parent directories around every rename
+and marker removal. Unix uses directory `fsync`; Windows opens directory handles with backup
+semantics and calls `FlushFileBuffers` through `sync_all`. Actual guarantees still depend on the
+filesystem, storage device, and their write-cache configuration.
 
 Discovery searches only directories supplied as `DiscoveryRoot` values. Import reads only a
 caller-supplied directory and rejects symbolic-link artifacts. Delete derives one content-addressed

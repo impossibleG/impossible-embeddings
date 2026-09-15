@@ -8,7 +8,7 @@ mod manifest;
 mod store;
 
 pub use impossible_embedding_core::ModelVerificationStatus as ModelStatus;
-pub use install::{CancelToken, InstallOptions, Installer};
+pub use install::{CancelToken, CommitDecision, InstallCommitGate, InstallOptions, Installer};
 pub use manifest::{
     Artifact, Dimensions, License, MAX_ARTIFACTS, MAX_TOTAL_ARTIFACT_BYTES, Manifest,
     OnnxInputNames, Pooling, Prefixes, RuntimeMetadata, SemanticVerification, TensorMetadata,

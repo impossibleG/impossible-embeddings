@@ -6,7 +6,8 @@ use impossible_embedding_core::{
 };
 use impossible_embedding_onnx::OnnxEmbeddingEngine;
 use impossible_models::{
-    CancelToken as InstallCancelToken, Installer, Manifest, ModelStatus, ModelStore,
+    CancelToken as InstallCancelToken, CommitDecision, InstallCommitGate, Installer, Manifest,
+    ModelStatus, ModelStore,
 };
 use impossible_server_core::{
     HealthRegistry, LifecycleState, ModelKey, ModelState, ReadinessReason, ShutdownCoordinator,
@@ -377,7 +378,7 @@ struct Inner {
     policy: BatchPolicy,
     models: RwLock<HashMap<String, Arc<ModelSlot>>>,
     loading: Mutex<HashMap<String, ModelKey>>,
-    installs: Arc<Mutex<HashMap<usize, InstallCancelToken>>>,
+    installs: Arc<Mutex<HashMap<usize, InstallControl>>>,
     health: HealthRegistry,
     shutdown: ShutdownCoordinator,
     pool: BlockingPool,
@@ -498,7 +499,7 @@ struct LoadReservation {
 }
 
 struct InstallRegistration {
-    installs: Arc<Mutex<HashMap<usize, InstallCancelToken>>>,
+    installs: Arc<Mutex<HashMap<usize, InstallControl>>>,
     operation: usize,
 }
 
@@ -506,6 +507,47 @@ struct ActiveInstall {
     _registration: InstallRegistration,
     _permit: RuntimeWorkPermit,
     cancellation: InstallCancelToken,
+    commit: InstallCommitGate,
+}
+
+#[derive(Clone)]
+struct InstallControl {
+    cancellation: InstallCancelToken,
+    commit: InstallCommitGate,
+}
+
+impl InstallControl {
+    fn cancel_before_commit(&self) -> CommitDecision {
+        let decision = self.commit.request_cancel();
+        if decision == CommitDecision::CancelledBeforeCommit {
+            self.cancellation.cancel();
+        }
+        decision
+    }
+}
+
+struct InstallCallerGuard {
+    control: InstallControl,
+    task: tokio::task::AbortHandle,
+    armed: bool,
+}
+
+impl InstallCallerGuard {
+    fn cancel_before_commit(&self) -> CommitDecision {
+        let decision = self.control.cancel_before_commit();
+        if decision == CommitDecision::CancelledBeforeCommit {
+            self.task.abort();
+        }
+        decision
+    }
+}
+
+impl Drop for InstallCallerGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancel_before_commit();
+        }
+    }
 }
 
 struct CancelOnDrop {
@@ -943,28 +985,18 @@ impl ApplicationRuntime {
         Ok(())
     }
 
-    /// Run a model installation operation while shutdown tracks and can reject its admission.
+    /// Run an owned model installation transaction with an explicit commit gate.
     ///
     /// # Errors
     /// Returns shutdown rejection or the operation's sanitized lifecycle failure.
-    pub async fn install_with<F, T>(&self, operation: F) -> Result<T, LifecycleError>
+    pub async fn install_with<F, Fut, T>(&self, operation: F) -> Result<T, LifecycleError>
     where
-        F: Future<Output = Result<T, LifecycleError>>,
+        F: FnOnce(InstallCancelToken, InstallCommitGate) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, LifecycleError>> + Send + 'static,
+        T: Send + 'static,
     {
-        let _permit = self.admit_work().ok_or(LifecycleError::ShuttingDown)?;
-        let mut force_stop = self.0.force_stop.subscribe();
-        if *force_stop.borrow() {
-            return Err(LifecycleError::ShuttingDown);
-        }
-        tokio::pin!(operation);
-        tokio::select! {
-            biased;
-            changed = force_stop.changed() => {
-                let _ = changed;
-                Err(LifecycleError::ShuttingDown)
-            }
-            result = &mut operation => result,
-        }
+        let active = self.begin_install()?;
+        self.run_install_transaction(active, operation).await
     }
 
     /// Install one exact manifest with cooperative cancellation on forced shutdown.
@@ -977,23 +1009,63 @@ impl ApplicationRuntime {
         manifest: &Manifest,
     ) -> Result<ModelStatus, LifecycleError> {
         let active = self.begin_install()?;
+        let installer = installer.clone();
+        let manifest = manifest.clone();
+        self.run_install_transaction(active, move |cancellation, commit| async move {
+            installer
+                .install_transaction(&manifest, &cancellation, &commit, || {})
+                .await
+                .map_err(|_| LifecycleError::InstallFailed)
+        })
+        .await
+    }
+
+    async fn run_install_transaction<F, Fut, T>(
+        &self,
+        active: ActiveInstall,
+        operation: F,
+    ) -> Result<T, LifecycleError>
+    where
+        F: FnOnce(InstallCancelToken, InstallCommitGate) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, LifecycleError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let control = InstallControl {
+            cancellation: active.cancellation.clone(),
+            commit: active.commit.clone(),
+        };
         let mut force_stop = self.0.force_stop.subscribe();
         if *force_stop.borrow() {
-            active.cancellation.cancel();
+            control.cancel_before_commit();
             return Err(LifecycleError::ShuttingDown);
         }
-        let install = installer.install(manifest, &active.cancellation);
-        tokio::pin!(install);
+        let (send, mut receive) = oneshot::channel();
+        let caller_control = control.clone();
+        let task = tokio::spawn(async move {
+            let result = operation(control.cancellation.clone(), control.commit.clone()).await;
+            drop(active);
+            let _ = send.send(result);
+        });
+        let mut caller = InstallCallerGuard {
+            control: caller_control,
+            task: task.abort_handle(),
+            armed: true,
+        };
         let result = tokio::select! {
             biased;
+            result = &mut receive => result.unwrap_or(Err(LifecycleError::InstallFailed)),
             changed = force_stop.changed() => {
                 let _ = changed;
-                active.cancellation.cancel();
-                return Err(LifecycleError::ShuttingDown);
+                match caller.cancel_before_commit() {
+                    CommitDecision::CancelledBeforeCommit => Err(LifecycleError::ShuttingDown),
+                    CommitDecision::AlreadyCommitted => {
+                        receive.await.unwrap_or(Err(LifecycleError::InstallFailed))
+                    }
+                }
             }
-            result = &mut install => result,
         };
-        result.map_err(|_| LifecycleError::InstallFailed)
+        caller.armed = false;
+        result
     }
 
     fn begin_install(&self) -> Result<ActiveInstall, LifecycleError> {
@@ -1012,11 +1084,18 @@ impl ApplicationRuntime {
             .ok_or(LifecycleError::ShuttingDown)?;
         let operation = self.0.next_key.fetch_add(1, Ordering::Relaxed);
         let cancellation = InstallCancelToken::new();
+        let commit = InstallCommitGate::new();
         self.0
             .installs
             .lock()
             .map_err(|_| LifecycleError::InstallFailed)?
-            .insert(operation, cancellation.clone());
+            .insert(
+                operation,
+                InstallControl {
+                    cancellation: cancellation.clone(),
+                    commit: commit.clone(),
+                },
+            );
         Ok(ActiveInstall {
             _registration: InstallRegistration {
                 installs: Arc::clone(&self.0.installs),
@@ -1024,6 +1103,7 @@ impl ApplicationRuntime {
             },
             _permit: permit,
             cancellation,
+            commit,
         })
     }
 
@@ -1332,8 +1412,8 @@ impl ApplicationRuntime {
         }
         if !drained {
             if let Ok(installs) = self.0.installs.lock() {
-                for cancellation in installs.values() {
-                    cancellation.cancel();
+                for install in installs.values() {
+                    install.cancel_before_commit();
                 }
             }
             let _ = self.0.force_stop.send(true);
@@ -2953,7 +3033,7 @@ mod tests {
         let install_runtime = runtime.clone();
         let mut install = Box::pin(async move {
             install_runtime
-                .install_with(std::future::pending::<Result<(), LifecycleError>>())
+                .install_with(|_, _| std::future::pending::<Result<(), LifecycleError>>())
                 .await
         });
         let waker = Waker::from(Arc::new(NoopWake));
@@ -2966,6 +3046,66 @@ mod tests {
         assert!(!drained);
         assert!(!runtime.health().is_live());
         drop(install);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_shutdown_cancels_owned_install_before_commit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let install_runtime = runtime.clone();
+        let (started, wait_started) = oneshot::channel();
+        let install = tokio::spawn(async move {
+            install_runtime
+                .install_with(move |_, _| async move {
+                    let _ = started.send(());
+                    std::future::pending::<Result<(), LifecycleError>>().await
+                })
+                .await
+        });
+        wait_started.await?;
+
+        if runtime.shutdown(Duration::ZERO).await {
+            return Err("forced shutdown unexpectedly drained".into());
+        }
+        let install_result = install.await?;
+        if install_result != Err(LifecycleError::ShuttingDown) {
+            return Err(format!("unexpected pre-commit result: {install_result:?}").into());
+        }
+        if runtime.health().is_live() {
+            return Err("runtime remained live after shutdown".into());
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_shutdown_preserves_truthful_result_after_install_commit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let install_runtime = runtime.clone();
+        let (committed, wait_committed) = oneshot::channel();
+        let (release, wait_release) = oneshot::channel();
+        let install = tokio::spawn(async move {
+            install_runtime
+                .install_with(move |_, commit| async move {
+                    assert!(commit.begin_commit());
+                    let _ = committed.send(());
+                    let _ = wait_release.await;
+                    Ok::<_, LifecycleError>(17_u8)
+                })
+                .await
+        });
+        wait_committed.await?;
+
+        assert!(
+            !tokio::time::timeout(Duration::from_millis(250), runtime.shutdown(Duration::ZERO))
+                .await?
+        );
+        assert!(!runtime.health().is_live());
+        release
+            .send(())
+            .map_err(|()| "install receiver disappeared")?;
+        assert_eq!(install.await??, 17);
         Ok(())
     }
 
@@ -3146,7 +3286,7 @@ mod tests {
         let operation_runtime = runtime.clone();
         let operation = tokio::spawn(async move {
             operation_runtime
-                .install_with(std::future::pending::<Result<(), LifecycleError>>())
+                .install_with(|_, _| std::future::pending::<Result<(), LifecycleError>>())
                 .await
         });
         tokio::task::yield_now().await;

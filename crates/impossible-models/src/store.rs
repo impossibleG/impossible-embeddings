@@ -1033,9 +1033,14 @@ fn promote_with_observer(
     staging: &Path,
     mut observe: impl FnMut(PromotionPhase) -> Result<()>,
 ) -> Result<()> {
-    promote_with_operations(layout, manifest, staging, &mut observe, |from, to| {
-        fs::rename(from, to)
-    })
+    promote_with_operations(
+        layout,
+        manifest,
+        staging,
+        &mut observe,
+        |from, to| fs::rename(from, to),
+        sync_directory,
+    )
 }
 
 fn promote_with_operations(
@@ -1044,11 +1049,12 @@ fn promote_with_operations(
     staging: &Path,
     observe: &mut impl FnMut(PromotionPhase) -> Result<()>,
     mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    mut sync_dir: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<()> {
     let final_path = layout.model_dir(manifest)?;
     reconcile_repair_inner(layout, manifest)?;
     if symlink_metadata_if_exists(&final_path)?.is_none() {
-        rename(staging, &final_path)?;
+        durable_rename(staging, &final_path, &mut rename, &mut sync_dir)?;
         return Ok(());
     }
     reject_reparse_components(
@@ -1060,6 +1066,7 @@ fn promote_with_operations(
     let transaction_root = layout.root.join("transactions");
     fs::create_dir_all(&transaction_root)?;
     ensure_contained_directory(&layout.root, &transaction_root)?;
+    sync_dir(&layout.root)?;
     let marker = layout.repair_marker(manifest)?;
     let backup = layout.repair_backup(manifest)?;
     if symlink_metadata_if_exists(&backup)?.is_some()
@@ -1074,15 +1081,17 @@ fn promote_with_operations(
         .write(true)
         .open(&marker)?;
     marker_file.sync_all()?;
+    sync_dir(&transaction_root)?;
     observe(PromotionPhase::MarkerDurable)?;
-    if let Err(error) = rename(&final_path, &backup) {
+    if let Err(error) = durable_rename(&final_path, &backup, &mut rename, &mut sync_dir) {
         verify_transaction_final(&final_path)?;
         fs::remove_file(&marker)?;
+        sync_dir(&transaction_root)?;
         return Err(error.into());
     }
     observe(PromotionPhase::PreviousDisplaced)?;
-    if rename(staging, &final_path).is_err() {
-        if rename(&backup, &final_path).is_err() {
+    if durable_rename(staging, &final_path, &mut rename, &mut sync_dir).is_err() {
+        if durable_rename(&backup, &final_path, &mut rename, &mut sync_dir).is_err() {
             // The durable marker is intentionally retained. A later status/load/install call can
             // now reconcile the unambiguous (missing final, complete staging, complete backup)
             // transaction instead of silently losing the only recovery signal.
@@ -1092,24 +1101,89 @@ fn promote_with_operations(
         }
         verify_transaction_final(&final_path)?;
         fs::remove_file(&marker)?;
+        sync_dir(&transaction_root)?;
         return Err(Error::Invalid(
             "replacement promotion failed; the previous model was restored".into(),
         ));
     }
     verify_transaction_final(&final_path)?;
     observe(PromotionPhase::ReplacementPromoted)?;
-    quarantine_backup(layout, manifest, &backup)?;
+    quarantine_backup_with_operations(layout, manifest, &backup, &mut rename, &mut sync_dir)?;
     fs::remove_file(marker)?;
+    sync_dir(&transaction_root)?;
     Ok(())
 }
 
-fn quarantine_backup(layout: &CacheLayout, manifest: &Manifest, backup: &Path) -> Result<()> {
+fn durable_rename(
+    from: &Path,
+    to: &Path,
+    rename: &mut impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    sync_dir: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let from_parent = from.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source has no parent")
+    })?;
+    let to_parent = to.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination has no parent",
+        )
+    })?;
+    // The model directory contains already-synced files, but its own entries also need a barrier
+    // before the directory is made reachable under a durable name.
+    sync_dir(from)?;
+    sync_dir(from_parent)?;
+    if from_parent != to_parent {
+        sync_dir(to_parent)?;
+    }
+    rename(from, to)?;
+    sync_dir(to)?;
+    sync_dir(from_parent)?;
+    if from_parent != to_parent {
+        sync_dir(to_parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // FILE_FLAG_BACKUP_SEMANTICS is required to obtain a directory handle. `sync_all` maps to
+    // FlushFileBuffers, giving supported Windows filesystems the strongest available metadata
+    // persistence barrier without relying on host-specific native APIs.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
+}
+
+fn quarantine_backup_with_operations(
+    layout: &CacheLayout,
+    manifest: &Manifest,
+    backup: &Path,
+    rename: &mut impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    sync_dir: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<()> {
     if symlink_metadata_if_exists(backup)?.is_none() {
         return Ok(());
     }
     let quarantine_root = layout.root.join("quarantine");
     fs::create_dir_all(&quarantine_root)?;
     ensure_contained_directory(&layout.root, &quarantine_root)?;
+    sync_dir(&layout.root)?;
     let quarantine = loop {
         let sequence = QUARANTINE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let candidate = quarantine_root.join(format!(
@@ -1124,11 +1198,25 @@ fn quarantine_backup(layout: &CacheLayout, manifest: &Manifest, backup: &Path) -
             Err(error) => return Err(error.into()),
         }
     };
-    fs::rename(backup, quarantine)?;
+    durable_rename(backup, &quarantine, rename, sync_dir)?;
     Ok(())
 }
 
 fn reconcile_repair_inner(layout: &CacheLayout, manifest: &Manifest) -> Result<()> {
+    reconcile_repair_with_operations(
+        layout,
+        manifest,
+        &mut |from, to| fs::rename(from, to),
+        &mut sync_directory,
+    )
+}
+
+fn reconcile_repair_with_operations(
+    layout: &CacheLayout,
+    manifest: &Manifest,
+    rename: &mut impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    sync_dir: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<()> {
     let marker = layout.repair_marker(manifest)?;
     let marker_metadata = match fs::symlink_metadata(&marker) {
         Ok(metadata) => metadata,
@@ -1148,13 +1236,13 @@ fn reconcile_repair_inner(layout: &CacheLayout, manifest: &Manifest) -> Result<(
     match (final_exists, staging_exists, backup_exists) {
         // Crash after marker creation: resume the intended replacement.
         (true, true, false) => {
-            fs::rename(&final_path, &backup)?;
-            fs::rename(&staging, &final_path)?;
+            durable_rename(&final_path, &backup, rename, sync_dir)?;
+            durable_rename(&staging, &final_path, rename, sync_dir)?;
         }
         // Crash after displacement: finish promoting the fully prepared replacement.
-        (false, true, true) => fs::rename(&staging, &final_path)?,
+        (false, true, true) => durable_rename(&staging, &final_path, rename, sync_dir)?,
         // The replacement vanished: restore the previous state rather than leave a hole.
-        (false, false, true) => fs::rename(&backup, &final_path)?,
+        (false, false, true) => durable_rename(&backup, &final_path, rename, sync_dir)?,
         // New state is already visible, or the marker preceded any mutation.
         (true, _, _) => {}
         _ => {
@@ -1164,8 +1252,10 @@ fn reconcile_repair_inner(layout: &CacheLayout, manifest: &Manifest) -> Result<(
         }
     }
     verify_transaction_final(&final_path)?;
-    quarantine_backup(layout, manifest, &backup)?;
+    quarantine_backup_with_operations(layout, manifest, &backup, rename, sync_dir)?;
     fs::remove_file(marker)?;
+    let transaction_root = layout.root.join("transactions");
+    sync_dir(&transaction_root)?;
     Ok(())
 }
 
@@ -1292,7 +1382,10 @@ fn validate_import_source(source: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod transaction_tests {
     use super::*;
-    use std::cell::Cell;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
     use tempfile::TempDir;
 
     fn local_manifest(body: &[u8]) -> Manifest {
@@ -1419,8 +1512,12 @@ mod transaction_tests {
 
         let mut rename_count = 0_u8;
         let mut observer = |_| Ok(());
-        let result =
-            promote_with_operations(&layout, &manifest, &staging, &mut observer, |from, to| {
+        let result = promote_with_operations(
+            &layout,
+            &manifest,
+            &staging,
+            &mut observer,
+            |from, to| {
                 rename_count = rename_count.saturating_add(1);
                 if matches!(rename_count, 2 | 3) {
                     Err(std::io::Error::new(
@@ -1430,12 +1527,187 @@ mod transaction_tests {
                 } else {
                     fs::rename(from, to)
                 }
-            });
+            },
+            sync_directory,
+        );
         assert!(matches!(result, Err(Error::Invalid(_))));
         assert!(layout.repair_marker(&manifest)?.is_file());
         assert!(!final_path.exists());
         assert!(staging.is_dir());
         assert!(layout.repair_backup(&manifest)?.is_dir());
+
+        reconcile_repair_inner(&layout, &manifest)?;
+        assert_eq!(fs::read(final_path.join("state"))?, b"new");
+        assert!(!layout.repair_marker(&manifest)?.exists());
+        assert!(!layout.repair_backup(&manifest)?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn repair_promotion_persists_each_metadata_transition_in_order() -> Result<()> {
+        let temp = TempDir::new()?;
+        let layout = CacheLayout::new(temp.path())?;
+        let manifest = manifest()?;
+        let final_path = layout.model_dir(&manifest)?;
+        let staging = layout.staging_dir(&manifest)?;
+        fs::create_dir_all(&final_path)?;
+        fs::write(final_path.join("state"), b"old")?;
+        prepare_staging(&layout, &staging)?;
+        fs::write(staging.join("state"), b"new")?;
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let rename_events = Rc::clone(&events);
+        let sync_events = Rc::clone(&events);
+        promote_with_operations(
+            &layout,
+            &manifest,
+            &staging,
+            &mut |_| Ok(()),
+            move |from, to| {
+                rename_events.borrow_mut().push(format!(
+                    "rename:{}->{}",
+                    from.parent()
+                        .and_then(Path::file_name)
+                        .and_then(|v| v.to_str())
+                        .unwrap_or("root"),
+                    to.parent()
+                        .and_then(Path::file_name)
+                        .and_then(|v| v.to_str())
+                        .unwrap_or("root")
+                ));
+                fs::rename(from, to)
+            },
+            move |path| {
+                sync_events.borrow_mut().push(format!(
+                    "sync:{}",
+                    path.file_name().and_then(|v| v.to_str()).unwrap_or("root")
+                ));
+                Ok(())
+            },
+        )?;
+
+        let events = events.borrow();
+        assert!(
+            events
+                .first()
+                .is_some_and(|event| event.starts_with("sync:"))
+        );
+        assert_eq!(events.get(1).map(String::as_str), Some("sync:transactions"));
+        let metadata_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.as_str(),
+                    "sync:models"
+                        | "sync:transactions"
+                        | "sync:staging"
+                        | "rename:models->transactions"
+                        | "rename:staging->models"
+                )
+            })
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert!(metadata_events.windows(5).any(|window| window
+            == [
+                "sync:models",
+                "sync:transactions",
+                "rename:models->transactions",
+                "sync:models",
+                "sync:transactions"
+            ]));
+        assert!(metadata_events.windows(5).any(|window| window
+            == [
+                "sync:staging",
+                "sync:models",
+                "rename:staging->models",
+                "sync:staging",
+                "sync:models"
+            ]));
+        assert_eq!(events.last().map(String::as_str), Some("sync:transactions"));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_marker_directory_barrier_retains_repair_signal() -> Result<()> {
+        let temp = TempDir::new()?;
+        let layout = CacheLayout::new(temp.path())?;
+        let manifest = manifest()?;
+        let final_path = layout.model_dir(&manifest)?;
+        let staging = layout.staging_dir(&manifest)?;
+        fs::create_dir_all(&final_path)?;
+        fs::write(final_path.join("state"), b"old")?;
+        prepare_staging(&layout, &staging)?;
+        fs::write(staging.join("state"), b"new")?;
+        let calls = Cell::new(0_u8);
+
+        let result = promote_with_operations(
+            &layout,
+            &manifest,
+            &staging,
+            &mut |_| Ok(()),
+            |from, to| fs::rename(from, to),
+            |_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "injected sync failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(result, Err(Error::Io(_))));
+        assert!(layout.repair_marker(&manifest)?.is_file());
+        assert!(final_path.is_dir());
+        assert!(staging.is_dir());
+
+        reconcile_repair_inner(&layout, &manifest)?;
+        assert_eq!(fs::read(final_path.join("state"))?, b"new");
+        assert!(!layout.repair_marker(&manifest)?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_sync_failure_keeps_marker_until_safe_retry() -> Result<()> {
+        let temp = TempDir::new()?;
+        let layout = CacheLayout::new(temp.path())?;
+        let manifest = manifest()?;
+        let final_path = layout.model_dir(&manifest)?;
+        let staging = layout.staging_dir(&manifest)?;
+        fs::create_dir_all(&final_path)?;
+        fs::write(final_path.join("state"), b"old")?;
+        prepare_staging(&layout, &staging)?;
+        fs::write(staging.join("state"), b"new")?;
+        let result = promote_with_observer(&layout, &manifest, &staging, |phase| {
+            if phase == PromotionPhase::PreviousDisplaced {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(Error::Cancelled)));
+
+        let calls = Cell::new(0_u8);
+        let result = reconcile_repair_with_operations(
+            &layout,
+            &manifest,
+            &mut |from, to| fs::rename(from, to),
+            &mut |_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 4 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "injected reconciliation sync failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(result, Err(Error::Io(_))));
+        assert!(layout.repair_marker(&manifest)?.is_file());
 
         reconcile_repair_inner(&layout, &manifest)?;
         assert_eq!(fs::read(final_path.join("state"))?, b"new");
