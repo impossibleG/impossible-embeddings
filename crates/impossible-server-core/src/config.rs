@@ -1170,6 +1170,18 @@ mod tests {
     }
 
     #[test]
+    fn origin_validation_requires_canonical_idna_serialization() {
+        for non_canonical in [
+            "https://bücher.example",
+            "https://faß.example",
+            "https://XN--BCHER-KVA.example",
+        ] {
+            assert!(!valid_origin(non_canonical), "accepted {non_canonical:?}");
+        }
+        assert!(valid_origin("https://xn--bcher-kva.example"));
+    }
+
+    #[test]
     fn duplicate_and_conflicting_keys_fail_closed() {
         assert!(parse_toml("bind = \"[::1]:1\"\nbind = \"[::1]:2\"").is_err());
         assert!(

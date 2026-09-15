@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-impossible-server-core = { path = "../impossible-server-core" }
+impossible-server-core = { version = "=0.1.0", path = "../impossible-server-core" }
 
 [lints]
 workspace = true

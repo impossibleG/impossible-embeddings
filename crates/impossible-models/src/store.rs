@@ -218,7 +218,7 @@ impl VerifiedModel {
     /// # Errors
     /// Returns an error if any byte or filesystem invariant changed since verification.
     pub fn revalidate_integrity(&self) -> Result<()> {
-        let stored = Manifest::from_json(&fs::read(self.root.join(MANIFEST_FILE))?)?;
+        let stored = read_contained_manifest(&self.root)?;
         if stored != self.manifest {
             return Err(Error::Invalid(
                 "stored manifest changed after verification".into(),
@@ -389,14 +389,11 @@ impl ModelStore {
             }
             Err(error) => return Err(error.into()),
         };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if is_reparse(&metadata) || !metadata.is_dir() {
             return Ok(ModelStatus::Invalid);
         }
-        let stored = match fs::read(directory.join(MANIFEST_FILE))
-            .ok()
-            .and_then(|bytes| Manifest::from_json(&bytes).ok())
-        {
-            Some(value) if value == *manifest => value,
+        let stored = match read_contained_manifest(&directory) {
+            Ok(value) if value == *manifest => value,
             _ => return Ok(ModelStatus::Invalid),
         };
         for artifact in &stored.artifacts {
@@ -534,19 +531,25 @@ impl ModelStore {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            if is_reparse(&metadata) || !metadata.is_dir() {
                 continue;
             }
+            let canonical_root = fs::canonicalize(&root.0)?;
             for entry in fs::read_dir(&root.0)? {
                 let entry = entry?;
-                if entry.file_type()?.is_symlink() || !entry.file_type()?.is_dir() {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if is_reparse(&metadata) || !metadata.is_dir() {
                     continue;
                 }
-                let path = entry.path().join(MANIFEST_FILE);
-                if let Ok(bytes) = fs::read(path) {
-                    if let Ok(manifest) = Manifest::from_json(&bytes) {
-                        found.push(manifest);
-                    }
+                let directory = entry.path();
+                let Ok(canonical_directory) = fs::canonicalize(&directory) else {
+                    continue;
+                };
+                if !canonical_directory.starts_with(&canonical_root) {
+                    continue;
+                }
+                if let Ok(manifest) = read_contained_manifest(&directory) {
+                    found.push(manifest);
                 }
             }
         }
@@ -583,7 +586,7 @@ impl ModelStore {
                 "model target escaped cache containment".into(),
             ));
         }
-        let stored = Manifest::from_json(&fs::read(target.join(MANIFEST_FILE))?)?;
+        let stored = read_contained_manifest(&target)?;
         if stored != *manifest || stored.artifact_fingerprint() != manifest.artifact_fingerprint() {
             return Err(Error::Invalid(
                 "stored manifest does not exactly match deletion request".into(),
@@ -592,6 +595,32 @@ impl ModelStore {
         fs::remove_dir_all(target)?;
         Ok(true)
     }
+}
+
+/// Reads an identity record only after both the containing directory and manifest file have been
+/// proven to be regular, non-reparse filesystem objects within the same canonical directory.
+fn read_contained_manifest(directory: &Path) -> Result<Manifest> {
+    let directory_metadata = fs::symlink_metadata(directory)?;
+    if is_reparse(&directory_metadata) || !directory_metadata.is_dir() {
+        return Err(Error::Invalid(
+            "manifest directory cannot be a symlink or reparse point".into(),
+        ));
+    }
+    let canonical_directory = fs::canonicalize(directory)?;
+    let path = directory.join(MANIFEST_FILE);
+    let metadata = fs::symlink_metadata(&path)?;
+    if is_reparse(&metadata) || !metadata.is_file() {
+        return Err(Error::Invalid(
+            "manifest must be a regular non-reparse file".into(),
+        ));
+    }
+    let canonical_path = fs::canonicalize(&path)?;
+    if canonical_path.parent() != Some(canonical_directory.as_path()) {
+        return Err(Error::Invalid(
+            "manifest escaped its containing directory".into(),
+        ));
+    }
+    Manifest::from_json(&fs::read(canonical_path)?)
 }
 
 fn acquire_store_lock(layout: &CacheLayout, manifest: &Manifest) -> Result<fs::File> {

@@ -4,6 +4,13 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # Applicability: tokenizers 0.23.2 uses this proc macro at build time; it is not part of the
+    # server's runtime attack surface. The latest compatible tokenizers release still requires it,
+    # and RustSec reports no safe upgrade. Re-evaluate by 2026-12-15 or on the next tokenizer
+    # release, whichever comes first.
+    { id = "RUSTSEC-2024-0436", reason = "transitive build-time dependency of tokenizers 0.23.2; no safe upstream upgrade; review by 2026-12-15" },
+]
 
 [licenses]
 version = 2

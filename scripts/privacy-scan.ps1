@@ -1,12 +1,30 @@
 $ErrorActionPreference = "Stop"
 
 $patterns = @(
-    'C:\\Users\\',
+    '(?i)c:\\users\\',
     '/Users/',
     '/home/',
     '(?i)co-authored-by:',
     '(?i)(cpu|gpu|processor|graphics card):\s+[^<]'
 )
+
+function Test-ProhibitedContent {
+    param([Parameter(Mandatory = $true)][string]$Content)
+
+    foreach ($pattern in $patterns) {
+        if ($Content -match $pattern) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# Keep this synthetic: it proves lowercase Windows home paths are rejected without embedding a
+# contributor's real account name or machine path in the repository.
+$lowercaseWindowsFixture = @('c:', 'users', 'example-account', 'private.txt') -join '\'
+if (-not (Test-ProhibitedContent -Content $lowercaseWindowsFixture)) {
+    throw "Privacy scan self-test failed: lowercase Windows home path was not detected."
+}
 
 $files = git ls-files | Where-Object { $_ -ne 'scripts/privacy-scan.ps1' }
 if ($LASTEXITCODE -ne 0) {
@@ -20,11 +38,8 @@ foreach ($file in $files) {
     }
 
     $content = Get-Content -LiteralPath $file -Raw
-    foreach ($pattern in $patterns) {
-        if ($content -match $pattern) {
-            $findings.Add("$file matches prohibited repository pattern")
-            break
-        }
+    if (Test-ProhibitedContent -Content $content) {
+        $findings.Add("$file matches prohibited repository pattern")
     }
 }
 

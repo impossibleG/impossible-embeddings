@@ -9,9 +9,9 @@ use std::{
 };
 
 use impossible_models::{
-    Artifact, CancelToken, Dimensions, InstallOptions, Installer, License, Manifest, ModelStatus,
-    ModelStore, Pooling, Prefixes, SemanticTrustRoot, SemanticVerification, TensorMetadata,
-    TokenizerMetadata, TrustedSemanticEvidence,
+    Artifact, CancelToken, Dimensions, DiscoveryRoot, InstallOptions, Installer, License, Manifest,
+    ModelStatus, ModelStore, Pooling, Prefixes, SemanticTrustRoot, SemanticVerification,
+    TensorMetadata, TokenizerMetadata, TrustedSemanticEvidence,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -529,6 +529,76 @@ fn verification_rejects_intermediate_link_or_junction() -> TestResult {
     assert_eq!(store.status(&manifest)?, ModelStatus::Invalid);
     assert!(store.verified_model(&manifest).is_err());
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_manifest_symlinks_are_rejected_by_status_revalidation_and_discovery() -> TestResult {
+    manifest_link_attack_is_rejected()
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_manifest_reparse_points_are_rejected_by_status_revalidation_and_discovery() -> TestResult
+{
+    manifest_link_attack_is_rejected()
+}
+
+fn manifest_link_attack_is_rejected() -> TestResult {
+    let cache = TempDir::new()?;
+    let source = TempDir::new()?;
+    let outside = TempDir::new()?;
+    let body = b"manifest link bytes";
+    let manifest = fixture("https://example.invalid/model".into(), body, None);
+    std::fs::create_dir_all(source.path().join("weights"))?;
+    std::fs::write(source.path().join("weights/model.bin"), body)?;
+    let store = trusted_store(cache.path(), &manifest)?;
+    assert_eq!(
+        store.import(&manifest, source.path())?,
+        ModelStatus::Loadable
+    );
+    let verified = store.verified_model(&manifest)?;
+
+    let installed_manifest = store.layout().model_dir(&manifest)?.join("manifest.json");
+    let outside_manifest = outside.path().join("identity.json");
+    std::fs::write(&outside_manifest, manifest.to_json()?)?;
+    std::fs::remove_file(&installed_manifest)?;
+    if !create_file_link(&installed_manifest, &outside_manifest)? {
+        return Ok(());
+    }
+
+    assert_eq!(store.status(&manifest)?, ModelStatus::Invalid);
+    assert!(verified.revalidate_integrity().is_err());
+
+    let discovery = TempDir::new()?;
+    let candidate = discovery.path().join("candidate");
+    std::fs::create_dir(&candidate)?;
+    if !create_file_link(&candidate.join("manifest.json"), &outside_manifest)? {
+        return Ok(());
+    }
+    assert!(
+        store
+            .discover(&[DiscoveryRoot::new(discovery.path())])?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_file_link(link: &std::path::Path, target: &std::path::Path) -> TestResult<bool> {
+    // Directory junctions are reparse points and can be created in an unprivileged Windows test
+    // environment, unlike file symlinks on hosts without Developer Mode.
+    if target.is_file() {
+        std::fs::remove_file(target)?;
+        std::fs::create_dir(target)?;
+    }
+    create_directory_link(link, target)
+}
+
+#[cfg(unix)]
+fn create_file_link(link: &std::path::Path, target: &std::path::Path) -> TestResult<bool> {
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(true)
 }
 
 #[cfg(windows)]

@@ -8,15 +8,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-impossible-embedding-core = { path = "../impossible-embedding-core" }
-impossible-models = { path = "../impossible-models" }
+impossible-embedding-core = { version = "=0.1.0", path = "../impossible-embedding-core" }
+impossible-models = { version = "=0.1.0", path = "../impossible-models" }
 ndarray = "0.16.1"
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["download-binaries", "ndarray", "std"] }
-tokenizers = { version = "0.21.4", default-features = false, features = ["onig"] }
+tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
 anyhow.workspace = true
-impossible-server-core = { path = "../impossible-server-core" }
+impossible-server-core = { version = "=0.1.0", path = "../impossible-server-core" }
 prost.workspace = true
 sha2 = "0.10.9"
 tempfile = "3.23.0"
