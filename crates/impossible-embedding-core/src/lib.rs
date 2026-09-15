@@ -348,6 +348,10 @@ impl Error for EngineFailure {}
 #[derive(Debug)]
 enum CancellationState {
     Single(AtomicBool),
+    Any {
+        cancelled: AtomicBool,
+        constituents: Arc<[CancellationToken]>,
+    },
     Composite(Arc<[ExecutionControl]>),
 }
 
@@ -362,10 +366,23 @@ impl Default for CancellationToken {
 }
 
 impl CancellationToken {
+    /// Creates an independently owned signal that becomes cancelled when it or any constituent
+    /// is cancelled. Cancelling the returned signal never mutates its constituents.
+    #[must_use]
+    pub fn any(constituents: impl Into<Arc<[CancellationToken]>>) -> Self {
+        Self(Arc::new(CancellationState::Any {
+            cancelled: AtomicBool::new(false),
+            constituents: constituents.into(),
+        }))
+    }
+
     /// Requests cancellation. Calls are idempotent.
     pub fn cancel(&self) {
         match self.0.as_ref() {
             CancellationState::Single(cancelled) => cancelled.store(true, Ordering::Release),
+            CancellationState::Any { cancelled, .. } => {
+                cancelled.store(true, Ordering::Release);
+            }
             CancellationState::Composite(constituents) => {
                 for control in constituents.iter() {
                     control.cancellation.cancel();
@@ -379,6 +396,13 @@ impl CancellationToken {
     pub fn is_cancelled(&self) -> bool {
         match self.0.as_ref() {
             CancellationState::Single(cancelled) => cancelled.load(Ordering::Acquire),
+            CancellationState::Any {
+                cancelled,
+                constituents,
+            } => {
+                cancelled.load(Ordering::Acquire)
+                    || constituents.iter().any(CancellationToken::is_cancelled)
+            }
             CancellationState::Composite(constituents) => constituents
                 .iter()
                 .all(|control| control.ensure_active().is_err()),
@@ -667,6 +691,24 @@ mod tests {
             .err()
             .unwrap_or_else(|| EngineFailure::public(ErrorCode::Internal));
         assert_eq!(error.public_error().code, ErrorCode::Cancelled);
+    }
+
+    #[test]
+    fn any_cancellation_is_one_way_and_independently_owned() {
+        let caller = CancellationToken::default();
+        let model = CancellationToken::default();
+        let combined = CancellationToken::any(vec![caller.clone(), model.clone()]);
+        assert!(!combined.is_cancelled());
+
+        combined.cancel();
+        assert!(combined.is_cancelled());
+        assert!(!caller.is_cancelled());
+        assert!(!model.is_cancelled());
+
+        let caller = CancellationToken::default();
+        let combined = CancellationToken::any(vec![caller.clone()]);
+        caller.cancel();
+        assert!(combined.is_cancelled());
     }
 
     #[test]

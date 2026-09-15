@@ -237,6 +237,7 @@ struct ModelSlot {
     sender: mpsc::Sender<Request>,
     leases: Arc<AtomicUsize>,
     accepting: Arc<AtomicBool>,
+    cancellation: CancellationToken,
     queued: Arc<AtomicUsize>,
 }
 
@@ -353,9 +354,25 @@ impl Drop for GaugeGuard {
         }
         if previous == 1 {
             if let Some(latch) = &self.zero_latch {
-                latch.notify_waiters();
+                // `notify_one` stores a permit when the shutdown waiter is between creating and
+                // polling its notification future, so the final active completion cannot be lost.
+                latch.notify_one();
             }
         }
+    }
+}
+
+async fn wait_for_active_zero(active: &AtomicUsize, latch: &Notify) {
+    while active.load(Ordering::Acquire) != 0 {
+        // Register before rechecking the predicate. This closes the interval in which the final
+        // decrement could otherwise notify an unregistered waiter and leave shutdown asleep.
+        let notified = latch.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if active.load(Ordering::Acquire) == 0 {
+            break;
+        }
+        notified.await;
     }
 }
 
@@ -412,14 +429,14 @@ struct ActiveInstall {
 }
 
 struct CancelOnDrop {
-    cancellation: CancellationToken,
+    abandonment: CancellationToken,
     armed: bool,
 }
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         if self.armed {
-            self.cancellation.cancel();
+            self.abandonment.cancel();
         }
     }
 }
@@ -558,12 +575,14 @@ impl ApplicationRuntime {
         let (sender, receiver) = mpsc::channel(self.0.policy.queue_depth);
         let leases = Arc::new(AtomicUsize::new(0));
         let accepting = Arc::new(AtomicBool::new(true));
+        let cancellation = CancellationToken::default();
         let queued = Arc::new(AtomicUsize::new(0));
         let slot = Arc::new(ModelSlot {
             key,
             sender,
             leases,
             accepting: Arc::clone(&accepting),
+            cancellation,
             queued,
         });
         models.insert(model_id.clone(), Arc::clone(&slot));
@@ -592,12 +611,35 @@ impl ApplicationRuntime {
         store: ModelStore,
         manifest: Manifest,
     ) -> Result<(), LifecycleError> {
-        let permit = self
+        let model_id = manifest.canonical_id.clone();
+        self.load_with(model_id, move || {
+            store
+                .verified_model(&manifest)
+                .map_err(|_| LifecycleError::LoadFailed)
+                .and_then(|verified| {
+                    let engine = OnnxEmbeddingEngine::new();
+                    engine
+                        .load(&verified)
+                        .map_err(|_| LifecycleError::LoadFailed)?;
+                    engine.warm().map_err(|_| LifecycleError::LoadFailed)?;
+                    Ok(Arc::new(engine) as Arc<dyn RuntimeEngine>)
+                })
+        })
+        .await
+    }
+
+    async fn load_with<F>(&self, model_id: String, load: F) -> Result<(), LifecycleError>
+    where
+        F: FnOnce() -> Result<Arc<dyn RuntimeEngine>, LifecycleError> + Send + 'static,
+    {
+        // The permit and reservation deliberately remain owned by this public future. Native
+        // initialization is not interruptible, but forced shutdown can terminate this future,
+        // release lifecycle accounting, and drop the sole capability that can publish its result.
+        let _permit = self
             .0
             .shutdown
             .admit()
             .ok_or(LifecycleError::ShuttingDown)?;
-        let model_id = manifest.canonical_id.clone();
         let key_value = self.0.next_key.fetch_add(1, Ordering::Relaxed);
         let key = ModelKey(u64::try_from(key_value).unwrap_or(u64::MAX));
         // Construct cleanup ownership before publishing the reservation. Cancellation at every
@@ -635,24 +677,23 @@ impl ApplicationRuntime {
         }
         let (tx, rx) = oneshot::channel();
         let job = Box::new(move || {
-            let _permit: WorkPermit = permit;
-            let result = store
-                .verified_model(&manifest)
-                .map_err(|_| LifecycleError::LoadFailed)
-                .and_then(|verified| {
-                    let engine = OnnxEmbeddingEngine::new();
-                    engine
-                        .load(&verified)
-                        .map_err(|_| LifecycleError::LoadFailed)?;
-                    engine.warm().map_err(|_| LifecycleError::LoadFailed)?;
-                    Ok(Arc::new(engine) as Arc<dyn RuntimeEngine>)
-                });
-            let _ = tx.send((result, reservation));
+            let _ = tx.send(load());
         }) as BlockingJob;
         if self.0.pool.try_execute(job).is_err() {
             return Err(LifecycleError::InUse);
         }
-        let (result, reservation) = rx.await.map_err(|_| LifecycleError::LoadFailed)?;
+        let mut force_stop = self.0.force_stop.subscribe();
+        if *force_stop.borrow() {
+            return Err(LifecycleError::ShuttingDown);
+        }
+        let result = tokio::select! {
+            biased;
+            changed = force_stop.changed() => {
+                let _ = changed;
+                return Err(LifecycleError::ShuttingDown);
+            }
+            result = rx => result.map_err(|_| LifecycleError::LoadFailed)?,
+        };
         let engine = match result {
             Ok(engine) => engine,
             Err(error) => return Err(error),
@@ -696,6 +737,7 @@ impl ApplicationRuntime {
         let (sender, receiver) = mpsc::channel(self.0.policy.queue_depth);
         let leases = Arc::new(AtomicUsize::new(0));
         let accepting = Arc::new(AtomicBool::new(true));
+        let cancellation = CancellationToken::default();
         let queued = Arc::new(AtomicUsize::new(0));
         models.insert(
             model_id.clone(),
@@ -704,6 +746,7 @@ impl ApplicationRuntime {
                 sender,
                 leases,
                 accepting: Arc::clone(&accepting),
+                cancellation,
                 queued,
             }),
         );
@@ -916,7 +959,13 @@ impl ApplicationRuntime {
             .map_err(|_| EngineFailure::public(ErrorCode::ModelUnavailable))?;
         let effective_deadline =
             deadline.map_or(server_deadline, |caller| caller.min(server_deadline));
-        let control = ExecutionControl::new(cancellation.clone(), Some(effective_deadline));
+        let abandonment = CancellationToken::default();
+        let request_cancellation = CancellationToken::any(vec![
+            cancellation,
+            abandonment.clone(),
+            slot.cancellation.clone(),
+        ]);
+        let control = ExecutionControl::new(request_cancellation, Some(effective_deadline));
         control.ensure_active()?;
         let queue = QueuePermit::acquire(
             Arc::clone(&slot.queued),
@@ -943,7 +992,7 @@ impl ApplicationRuntime {
         })?;
         await_response(
             control,
-            cancellation,
+            abandonment,
             receive,
             self.0.force_stop.subscribe(),
             effective_deadline,
@@ -1050,6 +1099,7 @@ impl ApplicationRuntime {
         if let Ok(models) = self.0.models.read() {
             for slot in models.values() {
                 slot.accepting.store(false, Ordering::Release);
+                slot.cancellation.cancel();
             }
         }
         if !drained {
@@ -1089,12 +1139,7 @@ impl ApplicationRuntime {
             // The force-stop watch makes every admitted public request future terminal without
             // waiting for a non-cooperative native call. Do not publish Stopped before they have
             // observed that terminal state and released their shutdown permits.
-            while self.0.active.load(Ordering::Acquire) != 0 {
-                let notified = self.0.active_zero.notified();
-                if self.0.active.load(Ordering::Acquire) != 0 {
-                    notified.await;
-                }
-            }
+            wait_for_active_zero(&self.0.active, &self.0.active_zero).await;
             while !self.0.shutdown.wait(Duration::ZERO) {
                 tokio::task::yield_now().await;
             }
@@ -1109,13 +1154,13 @@ impl ApplicationRuntime {
 
 async fn await_response(
     control: ExecutionControl,
-    cancellation: CancellationToken,
+    abandonment: CancellationToken,
     mut receive: oneshot::Receiver<Result<EmbeddingOutput, EngineFailure>>,
     mut force_stop: watch::Receiver<bool>,
     deadline: Instant,
 ) -> Result<EmbeddingOutput, EngineFailure> {
     let mut cancel_on_drop = CancelOnDrop {
-        cancellation: cancellation.clone(),
+        abandonment,
         armed: true,
     };
     let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
@@ -1137,10 +1182,9 @@ async fn await_response(
                 }
             }
             () = &mut sleep => {
-                if cancellation.is_cancelled() {
-                    break Err(EngineFailure::public(ErrorCode::Cancelled));
-                }
-                break Err(EngineFailure::public(ErrorCode::DeadlineExceeded));
+                break control.ensure_active().and_then(|()| {
+                    Err(EngineFailure::public(ErrorCode::DeadlineExceeded))
+                });
             }
             response = &mut receive => {
                 if let Err(error) = control.ensure_active() {
@@ -1908,6 +1952,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn abandoning_one_request_does_not_cancel_a_shared_caller_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut limits = policy();
+        limits.max_batch_wait = Duration::ZERO;
+        let runtime = ApplicationRuntime::new(limits)?;
+        let slow = Arc::new(FakeEngine::new(Duration::from_millis(40)));
+        runtime.register_engine("fake", slow.clone())?;
+        let shared = CancellationToken::default();
+
+        let first_runtime = runtime.clone();
+        let first_shared = shared.clone();
+        let first = tokio::spawn(async move {
+            first_runtime
+                .embed(
+                    "fake",
+                    vec!["abandoned".into()],
+                    EmbedOptions::default(),
+                    first_shared,
+                    None,
+                )
+                .await
+        });
+        while slow.calls.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let survivor_runtime = runtime.clone();
+        let survivor_shared = shared.clone();
+        let survivor = tokio::spawn(async move {
+            survivor_runtime
+                .embed(
+                    "fake",
+                    vec!["survivor".into()],
+                    EmbedOptions::default(),
+                    survivor_shared,
+                    None,
+                )
+                .await
+        });
+        while !runtime
+            .metrics()
+            .render()
+            .contains("impossible_queue_depth 1")
+        {
+            tokio::task::yield_now().await;
+        }
+        first.abort();
+        let _ = first.await;
+
+        let output = tokio::time::timeout(Duration::from_millis(250), survivor).await???;
+        assert_eq!(output.vectors.len(), 1);
+        assert!(!shared.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exact_queue_capacity_and_abort_safe_gauges() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut limits = policy();
@@ -2010,6 +2110,67 @@ mod tests {
             .ok_or("forced shutdown must fail accepted request")?;
         assert_eq!(error.public_error().code, ErrorCode::ModelUnavailable);
         assert!(!runtime.health().is_live());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_detaches_hung_load_and_fences_late_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let (release, blocked) = std::sync::mpsc::sync_channel::<()>(0);
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let load_started = Arc::clone(&started);
+        let load_finished = Arc::clone(&finished);
+        let load_runtime = runtime.clone();
+        let load = tokio::spawn(async move {
+            load_runtime
+                .load_with("hung".into(), move || {
+                    load_started.store(true, Ordering::Release);
+                    let _ = blocked.recv();
+                    load_finished.store(true, Ordering::Release);
+                    Ok(Arc::new(FakeEngine::new(Duration::ZERO)) as Arc<dyn RuntimeEngine>)
+                })
+                .await
+        });
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        let drained =
+            tokio::time::timeout(Duration::from_millis(250), runtime.shutdown(Duration::ZERO))
+                .await?;
+        assert!(!drained);
+        assert!(!runtime.health().is_live());
+        assert_eq!(load.await?, Err(LifecycleError::ShuttingDown));
+
+        release.send(())?;
+        while !finished.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(runtime.snapshot().registered_models, 0);
+        assert_eq!(runtime.health().model_counts(), (0, 0));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_zero_latch_cannot_miss_final_completion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..500 {
+            let active = Arc::new(AtomicUsize::new(1));
+            let latch = Arc::new(Notify::new());
+            let wait_active = Arc::clone(&active);
+            let wait_latch = Arc::clone(&latch);
+            let waiter = tokio::spawn(async move {
+                wait_for_active_zero(&wait_active, &wait_latch).await;
+            });
+            tokio::task::yield_now().await;
+            let previous = active.fetch_sub(1, Ordering::AcqRel);
+            assert_eq!(previous, 1);
+            latch.notify_one();
+            tokio::time::timeout(Duration::from_millis(50), waiter).await??;
+        }
         Ok(())
     }
 
