@@ -265,6 +265,30 @@ struct SchedulerTask {
     handle: JoinHandle<()>,
 }
 
+struct SchedulerCandidate {
+    stop: watch::Sender<bool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl SchedulerCandidate {
+    fn into_task(mut self) -> Result<SchedulerTask, LifecycleError> {
+        let handle = self.handle.take().ok_or(LifecycleError::LoadFailed)?;
+        Ok(SchedulerTask {
+            stop: self.stop.clone(),
+            handle,
+        })
+    }
+}
+
+impl Drop for SchedulerCandidate {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = self.stop.send(true);
+            handle.abort();
+        }
+    }
+}
+
 // `catch_unwind` does not suppress Rust's default panic hook: the hook runs first and can print
 // adapter-owned payloads and source paths. Installing this once gives every native worker a
 // process-wide, payload-free policy. Rust has no stable thread-local panic hook, so embedders that
@@ -476,10 +500,15 @@ impl Drop for InstallRegistration {
 }
 
 impl LoadReservation {
-    fn publish(mut self, engine: Arc<dyn RuntimeEngine>) -> Result<(), LifecycleError> {
+    async fn publish(
+        mut self,
+        executor: tokio::runtime::Handle,
+        engine: Arc<dyn RuntimeEngine>,
+    ) -> Result<(), LifecycleError> {
         let result = self
             .runtime
-            .register_reserved_engine(self.model_id.clone(), self.key, engine);
+            .register_reserved_engine(self.model_id.clone(), self.key, executor, engine)
+            .await;
         if result.is_ok() {
             self.armed = false;
         }
@@ -591,13 +620,12 @@ impl ApplicationRuntime {
             .models
             .write()
             .map_err(|_| LifecycleError::LoadFailed)?;
-        if models.contains_key(&model_id)
-            || self
-                .0
-                .loading
-                .lock()
-                .is_ok_and(|loading| loading.contains_key(&model_id))
-        {
+        let loading = self
+            .0
+            .loading
+            .lock()
+            .map_err(|_| LifecycleError::LoadFailed)?;
+        if models.contains_key(&model_id) || loading.contains_key(&model_id) {
             return Err(LifecycleError::AlreadyLoaded);
         }
         let key_value = self.0.next_key.fetch_add(1, Ordering::Relaxed);
@@ -617,20 +645,42 @@ impl ApplicationRuntime {
             cancellation,
             queued,
         });
-        models.insert(model_id.clone(), Arc::clone(&slot));
-        drop(models);
-        self.0.health.set_model(key, ModelState::Ready);
         let policy = self.0.policy;
         let pool = self.0.pool.clone();
         let (stop, stop_rx) = watch::channel(false);
+        let scheduler_model_id = model_id.clone();
         let handle = executor.spawn(run_scheduler(
-            receiver, model_id, engine, policy, pool, accepting, stop_rx,
+            receiver,
+            scheduler_model_id,
+            engine,
+            policy,
+            pool,
+            accepting,
+            stop_rx,
         ));
-        self.0
+        let candidate = SchedulerCandidate {
+            stop,
+            handle: Some(handle),
+        };
+        if candidate
+            .handle
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(LifecycleError::LoadFailed);
+        }
+        let mut schedulers = self
+            .0
             .schedulers
             .lock()
-            .map_err(|_| LifecycleError::LoadFailed)?
-            .insert(key, SchedulerTask { stop, handle });
+            .map_err(|_| LifecycleError::LoadFailed)?;
+        if self.0.draining.load(Ordering::Acquire) {
+            return Err(LifecycleError::ShuttingDown);
+        }
+        let scheduler = candidate.into_task()?;
+        schedulers.insert(key, scheduler);
+        models.insert(model_id, Arc::clone(&slot));
+        self.0.health.set_model(key, ModelState::Ready);
         Ok(())
     }
 
@@ -664,6 +714,11 @@ impl ApplicationRuntime {
     where
         F: FnOnce() -> Result<Arc<dyn RuntimeEngine>, LifecycleError> + Send + 'static,
     {
+        // Capture the executor on the first poll, before admission or any lifecycle publication.
+        // Completion is allowed to be polled from another thread without an ambient Tokio context,
+        // while a future first polled outside Tokio fails without leaving a loading reservation.
+        let executor =
+            tokio::runtime::Handle::try_current().map_err(|_| LifecycleError::LoadFailed)?;
         // The permit and reservation deliberately remain owned by this public future. Native
         // initialization is not interruptible, but forced shutdown can terminate this future,
         // release lifecycle accounting, and drop the sole capability that can publish its result.
@@ -730,15 +785,64 @@ impl ApplicationRuntime {
             Ok(engine) => engine,
             Err(error) => return Err(error),
         };
-        reservation.publish(engine)
+        reservation.publish(executor, engine).await
     }
 
-    fn register_reserved_engine(
+    async fn register_reserved_engine(
         &self,
         model_id: String,
         key: ModelKey,
+        executor: tokio::runtime::Handle,
         engine: Arc<dyn RuntimeEngine>,
     ) -> Result<(), LifecycleError> {
+        let (sender, receiver) = mpsc::channel(self.0.policy.queue_depth);
+        let leases = Arc::new(AtomicUsize::new(0));
+        let accepting = Arc::new(AtomicBool::new(true));
+        let cancellation = CancellationToken::default();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let slot = Arc::new(ModelSlot {
+            key,
+            sender,
+            leases,
+            accepting: Arc::clone(&accepting),
+            cancellation,
+            queued,
+        });
+        let (stop, stop_rx) = watch::channel(false);
+        let (started, startup) = oneshot::channel();
+        let policy = self.0.policy;
+        let pool = self.0.pool.clone();
+        let scheduler_model_id = model_id.clone();
+        let handle = executor.spawn(async move {
+            if started.send(()).is_err() {
+                return;
+            }
+            run_scheduler(
+                receiver,
+                scheduler_model_id,
+                engine,
+                policy,
+                pool,
+                accepting,
+                stop_rx,
+            )
+            .await;
+        });
+        let candidate = SchedulerCandidate {
+            stop,
+            handle: Some(handle),
+        };
+        // A handle captured from a runtime that has since been torn down accepts `spawn`, but the
+        // task is cancelled without running. The startup handshake turns that into a stable error
+        // before any model, scheduler, or ready-health publication.
+        startup.await.map_err(|_| LifecycleError::LoadFailed)?;
+        if candidate
+            .handle
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(LifecycleError::LoadFailed);
+        }
         let _admin = self
             .0
             .admin
@@ -755,50 +859,37 @@ impl ApplicationRuntime {
         if models.contains_key(&model_id) {
             return Err(LifecycleError::AlreadyLoaded);
         }
-        {
-            let mut loading = self
-                .0
-                .loading
-                .lock()
-                .map_err(|_| LifecycleError::LoadFailed)?;
-            if loading.get(&model_id) != Some(&key) {
-                return Err(LifecycleError::LoadFailed);
-            }
-            loading.remove(&model_id);
+        let mut loading = self
+            .0
+            .loading
+            .lock()
+            .map_err(|_| LifecycleError::LoadFailed)?;
+        if loading.get(&model_id) != Some(&key) {
+            return Err(LifecycleError::LoadFailed);
         }
-        let (sender, receiver) = mpsc::channel(self.0.policy.queue_depth);
-        let leases = Arc::new(AtomicUsize::new(0));
-        let accepting = Arc::new(AtomicBool::new(true));
-        let cancellation = CancellationToken::default();
-        let queued = Arc::new(AtomicUsize::new(0));
-        models.insert(
-            model_id.clone(),
-            Arc::new(ModelSlot {
-                key,
-                sender,
-                leases,
-                accepting: Arc::clone(&accepting),
-                cancellation,
-                queued,
-            }),
-        );
-        drop(models);
-        self.0.health.set_model(key, ModelState::Ready);
-        let (stop, stop_rx) = watch::channel(false);
-        let handle = tokio::spawn(run_scheduler(
-            receiver,
-            model_id,
-            engine,
-            self.0.policy,
-            self.0.pool.clone(),
-            accepting,
-            stop_rx,
-        ));
-        self.0
+        let mut schedulers = self
+            .0
             .schedulers
             .lock()
-            .map_err(|_| LifecycleError::LoadFailed)?
-            .insert(key, SchedulerTask { stop, handle });
+            .map_err(|_| LifecycleError::LoadFailed)?;
+        if self.0.draining.load(Ordering::Acquire) {
+            return Err(LifecycleError::ShuttingDown);
+        }
+        if candidate
+            .handle
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(LifecycleError::LoadFailed);
+        }
+
+        // Every fallible lock and shutdown check precedes this publication block. Candidate owns
+        // scheduler rollback until it is transferred into the scheduler registry.
+        let scheduler = candidate.into_task()?;
+        schedulers.insert(key, scheduler);
+        models.insert(model_id.clone(), slot);
+        loading.remove(&model_id);
+        self.0.health.set_model(key, ModelState::Ready);
         Ok(())
     }
 
@@ -1790,6 +1881,163 @@ mod tests {
         assert_eq!(runtime.health().model_counts(), (0, 0));
         assert!(
             runtime
+                .0
+                .schedulers
+                .lock()
+                .is_ok_and(|schedulers| schedulers.is_empty())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completed_load_can_be_polled_outside_its_tokio_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let runtime = ApplicationRuntime::new(policy())?;
+        let observer = runtime.clone();
+        let (started, wait_started) = std::sync::mpsc::sync_channel(0);
+        let (release, wait_release) = std::sync::mpsc::sync_channel(0);
+        let mut load = Box::pin(async move {
+            runtime
+                .load_with("portable-poll".into(), move || {
+                    started.send(()).map_err(|_| LifecycleError::LoadFailed)?;
+                    wait_release
+                        .recv()
+                        .map_err(|_| LifecycleError::LoadFailed)?;
+                    Ok(Arc::new(FakeEngine::new(Duration::ZERO)) as Arc<dyn RuntimeEngine>)
+                })
+                .await
+        });
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        {
+            let _entered = executor.enter();
+            assert!(matches!(load.as_mut().poll(&mut context), Poll::Pending));
+        }
+        wait_started.recv_timeout(Duration::from_secs(1))?;
+        release.send(())?;
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let result = loop {
+            match load.as_mut().poll(&mut context) {
+                Poll::Ready(result) => break result,
+                Poll::Pending if Instant::now() < deadline => thread::yield_now(),
+                Poll::Pending => return Err("load did not complete outside Tokio context".into()),
+            }
+        };
+        assert_eq!(result, Ok(()));
+        assert_eq!(observer.snapshot().registered_models, 1);
+        assert_eq!(observer.health().model_counts(), (1, 1));
+        assert!(
+            observer
+                .0
+                .schedulers
+                .lock()
+                .is_ok_and(|schedulers| schedulers.len() == 1)
+        );
+        executor.block_on(async { assert!(observer.shutdown(Duration::from_secs(1)).await) });
+        Ok(())
+    }
+
+    #[test]
+    fn load_first_polled_without_tokio_fails_before_lifecycle_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let observer = runtime.clone();
+        let load_ran = Arc::new(AtomicBool::new(false));
+        let load_ran_in_job = Arc::clone(&load_ran);
+        let mut load = Box::pin(async move {
+            runtime
+                .load_with("no-executor".into(), move || {
+                    load_ran_in_job.store(true, Ordering::Release);
+                    Ok(Arc::new(FakeEngine::new(Duration::ZERO)) as Arc<dyn RuntimeEngine>)
+                })
+                .await
+        });
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        let result = catch_unwind(AssertUnwindSafe(|| load.as_mut().poll(&mut context)))
+            .map_err(|_| "load panicked without Tokio")?;
+
+        assert_eq!(result, Poll::Ready(Err(LifecycleError::LoadFailed)));
+        assert!(!load_ran.load(Ordering::Acquire));
+        assert_eq!(observer.snapshot().registered_models, 0);
+        assert_eq!(observer.health().model_counts(), (0, 0));
+        assert!(
+            observer
+                .0
+                .loading
+                .lock()
+                .is_ok_and(|loading| loading.is_empty())
+        );
+        assert!(
+            observer
+                .0
+                .schedulers
+                .lock()
+                .is_ok_and(|schedulers| schedulers.is_empty())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_teardown_before_load_publication_is_atomic() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let runtime = ApplicationRuntime::new(policy())?;
+        let observer = runtime.clone();
+        let (started, wait_started) = std::sync::mpsc::sync_channel(0);
+        let (release, wait_release) = std::sync::mpsc::sync_channel(0);
+        let (finished, wait_finished) = std::sync::mpsc::sync_channel(0);
+        let mut load = Box::pin(async move {
+            runtime
+                .load_with("torn-down-runtime".into(), move || {
+                    started.send(()).map_err(|_| LifecycleError::LoadFailed)?;
+                    wait_release
+                        .recv()
+                        .map_err(|_| LifecycleError::LoadFailed)?;
+                    finished.send(()).map_err(|_| LifecycleError::LoadFailed)?;
+                    Ok(Arc::new(FakeEngine::new(Duration::ZERO)) as Arc<dyn RuntimeEngine>)
+                })
+                .await
+        });
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        {
+            let _entered = executor.enter();
+            assert!(matches!(load.as_mut().poll(&mut context), Poll::Pending));
+        }
+        wait_started.recv_timeout(Duration::from_secs(1))?;
+        drop(executor);
+        release.send(())?;
+        wait_finished.recv_timeout(Duration::from_secs(1))?;
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let result = loop {
+            match load.as_mut().poll(&mut context) {
+                Poll::Ready(result) => break result,
+                Poll::Pending if Instant::now() < deadline => thread::yield_now(),
+                Poll::Pending => return Err("load remained pending after runtime teardown".into()),
+            }
+        };
+        assert_eq!(result, Err(LifecycleError::LoadFailed));
+        assert_eq!(observer.snapshot().registered_models, 0);
+        assert_eq!(observer.health().model_counts(), (0, 0));
+        assert!(
+            observer
+                .0
+                .loading
+                .lock()
+                .is_ok_and(|loading| loading.is_empty())
+        );
+        assert!(
+            observer
                 .0
                 .schedulers
                 .lock()
