@@ -326,6 +326,68 @@ fn artifact_fingerprint_is_independent_of_manifest_artifact_order() -> TestResul
 }
 
 #[test]
+fn semantic_identity_and_cache_key_cover_every_inference_setting() -> TestResult {
+    let temp = TempDir::new()?;
+    let body = b"same artifact bytes";
+    let base = fixture("https://example.invalid/model".into(), body, None);
+    let base_fingerprint = base.semantic_fingerprint()?;
+    let base_directory = ModelStore::new(temp.path())?.layout().model_dir(&base)?;
+
+    let mut variants = Vec::new();
+    let mut changed = base.clone();
+    changed.tokenizer.kind = "different-tokenizer".into();
+    variants.push(changed);
+    let mut changed = base.clone();
+    changed.tokenizer.max_tokens += 1;
+    variants.push(changed);
+    let mut changed = base.clone();
+    changed.tokenizer.lowercase = true;
+    variants.push(changed);
+    let mut changed = base.clone();
+    changed.pooling = Pooling::Cls;
+    variants.push(changed);
+    let mut changed = base.clone();
+    changed.prefixes.query = "query: ".into();
+    variants.push(changed);
+    let mut changed = base.clone();
+    changed.dimensions.matryoshka = vec![1];
+    variants.push(changed);
+    let mut changed = base.clone();
+    changed.tensors.architecture = "different-architecture".into();
+    variants.push(changed);
+    let mut changed = base.clone();
+    changed.artifacts[0].path = "weights/alternate.bin".into();
+    variants.push(changed);
+
+    for variant in variants {
+        assert_ne!(base_fingerprint, variant.semantic_fingerprint()?);
+        assert_ne!(
+            base_directory,
+            ModelStore::new(temp.path())?.layout().model_dir(&variant)?
+        );
+    }
+
+    let mut trust_and_location_only = base.clone();
+    trust_and_location_only.semantic_verification = SemanticVerification::Unverified {
+        reason: "different trust state".into(),
+    };
+    trust_and_location_only.license.spdx = "Apache-2.0".into();
+    trust_and_location_only.license.source_url = "https://example.invalid/other-license".into();
+    trust_and_location_only.artifacts[0].url = "https://mirror.example.invalid/model".into();
+    assert_eq!(
+        base_fingerprint,
+        trust_and_location_only.semantic_fingerprint()?
+    );
+    assert_eq!(
+        base_directory,
+        ModelStore::new(temp.path())?
+            .layout()
+            .model_dir(&trust_and_location_only)?
+    );
+    Ok(())
+}
+
+#[test]
 fn corrupt_exact_identity_is_quarantined_and_repaired() -> TestResult {
     let temp = TempDir::new()?;
     let source = TempDir::new()?;
@@ -339,7 +401,7 @@ fn corrupt_exact_identity_is_quarantined_and_repaired() -> TestResult {
         ModelStatus::IntegrityVerified
     );
     std::fs::write(
-        store.layout().model_dir(&manifest).join("manifest.json"),
+        store.layout().model_dir(&manifest)?.join("manifest.json"),
         b"{",
     )?;
     assert_eq!(store.status(&manifest)?, ModelStatus::Invalid);
@@ -348,7 +410,7 @@ fn corrupt_exact_identity_is_quarantined_and_repaired() -> TestResult {
         ModelStatus::IntegrityVerified
     );
     assert!(temp.path().join("quarantine").read_dir()?.next().is_some());
-    std::fs::remove_file(store.layout().model_dir(&manifest).join("manifest.json"))?;
+    std::fs::remove_file(store.layout().model_dir(&manifest)?.join("manifest.json"))?;
     assert_eq!(store.status(&manifest)?, ModelStatus::Invalid);
     assert_eq!(
         store.import(&manifest, source.path())?,
@@ -396,7 +458,7 @@ fn verification_rejects_intermediate_link_or_junction() -> TestResult {
     store.import(&manifest, source.path())?;
 
     std::fs::write(outside.path().join("model.bin"), body)?;
-    let weights = store.layout().model_dir(&manifest).join("weights");
+    let weights = store.layout().model_dir(&manifest)?.join("weights");
     std::fs::remove_dir_all(&weights)?;
     if !create_directory_link(&weights, outside.path())? {
         return Ok(());

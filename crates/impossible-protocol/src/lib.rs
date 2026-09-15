@@ -91,6 +91,7 @@ mod tests {
                 revision: "immutable-revision".into(),
                 runtime: "onnx-runtime@1".into(),
                 artifact_fingerprint: "sha256:artifact".into(),
+                semantic_fingerprint: "sha256:semantics".into(),
             }),
         };
         let Some(identity) = response.model else {
@@ -98,6 +99,7 @@ mod tests {
         };
         assert_ne!(request.model, identity.canonical_id);
         assert!(!identity.artifact_fingerprint.is_empty());
+        assert!(!identity.semantic_fingerprint.is_empty());
         Ok(())
     }
 

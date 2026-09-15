@@ -6,8 +6,9 @@ origins.
 
 ## Cache contract
 
-The caller chooses the cache root. Exact model identities are mapped to a SHA-256 key so registry
-names can never become filesystem paths:
+The caller chooses the cache root. Exact model identities are mapped by the canonical semantic
+SHA-256 fingerprint so registry names can never become filesystem paths and the same revision and
+bytes with different inference settings cannot share cache state:
 
 ```text
 <root>/
@@ -32,6 +33,12 @@ target from the requested identity, requires the complete stored manifest to mat
 containment, and rejects symbolic links and Windows reparse points before removal. A verified model
 capability holds a shared in-use lease; deletion and replacement cannot proceed while a runtime
 retains that capability.
+
+Artifact paths follow a deliberately conservative portable subset: slash-separated ASCII
+alphanumeric, dash, underscore, and dot components. Empty components, traversal, backslashes,
+colons/alternate data streams, trailing dots or spaces, Unicode filesystem aliases, DOS device
+names, and case-insensitive collisions are rejected before filesystem access. `manifest.json` is
+reserved for the installed identity record.
 
 ## Trust states
 

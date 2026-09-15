@@ -56,6 +56,7 @@ message ResolvedModelIdentity {
   string revision = 2;
   string runtime = 3;
   string artifact_fingerprint = 4;
+  string semantic_fingerprint = 5;
 }
 
 message DenseVector {

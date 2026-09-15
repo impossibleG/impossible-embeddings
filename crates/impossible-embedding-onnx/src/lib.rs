@@ -136,6 +136,9 @@ impl OnnxEmbeddingEngine {
             manifest.revision.clone(),
             format!("{ENGINE_NAME}@{}", env!("CARGO_PKG_VERSION")),
             verified.artifact_fingerprint(),
+            manifest
+                .semantic_fingerprint()
+                .map_err(|e| EngineFailure::with_source(ErrorCode::Internal, e))?,
         )?;
         Ok(LoadedModel {
             manifest,
@@ -412,25 +415,41 @@ fn validate_graph_contract(
         Some(contract.inputs.input_ids.as_str()),
         contract.inputs.attention_mask.as_deref(),
         contract.inputs.token_type_ids.as_deref(),
-    ];
-    let has_inputs = required_inputs
-        .into_iter()
-        .flatten()
-        .all(|name| available_inputs.contains(name));
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<BTreeSet<_>>();
+    let has_exact_inputs = available_inputs.len() == session.inputs.len()
+        && required_inputs.len() == session.inputs.len()
+        && available_inputs == required_inputs;
+    let valid_inputs = has_exact_inputs
+        && session.inputs.iter().all(|input| {
+            matches!(
+                &input.input_type,
+                ValueType::Tensor { ty, shape, .. }
+                    if *ty == TensorElementType::Int64 && shape.len() == 2
+            )
+        });
+    let output_count = session
+        .outputs
+        .iter()
+        .filter(|output| output.name == contract.output)
+        .count();
     let output = session
         .outputs
         .iter()
         .find(|output| output.name == contract.output);
-    let valid_output = output.is_some_and(|output| match &output.output_type {
-        ValueType::Tensor { ty, shape, .. } if *ty == TensorElementType::Float32 => {
-            matches!(shape.len(), 2 | 3)
-                && shape.last().is_some_and(|hidden| {
-                    *hidden < 0 || u32::try_from(*hidden).ok() == Some(native_dimensions)
-                })
-        }
-        _ => false,
-    });
-    if !has_inputs || !valid_output {
+    let valid_output = output_count == 1
+        && output.is_some_and(|output| match &output.output_type {
+            ValueType::Tensor { ty, shape, .. } if *ty == TensorElementType::Float32 => {
+                matches!(shape.len(), 2 | 3)
+                    && shape.last().is_some_and(|hidden| {
+                        *hidden < 0 || u32::try_from(*hidden).ok() == Some(native_dimensions)
+                    })
+            }
+            _ => false,
+        });
+    if !valid_inputs || !valid_output {
         return Err(EngineFailure::public(ErrorCode::InvalidRequest));
     }
     Ok(())

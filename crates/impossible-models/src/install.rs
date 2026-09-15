@@ -139,7 +139,7 @@ impl Installer {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let lock = acquire_lock(self.store.layout().lock_file(manifest), cancel).await?;
+        let lock = acquire_lock(self.store.layout().lock_file(manifest)?, cancel).await?;
         let existing = self.store.status(manifest)?;
         if matches!(
             existing,
@@ -148,7 +148,7 @@ impl Installer {
             drop(lock);
             return Ok(existing);
         }
-        let staging = self.store.layout().staging_dir(manifest);
+        let staging = self.store.layout().staging_dir(manifest)?;
         prepare_staging(self.store.layout(), &staging)?;
         for artifact in &manifest.artifacts {
             if artifact.size > self.options.max_artifact_bytes {

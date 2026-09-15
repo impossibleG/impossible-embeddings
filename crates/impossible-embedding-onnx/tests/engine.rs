@@ -304,6 +304,20 @@ fn write_fixture(root: &Path) -> Result<Manifest> {
     })
 }
 
+fn replace_model(root: &Path, manifest: &mut Manifest, model: &ModelProto) -> Result<()> {
+    let mut bytes = Vec::new();
+    model.encode(&mut bytes)?;
+    fs::write(root.join("model.onnx"), &bytes)?;
+    let artifact = manifest
+        .artifacts
+        .iter_mut()
+        .find(|artifact| artifact.path == "model.onnx")
+        .context("fixture model artifact")?;
+    artifact.sha256 = digest(&bytes);
+    artifact.size = u64::try_from(bytes.len())?;
+    Ok(())
+}
+
 fn setup() -> Result<(tempfile::TempDir, OnnxEmbeddingEngine)> {
     let directory = tempfile::tempdir()?;
     let source = directory.path().join("source");
@@ -471,6 +485,99 @@ fn rejects_declared_native_width_that_disagrees_with_2d_graph() -> Result<()> {
 }
 
 #[test]
+fn load_rejects_extra_or_malformed_session_inputs_before_warmup() -> Result<()> {
+    let mut extra = cast_model();
+    extra
+        .graph
+        .as_mut()
+        .context("fixture graph")?
+        .input
+        .push(tensor_value("token_type_ids", 7));
+    let mut wrong_dtype = cast_model();
+    wrong_dtype.graph.as_mut().context("fixture graph")?.input[0] = tensor_value("input_ids", 6);
+    let mut wrong_rank = cast_model();
+    wrong_rank.graph.as_mut().context("fixture graph")?.input[0]
+        .r#type
+        .as_mut()
+        .and_then(|value| value.tensor_type.as_mut())
+        .and_then(|value| value.shape.as_mut())
+        .context("fixture input shape")?
+        .dim
+        .pop();
+
+    for (case, graph, expected_code) in [
+        ("extra", extra, ErrorCode::InvalidRequest),
+        ("wrong_dtype", wrong_dtype, ErrorCode::InvalidRequest),
+        // ONNX Runtime itself rejects this invalid graph before exposing session metadata.
+        ("wrong_rank", wrong_rank, ErrorCode::ModelUnavailable),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source");
+        fs::create_dir(&source)?;
+        let mut manifest = write_fixture(&source)?;
+        replace_model(&source, &mut manifest, &graph)?;
+        let store = trusted_store(directory.path().join("cache"), &manifest)?;
+        assert_eq!(store.import(&manifest, &source)?, ModelStatus::Loadable);
+        let verified = store.verified_model(&manifest)?;
+        let Err(error) = OnnxEmbeddingEngine::new().load(&verified) else {
+            anyhow::bail!("{case} graph input contract must fail during load");
+        };
+        assert_eq!(
+            error.public_error().code,
+            expected_code,
+            "unexpected failure class for {case}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn semantic_identity_covers_complete_onnx_runtime_contract() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source");
+    fs::create_dir(&source)?;
+    let base = write_fixture(&source)?;
+    let base_fingerprint = base.semantic_fingerprint()?;
+
+    for runtime in [
+        RuntimeMetadata::Onnx {
+            model_file: "model.onnx".into(),
+            tokenizer_file: "tokenizer.json".into(),
+            inputs: OnnxInputNames {
+                input_ids: "input_ids".into(),
+                attention_mask: Some("attention_mask".into()),
+                token_type_ids: None,
+            },
+            output: "sentence_embedding".into(),
+            pad_token_id: 7,
+            normalize: true,
+        },
+        RuntimeMetadata::Onnx {
+            model_file: "model.onnx".into(),
+            tokenizer_file: "tokenizer.json".into(),
+            inputs: OnnxInputNames {
+                input_ids: "input_ids".into(),
+                attention_mask: Some("attention_mask".into()),
+                token_type_ids: None,
+            },
+            output: "sentence_embedding".into(),
+            pad_token_id: 0,
+            normalize: false,
+        },
+    ] {
+        let mut changed = base.clone();
+        changed.runtime = runtime;
+        assert_ne!(base_fingerprint, changed.semantic_fingerprint()?);
+    }
+
+    let store = trusted_store(directory.path().join("cache"), &base)?;
+    store.import(&base, &source)?;
+    let identity = OnnxEmbeddingEngine::new().load(&store.verified_model(&base)?)?;
+    assert_eq!(identity.semantic_fingerprint, base_fingerprint);
+    Ok(())
+}
+
+#[test]
 fn load_rehashes_verified_artifacts_and_loaded_engine_retains_delete_lease() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let source = directory.path().join("source");
@@ -480,7 +587,7 @@ fn load_rehashes_verified_artifacts_and_loaded_engine_retains_delete_lease() -> 
     store.import(&manifest, &source)?;
     let verified = store.verified_model(&manifest)?;
     fs::write(
-        store.layout().model_dir(&manifest).join("tokenizer.json"),
+        store.layout().model_dir(&manifest)?.join("tokenizer.json"),
         b"tampered",
     )?;
     assert!(OnnxEmbeddingEngine::new().load(&verified).is_err());

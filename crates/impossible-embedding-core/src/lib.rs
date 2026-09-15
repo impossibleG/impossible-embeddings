@@ -126,6 +126,8 @@ pub struct ResolvedModelIdentity {
     pub runtime: String,
     /// Content fingerprint covering all inference-affecting artifacts.
     pub artifact_fingerprint: String,
+    /// Canonical fingerprint covering the complete inference semantics and artifact content.
+    pub semantic_fingerprint: String,
 }
 
 impl ResolvedModelIdentity {
@@ -139,18 +141,21 @@ impl ResolvedModelIdentity {
         revision: impl Into<String>,
         runtime: impl Into<String>,
         artifact_fingerprint: impl Into<String>,
+        semantic_fingerprint: impl Into<String>,
     ) -> Result<Self, EngineFailure> {
         let identity = Self {
             canonical_id: canonical_id.into(),
             revision: revision.into(),
             runtime: runtime.into(),
             artifact_fingerprint: artifact_fingerprint.into(),
+            semantic_fingerprint: semantic_fingerprint.into(),
         };
         if [
             &identity.canonical_id,
             &identity.revision,
             &identity.runtime,
             &identity.artifact_fingerprint,
+            &identity.semantic_fingerprint,
         ]
         .into_iter()
         .any(|value| value.trim().is_empty())
@@ -455,6 +460,7 @@ mod tests {
             "revision-sha256",
             "test-runtime@1",
             "sha256:artifact",
+            "sha256:semantics",
         )
     }
 

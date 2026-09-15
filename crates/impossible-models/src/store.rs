@@ -13,7 +13,10 @@ use std::{
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
-use crate::{Error, Manifest, ModelStatus, Result};
+use crate::{
+    Artifact, Dimensions, Error, Manifest, ModelStatus, Pooling, Prefixes, Result, RuntimeMetadata,
+    TensorMetadata, TokenizerMetadata,
+};
 
 const MANIFEST_FILE: &str = "manifest.json";
 static QUARANTINE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -113,28 +116,31 @@ impl CacheLayout {
         &self.root
     }
 
-    pub(crate) fn key(manifest: &Manifest) -> String {
-        let mut digest = Sha256::new();
-        digest.update(manifest.canonical_id.as_bytes());
-        digest.update([0]);
-        digest.update(manifest.revision.as_bytes());
-        format!("{:x}", digest.finalize())
+    pub(crate) fn key(manifest: &Manifest) -> Result<String> {
+        Ok(manifest
+            .semantic_fingerprint()?
+            .trim_start_matches("sha256:")
+            .to_owned())
     }
 
     /// Final directory for an exact immutable identity.
-    #[must_use]
-    pub fn model_dir(&self, manifest: &Manifest) -> PathBuf {
-        self.root.join("models").join(Self::key(manifest))
+    ///
+    /// # Errors
+    /// Returns an error when the manifest is invalid or cannot be canonically fingerprinted.
+    pub fn model_dir(&self, manifest: &Manifest) -> Result<PathBuf> {
+        Ok(self.root.join("models").join(Self::key(manifest)?))
     }
-    pub(crate) fn staging_dir(&self, manifest: &Manifest) -> PathBuf {
-        self.root
+    pub(crate) fn staging_dir(&self, manifest: &Manifest) -> Result<PathBuf> {
+        Ok(self
+            .root
             .join("staging")
-            .join(format!("{}.partial", Self::key(manifest)))
+            .join(format!("{}.partial", Self::key(manifest)?)))
     }
-    pub(crate) fn lock_file(&self, manifest: &Manifest) -> PathBuf {
-        self.root
+    pub(crate) fn lock_file(&self, manifest: &Manifest) -> Result<PathBuf> {
+        Ok(self
+            .root
             .join("locks")
-            .join(format!("{}.lock", Self::key(manifest)))
+            .join(format!("{}.lock", Self::key(manifest)?)))
     }
 }
 
@@ -247,19 +253,58 @@ impl Manifest {
     /// Returns an error if the validated manifest cannot be serialized.
     pub fn semantic_fingerprint(&self) -> Result<String> {
         self.validate()?;
-        let mut canonical = self.clone();
-        canonical.artifacts.sort_by(|left, right| {
+        let mut artifacts = self.artifacts.iter().collect::<Vec<_>>();
+        artifacts.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
                 .then(left.sha256.cmp(&right.sha256))
                 .then(left.size.cmp(&right.size))
-                .then(left.url.cmp(&right.url))
         });
-        canonical.semantic_verification = crate::SemanticVerification::Unverified {
-            reason: "trust-state-excluded-from-fingerprint".into(),
+        let canonical = SemanticContract {
+            schema_version: self.schema_version,
+            canonical_id: &self.canonical_id,
+            revision: &self.revision,
+            tokenizer: &self.tokenizer,
+            pooling: self.pooling,
+            prefixes: &self.prefixes,
+            dimensions: &self.dimensions,
+            tensors: &self.tensors,
+            runtime: &self.runtime,
+            artifacts: artifacts.into_iter().map(SemanticArtifact::from).collect(),
         };
         let encoded = serde_json::to_vec(&canonical)?;
         Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SemanticContract<'a> {
+    schema_version: u32,
+    canonical_id: &'a str,
+    revision: &'a str,
+    tokenizer: &'a TokenizerMetadata,
+    pooling: Pooling,
+    prefixes: &'a Prefixes,
+    dimensions: &'a Dimensions,
+    tensors: &'a TensorMetadata,
+    runtime: &'a RuntimeMetadata,
+    artifacts: Vec<SemanticArtifact<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct SemanticArtifact<'a> {
+    path: &'a str,
+    sha256: &'a str,
+    size: u64,
+}
+
+impl<'a> From<&'a Artifact> for SemanticArtifact<'a> {
+    fn from(artifact: &'a Artifact) -> Self {
+        Self {
+            path: &artifact.path,
+            sha256: &artifact.sha256,
+            size: artifact.size,
+        }
     }
 }
 
@@ -326,11 +371,11 @@ impl ModelStore {
     /// Returns an error when validation or filesystem inspection cannot be completed safely.
     pub fn status(&self, manifest: &Manifest) -> Result<ModelStatus> {
         manifest.validate()?;
-        let directory = self.layout.model_dir(manifest);
+        let directory = self.layout.model_dir(manifest)?;
         if reject_reparse_components(
             &self.layout.root,
             Path::new("models")
-                .join(CacheLayout::key(manifest))
+                .join(CacheLayout::key(manifest)?)
                 .as_path(),
         )
         .is_err()
@@ -397,7 +442,7 @@ impl ModelStore {
         match self.verify(manifest)? {
             ModelStatus::Loadable => Ok(VerifiedModel {
                 manifest: manifest.clone(),
-                root: self.layout.model_dir(manifest),
+                root: self.layout.model_dir(manifest)?,
                 _lease: Arc::new(lease),
             }),
             status => Err(Error::Invalid(format!(
@@ -427,7 +472,7 @@ impl ModelStore {
                 "import source must be a real directory".into(),
             ));
         }
-        let staging = self.layout.staging_dir(manifest);
+        let staging = self.layout.staging_dir(manifest)?;
         prepare_staging(&self.layout, &staging)?;
         let result = (|| {
             for artifact in &manifest.artifacts {
@@ -516,7 +561,7 @@ impl ModelStore {
     pub fn delete(&self, manifest: &Manifest) -> Result<bool> {
         manifest.validate()?;
         let _lock = acquire_delete_lock(&self.layout, manifest)?;
-        let target = self.layout.model_dir(manifest);
+        let target = self.layout.model_dir(manifest)?;
         let metadata = match fs::symlink_metadata(&target) {
             Ok(value) => value,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -550,7 +595,7 @@ impl ModelStore {
 }
 
 fn acquire_store_lock(layout: &CacheLayout, manifest: &Manifest) -> Result<fs::File> {
-    let path = layout.lock_file(manifest);
+    let path = layout.lock_file(manifest)?;
     let parent = path
         .parent()
         .ok_or_else(|| Error::Invalid("lock path has no parent".into()))?;
@@ -582,7 +627,7 @@ fn acquire_store_lock(layout: &CacheLayout, manifest: &Manifest) -> Result<fs::F
 }
 
 fn acquire_shared_store_lock(layout: &CacheLayout, manifest: &Manifest) -> Result<fs::File> {
-    let path = layout.lock_file(manifest);
+    let path = layout.lock_file(manifest)?;
     let parent = path
         .parent()
         .ok_or_else(|| Error::Invalid("lock path has no parent".into()))?;
@@ -609,7 +654,7 @@ fn acquire_shared_store_lock(layout: &CacheLayout, manifest: &Manifest) -> Resul
 }
 
 fn acquire_delete_lock(layout: &CacheLayout, manifest: &Manifest) -> Result<fs::File> {
-    let path = layout.lock_file(manifest);
+    let path = layout.lock_file(manifest)?;
     let parent = path
         .parent()
         .ok_or_else(|| Error::Invalid("lock path has no parent".into()))?;
@@ -675,12 +720,12 @@ pub(crate) fn ensure_contained_directory(base: &Path, directory: &Path) -> Resul
 }
 
 pub(crate) fn promote(layout: &CacheLayout, manifest: &Manifest, staging: &Path) -> Result<()> {
-    let final_path = layout.model_dir(manifest);
+    let final_path = layout.model_dir(manifest)?;
     let displaced = if fs::symlink_metadata(&final_path).is_ok() {
         reject_reparse_components(
             &layout.root,
             Path::new("models")
-                .join(CacheLayout::key(manifest))
+                .join(CacheLayout::key(manifest)?)
                 .as_path(),
         )?;
         let quarantine_root = layout.root.join("quarantine");
@@ -690,7 +735,7 @@ pub(crate) fn promote(layout: &CacheLayout, manifest: &Manifest, staging: &Path)
             let sequence = QUARANTINE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let candidate = quarantine_root.join(format!(
                 "{}.{}.{}.invalid",
-                CacheLayout::key(manifest),
+                CacheLayout::key(manifest)?,
                 std::process::id(),
                 sequence
             ));

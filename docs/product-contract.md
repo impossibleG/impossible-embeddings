@@ -40,8 +40,12 @@ and queue-resource guarantee, not a claim that every runtime can immediately rec
 
 The model string in a request is an alias or selection expression. Successful responses carry a
 separate resolved identity containing a canonical model id, immutable revision, runtime/version,
-and fingerprint over every inference-affecting artifact. Aliases are never presented as proof of
-which model produced an embedding.
+an artifact fingerprint, and a canonical semantic fingerprint. The semantic fingerprint covers
+artifact content plus tokenizer behavior, token limits/truncation bounds, pooling, prefixes,
+dimensions, tensor metadata, ONNX input/output names, padding, and normalization. Trust status,
+evidence references, license metadata, and download locations are deliberately excluded. Aliases
+are never presented as proof of which model produced an embedding, and the semantic fingerprint is
+also the cache key so identical bytes cannot collide when configured with different semantics.
 
 ## Public failures
 

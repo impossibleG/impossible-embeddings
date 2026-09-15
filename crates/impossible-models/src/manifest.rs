@@ -333,9 +333,19 @@ fn validate_runtime(runtime: &RuntimeMetadata) -> Result<()> {
     };
     validate_relative_path(model_file)?;
     validate_relative_path(tokenizer_file)?;
+    let declared_inputs = [
+        Some(inputs.input_ids.as_str()),
+        inputs.attention_mask.as_deref(),
+        inputs.token_type_ids.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let unique_inputs = declared_inputs.iter().copied().collect::<HashSet<_>>();
     if model_file == tokenizer_file
         || inputs.input_ids.trim().is_empty()
         || output.trim().is_empty()
+        || unique_inputs.len() != declared_inputs.len()
         || inputs
             .attention_mask
             .as_ref()
@@ -372,15 +382,54 @@ fn validate_runtime_artifacts(runtime: &RuntimeMetadata, artifacts: &[Artifact])
 pub(crate) fn validate_relative_path(value: &str) -> Result<()> {
     let path = std::path::Path::new(value);
     if value.is_empty()
+        || value.len() > 1024
         || value.contains('\\')
         || path.is_absolute()
         || path
             .components()
             .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        || value.split('/').any(|component| {
+            component.is_empty()
+                || component.len() > 255
+                || component.ends_with(['.', ' '])
+                || !component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+                || is_windows_device_name(component)
+        })
     {
         return Err(Error::Invalid(format!("unsafe artifact path: {value}")));
     }
     Ok(())
+}
+
+fn is_windows_device_name(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or_default();
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 fn is_path_ancestor(parent: &str, child: &str) -> bool {
@@ -491,5 +540,62 @@ mod tests {
             );
             assert!(Manifest::from_json(&serde_json::to_vec(&json).unwrap_or_default()).is_err());
         }
+    }
+
+    #[test]
+    fn rejects_non_portable_artifact_components_and_windows_aliases() {
+        let bytes = include_bytes!("../manifests/bge-small-en.json");
+        let base: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_default();
+        for path in [
+            "model.onnx.",
+            "model.onnx ",
+            "model.onnx:stream",
+            "CON",
+            "con.txt",
+            "weights/LpT9.bin",
+            "manifeſt.json",
+            "模型.onnx",
+        ] {
+            let mut json = base.clone();
+            json["artifacts"][0]["path"] = path.into();
+            assert!(
+                Manifest::from_json(&serde_json::to_vec(&json).unwrap_or_default()).is_err(),
+                "non-portable path was accepted: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_onnx_input_names() {
+        let mut json: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../manifests/bge-small-en.json"))
+                .unwrap_or_default();
+        json["runtime"] = serde_json::json!({
+            "engine": "onnx",
+            "model_file": "model.safetensors",
+            "tokenizer_file": "tokenizer.json",
+            "inputs": {
+                "input_ids": "tokens",
+                "attention_mask": "tokens",
+                "token_type_ids": null
+            },
+            "output": "embeddings",
+            "normalize": true
+        });
+        json["artifacts"] = serde_json::json!([
+            {
+                "path": "model.safetensors",
+                "url": "https://example.invalid/model",
+                "sha256": "a".repeat(64),
+                "size": 1
+            },
+            {
+                "path": "tokenizer.json",
+                "url": "https://example.invalid/tokenizer.json",
+                "sha256": "b".repeat(64),
+                "size": 1
+            }
+        ]);
+        assert!(Manifest::from_json(&serde_json::to_vec(&json).unwrap_or_default()).is_err());
     }
 }
