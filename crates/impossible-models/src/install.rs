@@ -318,12 +318,17 @@ async fn wait_for_cancel(cancel: &CancelToken) {
 async fn acquire_lock(path: impl AsRef<Path>, cancel: &CancelToken) -> Result<fs::File> {
     if let Some(parent) = path.as_ref().parent() {
         fs::create_dir_all(parent)?;
-        if fs::symlink_metadata(parent)?.file_type().is_symlink() {
-            return Err(Error::Invalid("lock directory cannot be a symlink".into()));
-        }
+        let root = parent
+            .parent()
+            .ok_or_else(|| Error::Invalid("lock directory has no cache root".into()))?;
+        crate::store::reject_reparse_components(root, Path::new("locks"))?;
     }
-    if fs::symlink_metadata(path.as_ref()).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        return Err(Error::Invalid("lock file cannot be a symlink".into()));
+    if fs::symlink_metadata(path.as_ref())
+        .is_ok_and(|metadata| metadata.file_type().is_symlink() || is_windows_reparse(&metadata))
+    {
+        return Err(Error::Invalid(
+            "lock file cannot be a symlink or reparse point".into(),
+        ));
     }
     loop {
         let file = match OpenOptions::new()
@@ -354,6 +359,17 @@ async fn acquire_lock(path: impl AsRef<Path>, cancel: &CancelToken) -> Result<fs
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+#[cfg(windows)]
+fn is_windows_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+const fn is_windows_reparse(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn is_lock_contention(error: &io::Error) -> bool {

@@ -10,7 +10,8 @@ use std::{
 
 use impossible_models::{
     Artifact, CancelToken, Dimensions, InstallOptions, Installer, License, Manifest, ModelStatus,
-    ModelStore, Pooling, Prefixes, SemanticVerification, TensorMetadata, TokenizerMetadata,
+    ModelStore, Pooling, Prefixes, SemanticTrustRoot, SemanticVerification, TensorMetadata,
+    TokenizerMetadata, TrustedSemanticEvidence,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -108,6 +109,14 @@ fn installer(temp: &TempDir, origin: Url, offline: bool) -> TestResult<Installer
     Ok(Installer::new(store, options)?)
 }
 
+fn trusted_store(path: impl AsRef<std::path::Path>, manifest: &Manifest) -> TestResult<ModelStore> {
+    let root = SemanticTrustRoot::from_evidence([TrustedSemanticEvidence {
+        manifest_fingerprint: manifest.semantic_fingerprint()?,
+        evidence: "repository test vector".into(),
+    }])?;
+    Ok(ModelStore::with_trust_root(path, root)?)
+}
+
 #[tokio::test]
 async fn installs_and_promotes_only_after_hash_verification() -> TestResult {
     let temp = TempDir::new()?;
@@ -118,7 +127,10 @@ async fn installs_and_promotes_only_after_hash_verification() -> TestResult {
     let status = installer(&temp, url, false)?
         .install(&manifest, &CancelToken::new())
         .await;
-    assert!(matches!(status, Ok(ModelStatus::Loadable)), "{status:?}");
+    assert!(
+        matches!(status, Ok(ModelStatus::IntegrityVerified)),
+        "{status:?}"
+    );
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     task.abort();
     Ok(())
@@ -187,7 +199,7 @@ async fn cancellation_leaves_only_partial_state_and_retry_recovers() -> TestResu
             installer(&temp, retry_url, false)?
                 .install(&retry_manifest, &CancelToken::new())
                 .await,
-            Ok(ModelStatus::Loadable)
+            Ok(ModelStatus::IntegrityVerified)
         ),
         "retry did not become loadable"
     );
@@ -209,8 +221,14 @@ async fn concurrent_install_is_coalesced_by_cross_process_lock() -> TestResult {
         installer.install(&manifest, &left_cancel),
         installer.install(&manifest, &right_cancel)
     );
-    assert!(matches!(left, Ok(ModelStatus::Loadable)), "{left:?}");
-    assert!(matches!(right, Ok(ModelStatus::Loadable)), "{right:?}");
+    assert!(
+        matches!(left, Ok(ModelStatus::IntegrityVerified)),
+        "{left:?}"
+    );
+    assert!(
+        matches!(right, Ok(ModelStatus::IntegrityVerified)),
+        "{right:?}"
+    );
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     task.abort();
     Ok(())
@@ -240,11 +258,166 @@ fn explicit_import_verifies_and_exact_delete_requires_identity() -> TestResult {
     let store = ModelStore::new(temp.path())?;
     assert_eq!(
         store.import(&manifest, source.path()).ok(),
-        Some(ModelStatus::Loadable)
+        Some(ModelStatus::IntegrityVerified)
     );
     let mut wrong = manifest.clone();
     wrong.revision = "abcdef0123456789abcdef0123456789abcdef01".into();
     assert_eq!(store.delete(&wrong).ok(), Some(false));
     assert_eq!(store.delete(&manifest).ok(), Some(true));
     Ok(())
+}
+
+#[test]
+fn custom_verified_claim_requires_independent_trust_root() -> TestResult {
+    let temp = TempDir::new()?;
+    let source = TempDir::new()?;
+    let body = b"semantic trust fixture";
+    let manifest = fixture("https://example.invalid/model".into(), body, None);
+    std::fs::create_dir_all(source.path().join("weights"))?;
+    std::fs::write(source.path().join("weights/model.bin"), body)?;
+
+    let untrusted = ModelStore::new(temp.path().join("untrusted"))?;
+    assert_eq!(
+        untrusted.import(&manifest, source.path())?,
+        ModelStatus::IntegrityVerified
+    );
+    assert!(untrusted.verified_model(&manifest).is_err());
+
+    let trusted = trusted_store(temp.path().join("trusted"), &manifest)?;
+    assert_eq!(
+        trusted.import(&manifest, source.path())?,
+        ModelStatus::Loadable
+    );
+    assert!(trusted.verified_model(&manifest).is_ok());
+    Ok(())
+}
+
+#[test]
+fn artifact_fingerprint_is_independent_of_manifest_artifact_order() -> TestResult {
+    let temp = TempDir::new()?;
+    let source = TempDir::new()?;
+    let left = b"left";
+    let right = b"right";
+    let mut manifest = fixture("https://example.invalid/left".into(), left, None);
+    manifest.artifacts.push(Artifact {
+        path: "weights/right.bin".into(),
+        url: "https://example.invalid/right".into(),
+        sha256: format!("{:x}", Sha256::digest(right)),
+        size: u64::try_from(right.len())?,
+    });
+    std::fs::create_dir_all(source.path().join("weights"))?;
+    std::fs::write(source.path().join("weights/model.bin"), left)?;
+    std::fs::write(source.path().join("weights/right.bin"), right)?;
+    let store = trusted_store(temp.path(), &manifest)?;
+    assert_eq!(
+        store.import(&manifest, source.path())?,
+        ModelStatus::Loadable
+    );
+    let first = store.verified_model(&manifest)?.artifact_fingerprint();
+    let mut reordered = manifest.clone();
+    reordered.artifacts.reverse();
+    let second = reordered.artifact_fingerprint();
+    assert_eq!(first, second);
+    assert_eq!(
+        manifest.semantic_fingerprint()?,
+        reordered.semantic_fingerprint()?
+    );
+    Ok(())
+}
+
+#[test]
+fn corrupt_exact_identity_is_quarantined_and_repaired() -> TestResult {
+    let temp = TempDir::new()?;
+    let source = TempDir::new()?;
+    let body = b"repairable bytes";
+    let manifest = fixture("https://example.invalid/model".into(), body, None);
+    std::fs::create_dir_all(source.path().join("weights"))?;
+    std::fs::write(source.path().join("weights/model.bin"), body)?;
+    let store = ModelStore::new(temp.path())?;
+    assert_eq!(
+        store.import(&manifest, source.path())?,
+        ModelStatus::IntegrityVerified
+    );
+    std::fs::write(
+        store.layout().model_dir(&manifest).join("manifest.json"),
+        b"{",
+    )?;
+    assert_eq!(store.status(&manifest)?, ModelStatus::Invalid);
+    assert_eq!(
+        store.import(&manifest, source.path())?,
+        ModelStatus::IntegrityVerified
+    );
+    assert!(temp.path().join("quarantine").read_dir()?.next().is_some());
+    std::fs::remove_file(store.layout().model_dir(&manifest).join("manifest.json"))?;
+    assert_eq!(store.status(&manifest)?, ModelStatus::Invalid);
+    assert_eq!(
+        store.import(&manifest, source.path())?,
+        ModelStatus::IntegrityVerified
+    );
+    assert!(temp.path().join("quarantine").read_dir()?.count() >= 2);
+    Ok(())
+}
+
+#[test]
+fn delete_requires_exact_manifest_and_respects_runtime_lease() -> TestResult {
+    let temp = TempDir::new()?;
+    let source = TempDir::new()?;
+    let body = b"leased bytes";
+    let manifest = fixture("https://example.invalid/model".into(), body, None);
+    std::fs::create_dir_all(source.path().join("weights"))?;
+    std::fs::write(source.path().join("weights/model.bin"), body)?;
+    let store = trusted_store(temp.path(), &manifest)?;
+    store.import(&manifest, source.path())?;
+
+    let mut altered = manifest.clone();
+    altered.license.spdx = "Apache-2.0".into();
+    assert!(store.delete(&altered).is_err());
+
+    let lease = store.verified_model(&manifest)?;
+    assert!(matches!(
+        store.delete(&manifest),
+        Err(impossible_models::Error::InUse)
+    ));
+    drop(lease);
+    assert!(store.delete(&manifest)?);
+    Ok(())
+}
+
+#[test]
+fn verification_rejects_intermediate_link_or_junction() -> TestResult {
+    let temp = TempDir::new()?;
+    let source = TempDir::new()?;
+    let outside = TempDir::new()?;
+    let body = b"outside bytes";
+    let manifest = fixture("https://example.invalid/model".into(), body, None);
+    std::fs::create_dir_all(source.path().join("weights"))?;
+    std::fs::write(source.path().join("weights/model.bin"), body)?;
+    let store = ModelStore::new(temp.path())?;
+    store.import(&manifest, source.path())?;
+
+    std::fs::write(outside.path().join("model.bin"), body)?;
+    let weights = store.layout().model_dir(&manifest).join("weights");
+    std::fs::remove_dir_all(&weights)?;
+    if !create_directory_link(&weights, outside.path())? {
+        return Ok(());
+    }
+    assert_eq!(store.status(&manifest)?, ModelStatus::Invalid);
+    assert!(store.verified_model(&manifest).is_err());
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_directory_link(link: &std::path::Path, target: &std::path::Path) -> TestResult<bool> {
+    let status = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .status()?;
+    Ok(status.success())
+}
+
+#[cfg(unix)]
+fn create_directory_link(link: &std::path::Path, target: &std::path::Path) -> TestResult<bool> {
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(true)
 }

@@ -11,7 +11,9 @@ use impossible_embedding_core::{
 use impossible_models::{Manifest, OnnxInputNames, Pooling, RuntimeMetadata, VerifiedModel};
 use ort::{
     session::{Session, SessionInputValue},
+    tensor::TensorElementType,
     value::Tensor,
+    value::ValueType,
 };
 use std::{
     borrow::Cow,
@@ -41,6 +43,7 @@ struct LoadedModel {
     tokenizer: Tokenizer,
     session: Session,
     identity: ResolvedModelIdentity,
+    _lease: VerifiedModel,
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +56,24 @@ struct OnnxContract {
 
 /// Single-model ONNX engine with explicit lifecycle operations.
 pub struct OnnxEmbeddingEngine {
-    loaded: Mutex<Option<LoadedModel>>,
+    state: Mutex<EngineState>,
+}
+
+#[derive(Default)]
+struct EngineState {
+    epoch: u64,
+    loaded: Option<LoadedModel>,
+}
+
+impl EngineState {
+    fn reserve_transition(&mut self) -> u64 {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch
+    }
+
+    const fn accepts(&self, epoch: u64) -> bool {
+        self.epoch == epoch
+    }
 }
 impl Default for OnnxEmbeddingEngine {
     fn default() -> Self {
@@ -66,7 +86,10 @@ impl OnnxEmbeddingEngine {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            loaded: Mutex::new(None),
+            state: Mutex::new(EngineState {
+                epoch: 0,
+                loaded: None,
+            }),
         }
     }
 
@@ -75,18 +98,28 @@ impl OnnxEmbeddingEngine {
     /// # Errors
     /// Returns stable invalid-manifest or unavailable-model errors with private diagnostics.
     pub fn load(&self, verified: &VerifiedModel) -> Result<ResolvedModelIdentity, EngineFailure> {
+        let epoch = {
+            let mut state = self.state()?;
+            state.reserve_transition()
+        };
         let candidate = Self::load_candidate(verified)?;
         let identity = candidate.identity.clone();
-        *self.state()? = Some(candidate);
+        let mut state = self.state()?;
+        if !state.accepts(epoch) {
+            return Err(EngineFailure::public(ErrorCode::ModelUnavailable));
+        }
+        state.loaded = Some(candidate);
         Ok(identity)
     }
 
     fn load_candidate(verified: &VerifiedModel) -> Result<LoadedModel, EngineFailure> {
+        verified
+            .revalidate_integrity()
+            .map_err(|e| EngineFailure::with_source(ErrorCode::ModelUnavailable, e))?;
         let manifest = verified.manifest().clone();
         let (model_file, tokenizer_file, contract) = onnx_contract(&manifest)?;
-        let model_path = safe_artifact_path(verified.root(), Path::new(&model_file), "onnx")?;
-        let tokenizer_path =
-            safe_artifact_path(verified.root(), Path::new(&tokenizer_file), "json")?;
+        let model_path = safe_artifact_path(verified, &model_file, "onnx")?;
+        let tokenizer_path = safe_artifact_path(verified, &tokenizer_file, "json")?;
         let tokenizer_bytes = fs::read(&tokenizer_path)
             .map_err(|e| EngineFailure::with_source(ErrorCode::ModelUnavailable, e))?;
         let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)
@@ -94,7 +127,10 @@ impl OnnxEmbeddingEngine {
         let session = Session::builder()
             .and_then(|b| b.commit_from_file(&model_path))
             .map_err(|e| private_error(ErrorCode::ModelUnavailable, "ONNX load", e))?;
-        validate_graph_contract(&contract, &session)?;
+        validate_graph_contract(&contract, &session, manifest.dimensions.native)?;
+        verified
+            .revalidate_integrity()
+            .map_err(|e| EngineFailure::with_source(ErrorCode::ModelUnavailable, e))?;
         let identity = ResolvedModelIdentity::new(
             manifest.canonical_id.clone(),
             manifest.revision.clone(),
@@ -107,11 +143,12 @@ impl OnnxEmbeddingEngine {
             tokenizer,
             session,
             identity,
+            _lease: verified.clone(),
         })
     }
 
-    fn state(&self) -> Result<std::sync::MutexGuard<'_, Option<LoadedModel>>, EngineFailure> {
-        self.loaded.lock().map_err(|_| {
+    fn state(&self) -> Result<std::sync::MutexGuard<'_, EngineState>, EngineFailure> {
+        self.state.lock().map_err(|_| {
             EngineFailure::with_source(
                 ErrorCode::Internal,
                 Diagnostic("model state lock is poisoned".into()),
@@ -122,7 +159,7 @@ impl OnnxEmbeddingEngine {
     /// Returns whether a model is loaded.
     #[must_use]
     pub fn is_loaded(&self) -> bool {
-        self.loaded.lock().is_ok_and(|g| g.is_some())
+        self.state.lock().is_ok_and(|state| state.loaded.is_some())
     }
 
     /// Runs one private synthetic request to initialize runtime state.
@@ -132,6 +169,7 @@ impl OnnxEmbeddingEngine {
     pub fn warm(&self) -> Result<(), EngineFailure> {
         let mut guard = self.state()?;
         let model = guard
+            .loaded
             .as_mut()
             .ok_or_else(|| EngineFailure::public(ErrorCode::ModelUnavailable))?;
         let input = model
@@ -148,7 +186,9 @@ impl OnnxEmbeddingEngine {
     /// # Errors
     /// Returns an internal failure only if lifecycle state was poisoned.
     pub fn unload(&self) -> Result<(), EngineFailure> {
-        *self.state()? = None;
+        let mut state = self.state()?;
+        state.reserve_transition();
+        state.loaded = None;
         Ok(())
     }
 
@@ -166,6 +206,7 @@ impl OnnxEmbeddingEngine {
         control.ensure_active()?;
         let mut guard = self.state()?;
         let model = guard
+            .loaded
             .as_mut()
             .ok_or_else(|| EngineFailure::public(ErrorCode::ModelUnavailable))?;
         if requested.as_str() != model.manifest.canonical_id {
@@ -275,6 +316,11 @@ impl LoadedModel {
             .try_extract_array::<f32>()
             .map_err(inference_error)?;
         let shape = output.shape();
+        let native = usize::try_from(self.manifest.dimensions.native)
+            .map_err(|_| EngineFailure::public(ErrorCode::InferenceFailed))?;
+        if !valid_runtime_output_shape(shape, batch, sequence, native) {
+            return Err(EngineFailure::public(ErrorCode::InferenceFailed));
+        }
         let mut vectors = match shape {
             [rows, hidden] if *rows == batch => (0..batch)
                 .map(|r| (0..*hidden).map(|c| output[[r, c]]).collect())
@@ -311,6 +357,17 @@ impl LoadedModel {
     }
 }
 
+fn valid_runtime_output_shape(
+    shape: &[usize],
+    batch: usize,
+    sequence: usize,
+    native: usize,
+) -> bool {
+    matches!(shape, [rows, hidden] if *rows == batch && *hidden == native)
+        || matches!(shape, [rows, tokens, hidden]
+            if *rows == batch && *tokens == sequence && *hidden == native)
+}
+
 fn apply_prefix<'a>(input: &'a str, prefix: Option<&str>) -> Cow<'a, str> {
     match prefix {
         None => Cow::Borrowed(input),
@@ -344,6 +401,7 @@ fn onnx_contract(manifest: &Manifest) -> Result<(String, String, OnnxContract), 
 fn validate_graph_contract(
     contract: &OnnxContract,
     session: &Session,
+    native_dimensions: u32,
 ) -> Result<(), EngineFailure> {
     let available_inputs = session
         .inputs
@@ -359,20 +417,28 @@ fn validate_graph_contract(
         .into_iter()
         .flatten()
         .all(|name| available_inputs.contains(name));
-    let has_output = session
+    let output = session
         .outputs
         .iter()
-        .any(|output| output.name == contract.output);
-    if !has_inputs || !has_output {
+        .find(|output| output.name == contract.output);
+    let valid_output = output.is_some_and(|output| match &output.output_type {
+        ValueType::Tensor { ty, shape, .. } if *ty == TensorElementType::Float32 => {
+            matches!(shape.len(), 2 | 3)
+                && shape.last().is_some_and(|hidden| {
+                    *hidden < 0 || u32::try_from(*hidden).ok() == Some(native_dimensions)
+                })
+        }
+        _ => false,
+    });
+    if !has_inputs || !valid_output {
         return Err(EngineFailure::public(ErrorCode::InvalidRequest));
     }
     Ok(())
 }
 fn validate_dimensions(m: &Manifest, requested: Option<usize>) -> Result<(), EngineFailure> {
     if requested.is_some_and(|dimension| {
-        !m.dimensions
-            .matryoshka
-            .contains(&u32::try_from(dimension).unwrap_or(u32::MAX))
+        let requested = u32::try_from(dimension).unwrap_or(u32::MAX);
+        requested != m.dimensions.native && !m.dimensions.matryoshka.contains(&requested)
     }) {
         Err(EngineFailure::public(ErrorCode::InvalidRequest))
     } else {
@@ -380,33 +446,16 @@ fn validate_dimensions(m: &Manifest, requested: Option<usize>) -> Result<(), Eng
     }
 }
 fn safe_artifact_path(
-    root: &Path,
-    relative: &Path,
+    verified: &VerifiedModel,
+    relative: &str,
     extension: &str,
 ) -> Result<PathBuf, EngineFailure> {
-    use std::path::Component;
-    if relative.is_absolute()
-        || relative.components().any(|c| {
-            matches!(
-                c,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-        || relative.extension().and_then(|v| v.to_str()) != Some(extension)
-    {
+    if Path::new(relative).extension().and_then(|v| v.to_str()) != Some(extension) {
         return Err(EngineFailure::public(ErrorCode::InvalidRequest));
     }
-    let base = root
-        .canonicalize()
-        .map_err(|e| EngineFailure::with_source(ErrorCode::ModelUnavailable, e))?;
-    let path = root
-        .join(relative)
-        .canonicalize()
-        .map_err(|e| EngineFailure::with_source(ErrorCode::ModelUnavailable, e))?;
-    if !path.starts_with(base) {
-        return Err(EngineFailure::public(ErrorCode::InvalidRequest));
-    }
-    Ok(path)
+    verified
+        .artifact_path(relative)
+        .map_err(|e| EngineFailure::with_source(ErrorCode::ModelUnavailable, e))
 }
 fn pool_tokens(
     output: &ndarray::ArrayViewD<'_, f32>,
@@ -500,5 +549,39 @@ mod tests {
         );
         assert!(pool_tokens(&view, 0, 2, &[0, 0, 0, 0], Pooling::Mean).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn output_shapes_require_declared_native_width_for_2d_and_3d() {
+        assert!(valid_runtime_output_shape(&[2, 384], 2, 7, 384));
+        assert!(!valid_runtime_output_shape(&[2, 383], 2, 7, 384));
+        assert!(valid_runtime_output_shape(&[2, 7, 384], 2, 7, 384));
+        assert!(!valid_runtime_output_shape(&[2, 7, 383], 2, 7, 384));
+        assert!(!valid_runtime_output_shape(&[2, 6, 384], 2, 7, 384));
+    }
+
+    #[test]
+    fn native_dimension_is_always_an_explicit_valid_request() -> Result<(), EngineFailure> {
+        let mut manifest = impossible_models::curated_manifests()
+            .unwrap_or_default()
+            .into_iter()
+            .next()
+            .ok_or_else(|| EngineFailure::public(ErrorCode::Internal))?;
+        manifest.dimensions.matryoshka.clear();
+        let native = usize::try_from(manifest.dimensions.native).unwrap_or_default();
+        assert!(validate_dimensions(&manifest, Some(native)).is_ok());
+        assert!(validate_dimensions(&manifest, Some(native.saturating_add(1))).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_epochs_reject_stale_concurrent_loads_and_post_unload_publish() {
+        let mut state = EngineState::default();
+        let first = state.reserve_transition();
+        let second = state.reserve_transition();
+        assert!(!state.accepts(first));
+        assert!(state.accepts(second));
+        state.reserve_transition();
+        assert!(!state.accepts(second));
     }
 }

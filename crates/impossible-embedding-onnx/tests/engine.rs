@@ -9,7 +9,8 @@ use impossible_embedding_core::{
 use impossible_embedding_onnx::{EmbedOptions, EmbeddingTask, OnnxEmbeddingEngine, Truncation};
 use impossible_models::{
     Artifact, Dimensions, License, Manifest, ModelStatus, ModelStore, OnnxInputNames, Pooling,
-    Prefixes, RuntimeMetadata, SemanticVerification, TensorMetadata, TokenizerMetadata,
+    Prefixes, RuntimeMetadata, SemanticTrustRoot, SemanticVerification, TensorMetadata,
+    TokenizerMetadata, TrustedSemanticEvidence,
 };
 use impossible_server_core::{HealthRegistry, LifecycleState, ModelKey};
 use prost::Message;
@@ -63,6 +64,8 @@ struct AttributeProto {
     i: i64,
     #[prost(int32, tag = "20")]
     r#type: i32,
+    #[prost(int64, repeated, tag = "8")]
+    ints: Vec<i64>,
 }
 #[derive(Clone, PartialEq, Message)]
 struct ValueInfoProto {
@@ -90,6 +93,8 @@ struct TensorShapeProto {
 }
 #[derive(Clone, PartialEq, Message)]
 struct Dimension {
+    #[prost(int64, tag = "1")]
+    dim_value: i64,
     #[prost(string, tag = "2")]
     dim_param: String,
 }
@@ -103,10 +108,35 @@ fn tensor_value(name: &str, element_type: i32) -> ValueInfoProto {
                 shape: Some(TensorShapeProto {
                     dim: vec![
                         Dimension {
+                            dim_value: 0,
                             dim_param: "batch".into(),
                         },
                         Dimension {
+                            dim_value: 0,
                             dim_param: "sequence".into(),
+                        },
+                    ],
+                }),
+            }),
+        }),
+    }
+}
+
+fn embedding_output(name: &str, dimensions: i64) -> ValueInfoProto {
+    ValueInfoProto {
+        name: name.into(),
+        r#type: Some(TypeProto {
+            tensor_type: Some(TensorTypeProto {
+                elem_type: 1,
+                shape: Some(TensorShapeProto {
+                    dim: vec![
+                        Dimension {
+                            dim_value: 0,
+                            dim_param: "batch".into(),
+                        },
+                        Dimension {
+                            dim_value: dimensions,
+                            dim_param: String::new(),
                         },
                     ],
                 }),
@@ -119,22 +149,60 @@ fn cast_model() -> ModelProto {
     ModelProto {
         ir_version: 8,
         graph: Some(GraphProto {
-            node: vec![NodeProto {
-                input: vec!["input_ids".into()],
-                output: vec!["sentence_embedding".into()],
-                op_type: "Cast".into(),
-                attribute: vec![AttributeProto {
-                    name: "to".into(),
-                    i: 1,      // TensorProto::FLOAT
-                    r#type: 2, // AttributeProto::INT
-                }],
-            }],
+            node: vec![
+                NodeProto {
+                    input: vec!["input_ids".into()],
+                    output: vec!["cast_tokens".into()],
+                    op_type: "Cast".into(),
+                    attribute: vec![AttributeProto {
+                        name: "to".into(),
+                        i: 1,      // TensorProto::FLOAT
+                        r#type: 2, // AttributeProto::INT
+                        ints: vec![],
+                    }],
+                },
+                NodeProto {
+                    input: vec!["cast_tokens".into()],
+                    output: vec!["pooled".into()],
+                    op_type: "ReduceMean".into(),
+                    attribute: vec![
+                        AttributeProto {
+                            name: "axes".into(),
+                            i: 0,
+                            r#type: 7, // AttributeProto::INTS
+                            ints: vec![1],
+                        },
+                        AttributeProto {
+                            name: "keepdims".into(),
+                            i: 1,
+                            r#type: 2,
+                            ints: vec![],
+                        },
+                    ],
+                },
+                NodeProto {
+                    input: vec![
+                        "pooled".into(),
+                        "pooled".into(),
+                        "pooled".into(),
+                        "pooled".into(),
+                    ],
+                    output: vec!["sentence_embedding".into()],
+                    op_type: "Concat".into(),
+                    attribute: vec![AttributeProto {
+                        name: "axis".into(),
+                        i: 1,
+                        r#type: 2,
+                        ints: vec![],
+                    }],
+                },
+            ],
             name: "synthetic_embedding_fixture".into(),
             input: vec![
                 tensor_value("input_ids", 7),
                 tensor_value("attention_mask", 7),
             ],
-            output: vec![tensor_value("sentence_embedding", 1)],
+            output: vec![embedding_output("sentence_embedding", 4)],
         }),
         opset_import: vec![OperatorSetIdProto { version: 13 }],
     }
@@ -241,7 +309,7 @@ fn setup() -> Result<(tempfile::TempDir, OnnxEmbeddingEngine)> {
     let source = directory.path().join("source");
     fs::create_dir(&source)?;
     let manifest = write_fixture(&source)?;
-    let store = ModelStore::new(directory.path().join("cache"))?;
+    let store = trusted_store(directory.path().join("cache"), &manifest)?;
     anyhow::ensure!(store.import(&manifest, &source)? == ModelStatus::Loadable);
     let verified = store.verified_model(&manifest)?;
     let engine = OnnxEmbeddingEngine::new();
@@ -249,6 +317,14 @@ fn setup() -> Result<(tempfile::TempDir, OnnxEmbeddingEngine)> {
     anyhow::ensure!(identity.canonical_id == "fixture/cast-embedding");
     anyhow::ensure!(identity.artifact_fingerprint.starts_with("sha256:"));
     Ok((directory, engine))
+}
+
+fn trusted_store(path: impl AsRef<Path>, manifest: &Manifest) -> Result<ModelStore> {
+    let trust_root = SemanticTrustRoot::from_evidence([TrustedSemanticEvidence {
+        manifest_fingerprint: manifest.semantic_fingerprint()?,
+        evidence: "repository-authored synthetic fixture".into(),
+    }])?;
+    Ok(ModelStore::with_trust_root(path, trust_root)?)
 }
 
 fn embed(
@@ -271,8 +347,7 @@ fn lifecycle_and_real_in_process_ort_execution() -> Result<()> {
     engine.warm()?;
     let vectors = embed(&engine, &["hello", "hello world"], EmbedOptions::default())?;
     assert_eq!(vectors.len(), 2);
-    assert_eq!(vectors[0].len(), 4); // padded to the longest input
-    assert!(vectors[0][3].abs() < f32::EPSILON);
+    assert_eq!(vectors[0].len(), 4);
     for vector in vectors {
         let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6);
@@ -289,7 +364,7 @@ fn verified_store_model_loads_and_drives_infrastructure_readiness() -> Result<()
     let source = directory.path().join("source");
     fs::create_dir(&source)?;
     let manifest = write_fixture(&source)?;
-    let store = ModelStore::new(directory.path().join("cache"))?;
+    let store = trusted_store(directory.path().join("cache"), &manifest)?;
     let status = store.import(&manifest, &source)?;
     assert_eq!(status, ModelStatus::Loadable);
 
@@ -351,6 +426,18 @@ fn handles_empty_unicode_prefixes_limits_and_dimensions() -> Result<()> {
         .sum::<f32>()
         .sqrt();
     assert!((norm - 1.0).abs() < 1e-6);
+    assert_eq!(
+        embed(
+            &engine,
+            &["hello"],
+            EmbedOptions {
+                dimensions: Some(4),
+                ..defaults
+            }
+        )?[0]
+            .len(),
+        4
+    );
     assert!(
         embed(
             &engine,
@@ -362,6 +449,54 @@ fn handles_empty_unicode_prefixes_limits_and_dimensions() -> Result<()> {
         )
         .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn rejects_declared_native_width_that_disagrees_with_2d_graph() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source");
+    fs::create_dir(&source)?;
+    let mut manifest = write_fixture(&source)?;
+    manifest.dimensions.native = 3;
+    manifest.dimensions.matryoshka.clear();
+    let store = trusted_store(directory.path().join("cache"), &manifest)?;
+    assert_eq!(store.import(&manifest, &source)?, ModelStatus::Loadable);
+    let verified = store.verified_model(&manifest)?;
+    let Err(error) = OnnxEmbeddingEngine::new().load(&verified) else {
+        anyhow::bail!("static graph width mismatch must fail");
+    };
+    assert_eq!(error.public_error().code, ErrorCode::InvalidRequest);
+    Ok(())
+}
+
+#[test]
+fn load_rehashes_verified_artifacts_and_loaded_engine_retains_delete_lease() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source");
+    fs::create_dir(&source)?;
+    let manifest = write_fixture(&source)?;
+    let store = trusted_store(directory.path().join("cache"), &manifest)?;
+    store.import(&manifest, &source)?;
+    let verified = store.verified_model(&manifest)?;
+    fs::write(
+        store.layout().model_dir(&manifest).join("tokenizer.json"),
+        b"tampered",
+    )?;
+    assert!(OnnxEmbeddingEngine::new().load(&verified).is_err());
+    drop(verified);
+
+    store.import(&manifest, &source)?;
+    let verified = store.verified_model(&manifest)?;
+    let engine = OnnxEmbeddingEngine::new();
+    engine.load(&verified)?;
+    drop(verified);
+    assert!(matches!(
+        store.delete(&manifest),
+        Err(impossible_models::Error::InUse)
+    ));
+    engine.unload()?;
+    assert!(store.delete(&manifest)?);
     Ok(())
 }
 

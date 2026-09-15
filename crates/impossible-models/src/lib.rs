@@ -13,7 +13,10 @@ pub use manifest::{
     Artifact, Dimensions, License, Manifest, OnnxInputNames, Pooling, Prefixes, RuntimeMetadata,
     SemanticVerification, TensorMetadata, TokenizerMetadata, curated_manifests,
 };
-pub use store::{CacheLayout, DiscoveryRoot, ModelStore, VerifiedModel};
+pub use store::{
+    CacheLayout, DiscoveryRoot, ModelStore, SemanticTrustRoot, TrustedSemanticEvidence,
+    VerifiedModel,
+};
 
 use std::{fmt, io};
 
@@ -26,6 +29,8 @@ pub enum Error {
     Cancelled,
     /// Network access was requested while offline mode was enabled.
     Offline,
+    /// The exact model identity currently has one or more runtime leases.
+    InUse,
     /// A URL did not match an explicitly allowed HTTPS origin.
     OriginNotAllowed(String),
     /// A response exceeded an artifact's declared size or configured limit.
@@ -56,6 +61,7 @@ impl fmt::Display for Error {
             Self::Invalid(message) => write!(formatter, "invalid model data: {message}"),
             Self::Cancelled => formatter.write_str("operation cancelled"),
             Self::Offline => formatter.write_str("network access is disabled in offline mode"),
+            Self::InUse => formatter.write_str("model identity is currently in use"),
             Self::OriginNotAllowed(origin) => {
                 write!(formatter, "download origin is not allowed: {origin}")
             }

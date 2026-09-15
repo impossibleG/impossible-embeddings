@@ -13,6 +13,7 @@ names can never become filesystem paths:
 <root>/
   locks/<identity-key>.lock
   staging/<identity-key>.partial/
+  quarantine/<identity-key>.<process>.<sequence>.invalid/
   models/<identity-key>/
     manifest.json
     <declared artifacts>
@@ -21,17 +22,25 @@ names can never become filesystem paths:
 An installation is visible under `models` only after its size and SHA-256 checks pass. A cancelled
 or interrupted transfer can leave only a `.partial` staging directory; the next installation under
 the same per-model lock clears it and starts from a known state.
+If the exact final identity is corrupt or its stored manifest is missing, a successful reinstall
+moves that state to `quarantine` and atomically promotes the verified replacement. Quarantine names
+contain no host or user information.
 
 Discovery searches only directories supplied as `DiscoveryRoot` values. Import reads only a
 caller-supplied directory and rejects symbolic-link artifacts. Delete derives one content-addressed
-target from the requested identity, checks the stored identity, verifies containment, and rejects
-symbolic links before removal.
+target from the requested identity, requires the complete stored manifest to match, verifies
+containment, and rejects symbolic links and Windows reparse points before removal. A verified model
+capability holds a shared in-use lease; deletion and replacement cannot proceed while a runtime
+retains that capability.
 
 ## Trust states
 
 Artifact integrity and semantic compatibility are separate. `IntegrityVerified` means every local
-byte matches the immutable manifest. `Loadable` additionally requires a curated manifest carrying
-independent semantic verification evidence. The initial three catalog entries deliberately remain
+byte matches the immutable manifest. `Loadable` additionally requires both the manifest claim and
+an independently configured trust-root fingerprint covering its complete inference contract. A
+custom manifest cannot make itself loadable by claiming `Verified`. The default trust root is built
+only from repository-curated manifests; operators may supply separately authenticated evidence
+records explicitly. The initial three catalog entries deliberately remain
 `Unverified`: their upstream revisions, sizes, and hashes are pinned, but this repository has not
 yet committed runtime golden-vector evidence. Server integrations must not advertise them as ready
 until that evidence exists.

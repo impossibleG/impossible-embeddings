@@ -255,37 +255,7 @@ impl Manifest {
         if self.artifacts.is_empty() {
             return Err(Error::Invalid("manifest has no artifacts".into()));
         }
-        let mut paths = HashSet::new();
-        for artifact in &self.artifacts {
-            validate_relative_path(&artifact.path)?;
-            if !paths.insert(&artifact.path) {
-                return Err(Error::Invalid("artifact paths must be unique".into()));
-            }
-            let url = Url::parse(&artifact.url)
-                .map_err(|_| Error::Invalid("artifact URL is invalid".into()))?;
-            let loopback_test_url = url.scheme() == "http"
-                && url
-                    .host_str()
-                    .is_some_and(|host| matches!(host, "127.0.0.1" | "::1" | "localhost"));
-            if (url.scheme() != "https" && !loopback_test_url)
-                || url.host_str().is_none()
-                || url.username() != ""
-                || url.password().is_some()
-            {
-                return Err(Error::Invalid("artifact URL must use HTTPS (HTTP is allowed only for loopback tests) and contain no credentials".into()));
-            }
-            if artifact.sha256.len() != 64
-                || !artifact
-                    .sha256
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                || artifact.size == 0
-            {
-                return Err(Error::Invalid(
-                    "artifact requires SHA-256 and non-zero size".into(),
-                ));
-            }
-        }
+        validate_artifacts(&self.artifacts)?;
         validate_runtime_artifacts(&self.runtime, &self.artifacts)?;
         Ok(())
     }
@@ -298,6 +268,56 @@ impl Manifest {
             SemanticVerification::Verified { .. }
         )
     }
+}
+
+fn validate_artifacts(artifacts: &[Artifact]) -> Result<()> {
+    let mut paths = HashSet::new();
+    for artifact in artifacts {
+        validate_relative_path(&artifact.path)?;
+        let portable_path = artifact.path.to_ascii_lowercase();
+        if portable_path == "manifest.json" {
+            return Err(Error::Invalid(
+                "manifest.json is reserved for the installed identity record".into(),
+            ));
+        }
+        if !paths.insert(portable_path.clone()) {
+            return Err(Error::Invalid("artifact paths must be unique".into()));
+        }
+        if paths.iter().any(|existing| {
+            existing != &portable_path
+                && (is_path_ancestor(existing, &portable_path)
+                    || is_path_ancestor(&portable_path, existing))
+        }) {
+            return Err(Error::Invalid(
+                "artifact paths cannot be ancestors of other artifacts".into(),
+            ));
+        }
+        let url = Url::parse(&artifact.url)
+            .map_err(|_| Error::Invalid("artifact URL is invalid".into()))?;
+        let loopback_test_url = url.scheme() == "http"
+            && url
+                .host_str()
+                .is_some_and(|host| matches!(host, "127.0.0.1" | "::1" | "localhost"));
+        if (url.scheme() != "https" && !loopback_test_url)
+            || url.host_str().is_none()
+            || url.username() != ""
+            || url.password().is_some()
+        {
+            return Err(Error::Invalid("artifact URL must use HTTPS (HTTP is allowed only for loopback tests) and contain no credentials".into()));
+        }
+        if artifact.sha256.len() != 64
+            || !artifact
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || artifact.size == 0
+        {
+            return Err(Error::Invalid(
+                "artifact requires SHA-256 and non-zero size".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_runtime(runtime: &RuntimeMetadata) -> Result<()> {
@@ -352,6 +372,7 @@ fn validate_runtime_artifacts(runtime: &RuntimeMetadata, artifacts: &[Artifact])
 pub(crate) fn validate_relative_path(value: &str) -> Result<()> {
     let path = std::path::Path::new(value);
     if value.is_empty()
+        || value.contains('\\')
         || path.is_absolute()
         || path
             .components()
@@ -360,6 +381,12 @@ pub(crate) fn validate_relative_path(value: &str) -> Result<()> {
         return Err(Error::Invalid(format!("unsafe artifact path: {value}")));
     }
     Ok(())
+}
+
+fn is_path_ancestor(parent: &str, child: &str) -> bool {
+    child
+        .strip_prefix(parent)
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn validate_id(value: &str) -> Result<()> {
@@ -436,5 +463,33 @@ mod tests {
         json["artifacts"][0]["path"] = "model.safetensors".into();
         json["surprise"] = true.into();
         assert!(Manifest::from_json(&serde_json::to_vec(&json).unwrap_or_default()).is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_and_colliding_artifact_paths() {
+        let bytes = include_bytes!("../manifests/bge-small-en.json");
+        let base: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_default();
+        for paths in [
+            vec!["manifest.json", "tokenizer.json"],
+            vec!["MANIFEST.JSON", "tokenizer.json"],
+            vec!["weights", "weights/model.onnx"],
+            vec!["A/model.onnx", "a/MODEL.onnx"],
+        ] {
+            let mut json = base.clone();
+            json["artifacts"] = serde_json::Value::Array(
+                paths
+                    .into_iter()
+                    .map(|path| {
+                        serde_json::json!({
+                            "path": path,
+                            "url": "https://example.invalid/artifact",
+                            "sha256": "a".repeat(64),
+                            "size": 1
+                        })
+                    })
+                    .collect(),
+            );
+            assert!(Manifest::from_json(&serde_json::to_vec(&json).unwrap_or_default()).is_err());
+        }
     }
 }
