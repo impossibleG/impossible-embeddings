@@ -18,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@077fee5b0788f1a772d4c6ce2814159cd1d6632b # 1.85.1
         with:
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
       - name: Format
         run: cargo fmt --all -- --check
       - name: Check
@@ -35,9 +35,12 @@ jobs:
       - name: Third-party notices
         shell: pwsh
         run: ./scripts/generate-third-party-notices.ps1 -Check
+      - name: Release asset policy
+        shell: pwsh
+        run: ./scripts/validate-release-assets.ps1
 
   dependencies:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2

@@ -11,5 +11,14 @@ dist
 **/*.pth
 **/*.gguf
 *.log
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.token
+credentials*
+secrets*
 Dockerfile*
 !Dockerfile

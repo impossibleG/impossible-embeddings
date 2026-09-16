@@ -22,7 +22,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@077fee5b0788f1a772d4c6ce2814159cd1d6632b # 1.85.1
         with:
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
       - name: Require tag and package version agreement
         shell: pwsh
         run: |
@@ -40,29 +40,63 @@ jobs:
           cargo check --locked --workspace --all-targets
           cargo clippy --locked --workspace --all-targets -- -D warnings
           cargo test --locked --workspace
+          cargo test --locked --package impossible-server --features e2e-fixture --test binary_e2e -- --test-threads=1
           cargo doc --locked --workspace --no-deps
       - name: Privacy and notice gates
         shell: pwsh
         run: |
           ./scripts/privacy-scan.ps1
           ./scripts/generate-third-party-notices.ps1 -Check
-      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
+          ./scripts/validate-release-assets.ps1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
       - name: Rust advisory scan
         run: |
           cargo install cargo-audit --locked --version 0.21.2
           cargo audit --ignore RUSTSEC-2024-0436
       - name: Build hardened container
         run: |
+          set -euo pipefail
+          container=impossible-embedding-release-test
+          volume=impossible-embedding-release-test
+          cleanup() {
+            docker rm --force "$container" >/dev/null 2>&1 || true
+            docker volume rm "$volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
           docker build \
             --build-arg VERSION="${GITHUB_REF_NAME#v}" \
             --build-arg REVISION="$GITHUB_SHA" \
             --build-arg SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
             --tag impossible-embedding:release-test .
-          docker volume create impossible-embedding-release-test >/dev/null
-          docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
-            --mount type=volume,source=impossible-embedding-release-test,target=/var/lib/impossible-embedding \
-            impossible-embedding:release-test --version
-          docker volume rm impossible-embedding-release-test >/dev/null
+          docker volume create "$volume" >/dev/null
+          docker run --detach --name "$container" \
+            --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --mount type=volume,source="$volume",target=/var/lib/impossible-embedding \
+            --publish 127.0.0.1::8080 \
+            impossible-embedding:release-test serve \
+            --http-bind 0.0.0.0:8080 \
+            --grpc-bind 0.0.0.0:50051 \
+            --allow-insecure-remote \
+            --admin-api-enabled false \
+            --offline
+          port="$(docker port "$container" 8080/tcp | sed -n 's/.*://p' | head -n 1)"
+          test -n "$port"
+          for attempt in $(seq 1 100); do
+            if curl --fail --silent --show-error "http://127.0.0.1:$port/health/live" >/dev/null; then
+              break
+            fi
+            if ! docker inspect --format '{{.State.Running}}' "$container" | grep --quiet true; then
+              docker logs "$container"
+              exit 1
+            fi
+            if [ "$attempt" -eq 100 ]; then
+              docker logs "$container"
+              exit 1
+            fi
+            sleep 0.1
+          done
+          curl --fail --silent --show-error "http://127.0.0.1:$port/openapi.json" >/dev/null
+          test "$(docker inspect --format '{{.Config.User}}' "$container")" = "65532:65532"
 
   native:
     needs: gates
@@ -80,7 +114,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@077fee5b0788f1a772d4c6ce2814159cd1d6632b # 1.85.1
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
         with:
           key: release-${{ matrix.target }}
       - name: Set reproducible source timestamp
