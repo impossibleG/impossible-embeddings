@@ -1,0 +1,30 @@
+# Safe single-machine defaults. Values in IMPOSSIBLE_* environment variables and command-line
+# options override this file. Secret values are referenced, never stored here.
+http_bind = "[::1]:8080"
+grpc_bind = "[::1]:50051"
+allow_insecure_remote = false
+admin_api_enabled = true
+allowed_origins = []
+model_directories = []
+cache_directory = ".impossible-embedding-cache"
+preload_models = []
+offline = false
+startup_policy = "best_effort"
+
+# Uncomment both credential references before binding to a non-loopback interface. The named
+# environment variables contain the secret values at process startup.
+# auth_env = "IMPOSSIBLE_AUTH_TOKEN"
+# admin_auth_env = "IMPOSSIBLE_ADMIN_AUTH_TOKEN"
+
+[limits]
+max_body_bytes = 2097152
+max_input_bytes = 262144
+max_request_bytes = 1048576
+max_items = 128
+max_tokens = 32768
+max_queue_depth = 256
+max_batch_items = 128
+max_batch_tokens = 32768
+max_concurrency = 4
+request_timeout_ms = 30000
+shutdown_timeout_ms = 20000

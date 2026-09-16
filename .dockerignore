@@ -1,0 +1,15 @@
+.git
+.github
+.worktrees
+target
+dist
+.impossible-embedding-cache
+**/*.onnx
+**/*.safetensors
+**/*.bin
+**/*.pt
+**/*.pth
+**/*.gguf
+*.log
+Dockerfile*
+!Dockerfile

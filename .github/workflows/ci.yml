@@ -32,6 +32,9 @@ jobs:
       - name: Privacy scan
         shell: pwsh
         run: ./scripts/privacy-scan.ps1
+      - name: Third-party notices
+        shell: pwsh
+        run: ./scripts/generate-third-party-notices.ps1 -Check
 
   dependencies:
     runs-on: ubuntu-latest

@@ -21,11 +21,11 @@ Impossible Embedding will provide a reliable, local-first service for dense text
 - Identical performance or accelerator support on every platform.
 - WebSockets when request/response or gRPC streaming is sufficient.
 
-## Foundation boundary
+## v0.1 boundary
 
-The first milestone establishes workspace policy, domain boundaries, reproducible protocol
-generation, and in-process ONNX feasibility. It intentionally does not expose a network port or
-claim production readiness.
+The v0.1 server exposes the frozen transports below and a CPU ONNX execution baseline. Distribution
+targets, model qualification status, and operational limitations are stated separately in
+`compatibility.md`; availability of a manifest is never presented as semantic verification.
 
 ## Execution semantics
 
