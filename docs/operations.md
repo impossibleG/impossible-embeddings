@@ -57,7 +57,10 @@ alias is a selector, not proof of the model revision or semantics.
 - `/health/live` indicates the process can serve control traffic.
 - `/health/ready` is successful only when lifecycle and model readiness permit inference.
 - Standard gRPC health reports the same readiness and changes to not-serving during drain.
-- `/metrics` is Prometheus text and follows the public authentication policy.
+- `/metrics` is Prometheus text. It requires the separate administrative credential when one is
+  configured, otherwise it falls back to the public credential. It is unauthenticated only for a
+  loopback-only server without credentials or when `allow_insecure_remote` explicitly acknowledges
+  an unauthenticated remote listener.
 - `/` is a host-detail-free aggregate status page.
 
 Logs are structured JSON on standard error. Configure filtering with `RUST_LOG`; keep production at

@@ -398,6 +398,19 @@ fn ephemeral_address() -> Result<String> {
     Ok(address.to_string())
 }
 
+fn ephemeral_remote_http_address() -> Result<(String, String)> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("reserve remote HTTP port")?;
+    let port = listener
+        .local_addr()
+        .context("read remote HTTP port")?
+        .port();
+    drop(listener);
+    Ok((
+        format!("0.0.0.0:{port}"),
+        format!("http://127.0.0.1:{port}"),
+    ))
+}
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_impossible-embedding")
 }
@@ -454,6 +467,42 @@ async fn start_server(fixture: &Fixture) -> Result<(RunningChild, String, String
         )));
     }
     Ok((running, base, grpc_address))
+}
+
+async fn start_metrics_server(
+    fixture: &Fixture,
+    http_bind: &str,
+    base: String,
+    extra_arguments: &[&str],
+) -> Result<RunningChild> {
+    let grpc_address = ephemeral_address()?;
+    let mut command = base_command(fixture);
+    command
+        .arg("serve")
+        .arg("--http-bind")
+        .arg(http_bind)
+        .arg("--grpc-bind")
+        .arg(grpc_address)
+        .arg("--cache-directory")
+        .arg(&fixture.cache)
+        .arg("--offline")
+        .arg("--admin-api-enabled")
+        .arg("false")
+        .arg("--shutdown-timeout-ms")
+        .arg("3000")
+        .args(extra_arguments);
+    let child = command.spawn().context("spawn metrics policy server")?;
+    let mut running = RunningChild { child: Some(child) };
+    if let Err(error) =
+        wait_for_http(&mut running, &format!("{base}/health/live"), StatusCode::OK).await
+    {
+        let output = running.stop().await?;
+        return Err(error.context(format!(
+            "metrics policy server output: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(running)
 }
 
 async fn wait_for_http(child: &mut RunningChild, url: &str, expected: StatusCode) -> Result<()> {
@@ -639,6 +688,83 @@ fn assert_private_data_absent(output: &std::process::Output, fixture: &Fixture) 
             "private fixture data appeared in logs"
         );
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_metrics_auth_uses_admin_then_public_then_accepted_no_auth() -> Result<()> {
+    let fixture = create_fixture()?;
+    let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
+
+    let (remote_bind, remote_base) = ephemeral_remote_http_address()?;
+    let remote_public = start_metrics_server(
+        &fixture,
+        &remote_bind,
+        remote_base.clone(),
+        &["--auth-env", "IE_E2E_PUBLIC_TOKEN"],
+    )
+    .await?;
+    assert_eq!(
+        client
+            .get(format!("{remote_base}/metrics"))
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .get(format!("{remote_base}/metrics"))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .get(format!("{remote_base}/metrics"))
+            .bearer_auth(PUBLIC_TOKEN)
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let output = remote_public.stop().await?;
+    assert_private_data_absent(&output, &fixture)?;
+
+    let local_address = ephemeral_address()?;
+    let local_base = format!("http://{local_address}");
+    let local = start_metrics_server(&fixture, &local_address, local_base.clone(), &[]).await?;
+    assert_eq!(
+        client
+            .get(format!("{local_base}/metrics"))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let output = local.stop().await?;
+    assert_private_data_absent(&output, &fixture)?;
+
+    let (insecure_bind, insecure_base) = ephemeral_remote_http_address()?;
+    let insecure = start_metrics_server(
+        &fixture,
+        &insecure_bind,
+        insecure_base.clone(),
+        &["--allow-insecure-remote"],
+    )
+    .await?;
+    assert_eq!(
+        client
+            .get(format!("{insecure_base}/metrics"))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let output = insecure.stop().await?;
+    assert_private_data_absent(&output, &fixture)?;
     Ok(())
 }
 

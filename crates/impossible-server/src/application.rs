@@ -1051,6 +1051,17 @@ impl AppState {
         self.admin_credential.is_some()
     }
 
+    /// Whether the metrics endpoint requires bearer authentication.
+    ///
+    /// Metrics uses the dedicated administrative credential when one is configured, otherwise it
+    /// falls back to the public credential. No credential is accepted only when the central
+    /// configuration validator has admitted a loopback-only listener or the operator's explicit
+    /// insecure-remote acknowledgement.
+    #[must_use]
+    pub fn metrics_auth_required(&self) -> bool {
+        self.metrics_credential().is_some()
+    }
+
     /// Verify a public bearer token candidate without exposing credential bytes.
     #[must_use]
     pub fn verify_public_token(&self, candidate: &[u8]) -> bool {
@@ -1066,6 +1077,19 @@ impl AppState {
         self.admin_credential
             .as_ref()
             .is_none_or(|secret| secret.verify(candidate))
+    }
+
+    /// Verify a metrics bearer token using the centralized admin-then-public fallback policy.
+    #[must_use]
+    pub fn verify_metrics_token(&self, candidate: &[u8]) -> bool {
+        self.metrics_credential()
+            .is_none_or(|secret| secret.verify(candidate))
+    }
+
+    fn metrics_credential(&self) -> Option<&Secret> {
+        self.admin_credential
+            .as_deref()
+            .or(self.public_credential.as_deref())
     }
 }
 

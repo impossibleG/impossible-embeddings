@@ -37,8 +37,9 @@ const JSON_CONTENT_TYPE: &str = "application/json";
 
 /// Build the complete HTTP v1 adapter without opening a listener.
 ///
-/// Administrative model routes are absent when disabled. Metrics always uses the separate
-/// administrative credential, while inference and model listing use the public credential.
+/// Administrative model routes are absent when disabled. Metrics uses the administrative
+/// credential when configured and otherwise falls back to the public credential. Inference and
+/// model listing use the public credential.
 pub fn router(state: AppState) -> Router {
     let public = Router::new()
         .route("/v1/embeddings", post(openai_embeddings))
@@ -60,7 +61,7 @@ pub fn router(state: AppState) -> Router {
             "/metrics",
             get(metrics).route_layer(middleware::from_fn_with_state(
                 state.clone(),
-                require_admin_auth,
+                require_metrics_auth,
             )),
         );
 
@@ -222,6 +223,20 @@ async fn require_admin_auth(
     if state.admin_auth_required()
         && !bearer_candidate(request.headers())
             .is_some_and(|candidate| state.verify_admin_token(candidate))
+    {
+        return wire_error(StatusCode::UNAUTHORIZED, ErrorCode::InvalidRequest);
+    }
+    next.run(request).await
+}
+
+async fn require_metrics_auth(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.metrics_auth_required()
+        && !bearer_candidate(request.headers())
+            .is_some_and(|candidate| state.verify_metrics_token(candidate))
     {
         return wire_error(StatusCode::UNAUTHORIZED, ErrorCode::InvalidRequest);
     }
@@ -1127,6 +1142,106 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(metrics_allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_falls_back_to_public_auth_when_admin_credential_is_absent() {
+        let directory = fixture_dir("metrics-public-fallback");
+        let public_file = directory.join("public.token");
+        fs::write(&public_file, b"public-fixture-token").expect("public credential");
+        let state = AppState::new(&ServerConfig {
+            http_bind: "0.0.0.0:18080".parse().expect("HTTP bind"),
+            grpc_bind: "127.0.0.1:18081".parse().expect("gRPC bind"),
+            cache_directory: directory.join("cache"),
+            auth: Some(CredentialSource::File(public_file)),
+            admin_auth: None,
+            admin_api_enabled: false,
+            ..ServerConfig::default()
+        })
+        .expect("valid remote state");
+        let app = router(state);
+
+        for request in [
+            Request::builder().uri("/metrics").body(Body::empty()),
+            Request::builder()
+                .uri("/metrics")
+                .header(AUTHORIZATION, "Bearer wrong-token")
+                .body(Body::empty()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request.expect("request"))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header(AUTHORIZATION, "Bearer public-fixture-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_without_credentials_requires_an_accepted_unauthenticated_deployment() {
+        let local = AppState::new(&ServerConfig {
+            cache_directory: fixture_dir("metrics-local-no-auth"),
+            admin_api_enabled: false,
+            ..ServerConfig::default()
+        })
+        .expect("valid loopback state");
+        assert_eq!(
+            router(local)
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .expect("request")
+                )
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::OK
+        );
+
+        let remote_without_acknowledgement = AppState::new(&ServerConfig {
+            http_bind: "0.0.0.0:18180".parse().expect("HTTP bind"),
+            grpc_bind: "127.0.0.1:18181".parse().expect("gRPC bind"),
+            cache_directory: fixture_dir("metrics-remote-rejected"),
+            admin_api_enabled: false,
+            ..ServerConfig::default()
+        });
+        assert!(remote_without_acknowledgement.is_err());
+
+        let acknowledged_remote = AppState::new(&ServerConfig {
+            http_bind: "0.0.0.0:18280".parse().expect("HTTP bind"),
+            grpc_bind: "127.0.0.1:18281".parse().expect("gRPC bind"),
+            cache_directory: fixture_dir("metrics-remote-acknowledged"),
+            allow_insecure_remote: true,
+            admin_api_enabled: false,
+            ..ServerConfig::default()
+        })
+        .expect("explicitly acknowledged remote state");
+        assert_eq!(
+            router(acknowledged_remote)
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .expect("request")
+                )
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

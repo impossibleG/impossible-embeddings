@@ -115,6 +115,9 @@ route names are frozen:
   and `delete` accept a model identifier in a strict JSON body.
 - `GET /health/live`, `GET /health/ready`, `GET /metrics`, and `GET /openapi.json` are the
   operational endpoints. `GET /` is a static aggregate status page and never reveals host details.
+  Metrics uses the administrative bearer credential when configured, otherwise the public bearer
+  credential; a credential-free metrics endpoint is limited to an accepted local or explicitly
+  acknowledged insecure-remote configuration.
 - `POST /mcp` is the MCP Streamable HTTP endpoint. The same tools are also available over MCP
   standard input/output when that process mode is selected.
 
