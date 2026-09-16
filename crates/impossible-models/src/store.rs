@@ -247,35 +247,40 @@ impl VerifiedModel {
     /// # Errors
     /// Returns an error if the artifact is undeclared, unsafe, replaced, or fails integrity.
     pub fn artifact_bytes(&self, relative: &str) -> Result<Vec<u8>> {
+        self.artifact_bytes_with_observer(relative, || Ok(()))
+    }
+
+    fn artifact_bytes_with_observer(
+        &self,
+        relative: &str,
+        after_open: impl FnOnce() -> Result<()>,
+    ) -> Result<Vec<u8>> {
         let artifact = self
             .manifest
             .artifacts
             .iter()
             .find(|artifact| artifact.path == relative)
             .ok_or_else(|| Error::Invalid("runtime requested an undeclared artifact".into()))?;
-        reject_reparse_components(&self.root, Path::new(relative))?;
-        let path = self.root.join(relative);
-        let mut options = OpenOptions::new();
-        options.read(true);
-        configure_no_follow(&mut options);
-        let mut file = options.open(&path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() != artifact.size {
-            return Err(Error::Invalid("artifact changed after verification".into()));
-        }
+        let mut file = open_contained_regular_file(&self.root, Path::new(relative), artifact.size)?;
+        after_open()?;
         let capacity = usize::try_from(artifact.size)
             .map_err(|_| Error::Invalid("artifact is too large for this platform".into()))?;
+        let read_limit = artifact
+            .size
+            .checked_add(1)
+            .ok_or_else(|| Error::Invalid("artifact length overflow".into()))?;
         let mut bytes = Vec::with_capacity(capacity);
-        file.read_to_end(&mut bytes)?;
-        if bytes.len() != capacity || format!("{:x}", Sha256::digest(&bytes)) != artifact.sha256 {
+        Read::by_ref(&mut file)
+            .take(read_limit)
+            .read_to_end(&mut bytes)?;
+        let final_metadata = file.metadata()?;
+        if bytes.len() != capacity
+            || is_reparse(&final_metadata)
+            || !final_metadata.is_file()
+            || final_metadata.len() != artifact.size
+            || format!("{:x}", Sha256::digest(&bytes)) != artifact.sha256
+        {
             return Err(Error::Invalid("artifact changed after verification".into()));
-        }
-        reject_reparse_components(&self.root, Path::new(relative))?;
-        let canonical = fs::canonicalize(&path)?;
-        if !canonical.starts_with(fs::canonicalize(&self.root)?) {
-            return Err(Error::Invalid(
-                "artifact escaped verified model root".into(),
-            ));
         }
         Ok(bytes)
     }
@@ -292,13 +297,7 @@ impl VerifiedModel {
             ));
         }
         for artifact in &stored.artifacts {
-            let path = self.artifact_path(&artifact.path)?;
-            let metadata = fs::symlink_metadata(&path)?;
-            if is_reparse(&metadata)
-                || !metadata.is_file()
-                || metadata.len() != artifact.size
-                || hash_file(&path)? != artifact.sha256
-            {
+            if !verify_contained_artifact(&self.root, artifact, &|| false)? {
                 return Err(Error::Invalid("artifact changed after verification".into()));
             }
         }
@@ -491,22 +490,7 @@ impl ModelStore {
             _ => return Ok(ModelStatus::Invalid),
         };
         for artifact in &stored.artifacts {
-            let path = directory.join(&artifact.path);
-            if reject_reparse_components(&directory, Path::new(&artifact.path)).is_err() {
-                return Ok(ModelStatus::Invalid);
-            }
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(ModelStatus::Invalid);
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.len() != artifact.size
-                || hash_file_with_cancel(&path, cancelled)? != artifact.sha256
-            {
+            if !verify_contained_artifact(&directory, artifact, cancelled)? {
                 return Ok(ModelStatus::Invalid);
             }
         }
@@ -1014,6 +998,350 @@ fn configure_no_follow(options: &mut OpenOptions) {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
     }
+}
+
+/// Creates each missing directory component under an already trusted base and proves after every
+/// operation that the component is still a real directory below that base. This is intentionally
+/// component-at-a-time: `create_dir_all` may otherwise traverse an attacker-replaced intermediate
+/// symlink or Windows junction.
+pub(crate) fn create_contained_parent_directories(base: &Path, relative_file: &Path) -> Result<()> {
+    let parent = relative_file.parent().unwrap_or_else(|| Path::new(""));
+    validate_relative_path(parent)?;
+    securely_create_parent_directories(base, parent)?;
+    revalidate_contained_directory(base, parent)
+}
+
+/// Opens a brand-new regular leaf below `base` without following a leaf symlink. The handle is
+/// returned only after a second component and canonical-containment pass, so callers never write
+/// through a path that was replaced at the create boundary. Existing leaves are never truncated.
+pub(crate) fn create_new_contained_file(base: &Path, relative: &Path) -> Result<fs::File> {
+    validate_relative_path(relative)?;
+    if relative.as_os_str().is_empty() {
+        return Err(Error::Invalid("file path cannot be empty".into()));
+    }
+    let file = securely_create_new_file(base, relative)?;
+    let metadata = file.metadata()?;
+    if is_reparse(&metadata) || !metadata.is_file() {
+        return Err(Error::Invalid(
+            "cache leaf is not a regular non-reparse file".into(),
+        ));
+    }
+    revalidate_contained_path(base, relative)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn locked_windows_directory_chain(base: &Path, relative: &Path) -> Result<Vec<fs::File>> {
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+    fn open_locked_directory(path: &Path) -> Result<fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = OpenOptions::new()
+            .read(true)
+            // Deliberately omit FILE_SHARE_DELETE. While this handle lives, Windows cannot
+            // rename/delete this component and substitute a junction before the child opens.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if is_reparse(&metadata) || !metadata.is_dir() {
+            return Err(Error::Invalid(
+                "cache path contains a junction or non-directory".into(),
+            ));
+        }
+        Ok(file)
+    }
+
+    let mut handles = vec![open_locked_directory(base)?];
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(Error::Invalid("path contains unsafe components".into()));
+        };
+        current.push(name);
+        match fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        handles.push(open_locked_directory(&current)?);
+    }
+    Ok(handles)
+}
+
+#[cfg(windows)]
+fn securely_create_parent_directories(base: &Path, relative: &Path) -> Result<()> {
+    let _locked = locked_windows_directory_chain(base, relative)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn securely_create_new_file(base: &Path, relative: &Path) -> Result<fs::File> {
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let _locked = locked_windows_directory_chain(base, parent)?;
+    let path = base.join(relative);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    configure_no_follow(&mut options);
+    options.open(path).map_err(Into::into)
+}
+
+#[cfg(windows)]
+fn securely_open_existing_file(base: &Path, relative: &Path) -> Result<fs::File> {
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let _locked = locked_windows_directory_chain(base, parent)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_no_follow(&mut options);
+    options.open(base.join(relative)).map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn securely_open_unix_parent(base: &Path, relative: &Path) -> Result<fs::File> {
+    use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
+
+    let mut directory = fs::File::from(open(
+        base,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    if is_reparse(&directory.metadata()?) || !directory.metadata()?.is_dir() {
+        return Err(Error::Invalid("cache directory cannot be a symlink".into()));
+    }
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(Error::Invalid("path contains unsafe components".into()));
+        };
+        if let Err(error) = mkdirat(&directory, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+            if error != rustix::io::Errno::EXIST {
+                return Err(std::io::Error::from(error).into());
+            }
+        }
+        directory = fs::File::from(openat(
+            &directory,
+            name,
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::CLOEXEC
+                | OFlags::NONBLOCK,
+            Mode::empty(),
+        )?);
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn securely_create_parent_directories(base: &Path, relative: &Path) -> Result<()> {
+    let _directory = securely_open_unix_parent(base, relative)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn securely_create_new_file(base: &Path, relative: &Path) -> Result<fs::File> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let directory = securely_open_unix_parent(base, parent)?;
+    let leaf = relative
+        .file_name()
+        .ok_or_else(|| Error::Invalid("file path has no leaf".into()))?;
+    Ok(fs::File::from(openat(
+        &directory,
+        leaf,
+        OFlags::WRONLY
+            | OFlags::CREATE
+            | OFlags::EXCL
+            | OFlags::NOFOLLOW
+            | OFlags::CLOEXEC
+            | OFlags::NONBLOCK,
+        Mode::RUSR | Mode::WUSR,
+    )?))
+}
+
+#[cfg(unix)]
+fn securely_open_existing_file(base: &Path, relative: &Path) -> Result<fs::File> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let directory = securely_open_unix_parent(base, parent)?;
+    let leaf = relative
+        .file_name()
+        .ok_or_else(|| Error::Invalid("file path has no leaf".into()))?;
+    Ok(fs::File::from(openat(
+        &directory,
+        leaf,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn securely_create_parent_directories(base: &Path, relative: &Path) -> Result<()> {
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        let metadata = fs::symlink_metadata(&current)?;
+        if is_reparse(&metadata) || !metadata.is_dir() {
+            return Err(Error::Invalid("cache path is unsafe".into()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn securely_create_new_file(base: &Path, relative: &Path) -> Result<fs::File> {
+    securely_create_parent_directories(base, relative.parent().unwrap_or_else(|| Path::new("")))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    configure_no_follow(&mut options);
+    options.open(base.join(relative)).map_err(Into::into)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn securely_open_existing_file(base: &Path, relative: &Path) -> Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_no_follow(&mut options);
+    options.open(base.join(relative)).map_err(Into::into)
+}
+
+fn validate_relative_path(relative: &Path) -> Result<()> {
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        && !relative.as_os_str().is_empty()
+    {
+        return Err(Error::Invalid("path contains unsafe components".into()));
+    }
+    Ok(())
+}
+
+fn canonical_directory(directory: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(Error::Invalid(
+            "cache directory cannot be a symlink or reparse point".into(),
+        ));
+    }
+    Ok(fs::canonicalize(directory)?)
+}
+
+fn revalidate_contained_directory(base: &Path, relative: &Path) -> Result<()> {
+    validate_relative_path(relative)?;
+    reject_reparse_components(base, relative)?;
+    let canonical_base = canonical_directory(base)?;
+    let directory = base.join(relative);
+    let metadata = fs::symlink_metadata(&directory)?;
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(Error::Invalid(
+            "cache directory cannot be a symlink or reparse point".into(),
+        ));
+    }
+    let canonical = fs::canonicalize(&directory)?;
+    if !canonical.starts_with(canonical_base) {
+        return Err(Error::Invalid("cache directory escaped containment".into()));
+    }
+    Ok(())
+}
+
+pub(crate) fn revalidate_contained_path(base: &Path, relative: &Path) -> Result<()> {
+    validate_relative_path(relative)?;
+    reject_reparse_components(base, relative)?;
+    let canonical_base = canonical_directory(base)?;
+    let path = base.join(relative);
+    let metadata = fs::symlink_metadata(&path)?;
+    if is_reparse(&metadata) || !metadata.is_file() {
+        return Err(Error::Invalid(
+            "cache leaf is not a regular non-reparse file".into(),
+        ));
+    }
+    let canonical = fs::canonicalize(&path)?;
+    if !canonical.starts_with(canonical_base) {
+        return Err(Error::Invalid("cache file escaped containment".into()));
+    }
+    Ok(())
+}
+
+fn open_contained_regular_file(
+    base: &Path,
+    relative: &Path,
+    expected_size: u64,
+) -> Result<fs::File> {
+    validate_relative_path(relative)?;
+    reject_reparse_components(base, relative)?;
+    let file = securely_open_existing_file(base, relative)?;
+    let metadata = file.metadata()?;
+    if is_reparse(&metadata) || !metadata.is_file() || metadata.len() != expected_size {
+        return Err(Error::Invalid("artifact changed after verification".into()));
+    }
+    Ok(file)
+}
+
+/// Hashes exactly the declared bytes from one no-follow, nonblocking handle. The `+1` cap detects
+/// growth without allowing an unbounded regular file, FIFO, or device to consume memory or time.
+fn verify_contained_artifact(
+    base: &Path,
+    artifact: &Artifact,
+    cancelled: &impl Fn() -> bool,
+) -> Result<bool> {
+    let relative = Path::new(&artifact.path);
+    let mut file = match open_contained_regular_file(base, relative, artifact.size) {
+        Ok(file) => file,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(Error::Invalid(_)) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut read_total = 0_u64;
+    let read_limit = artifact
+        .size
+        .checked_add(1)
+        .ok_or_else(|| Error::Invalid("artifact length overflow".into()))?;
+    loop {
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let remaining = read_limit.saturating_sub(read_total);
+        if remaining == 0 {
+            return Ok(false);
+        }
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| Error::Invalid("artifact length overflow".into()))?;
+        let read = file.read(&mut buffer[..limit])?;
+        if read == 0 {
+            break;
+        }
+        read_total = read_total
+            .checked_add(
+                u64::try_from(read)
+                    .map_err(|_| Error::Invalid("artifact length overflow".into()))?,
+            )
+            .ok_or_else(|| Error::Invalid("artifact length overflow".into()))?;
+        if read_total > artifact.size {
+            return Ok(false);
+        }
+        digest.update(&buffer[..read]);
+    }
+    let final_metadata = file.metadata()?;
+    if is_reparse(&final_metadata)
+        || !final_metadata.is_file()
+        || final_metadata.len() != artifact.size
+        || read_total != artifact.size
+        || format!("{:x}", digest.finalize()) != artifact.sha256
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn copy_import_artifact(
@@ -1558,28 +1886,6 @@ fn is_reparse(metadata: &fs::Metadata) -> bool {
     }
 }
 
-pub(crate) fn hash_file(path: &Path) -> Result<String> {
-    hash_file_with_cancel(path, &|| false)
-}
-
-fn hash_file_with_cancel(path: &Path, cancelled: &impl Fn() -> bool) -> Result<String> {
-    use std::io::Read;
-    let mut file = fs::File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    loop {
-        if cancelled() {
-            return Err(Error::Cancelled);
-        }
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
-}
-
 fn validate_import_source(source: &Path) -> Result<PathBuf> {
     if source.components().any(|component| {
         matches!(
@@ -1694,14 +2000,131 @@ mod transaction_tests {
     #[test]
     fn hashing_checks_cancellation_between_chunks() -> Result<()> {
         let temp = TempDir::new()?;
-        let path = temp.path().join("large.bin");
-        fs::write(&path, vec![7_u8; 256 * 1024])?;
+        let body = vec![7_u8; 256 * 1024];
+        fs::write(temp.path().join("large.bin"), &body)?;
+        let artifact = Artifact {
+            path: "large.bin".into(),
+            url: "https://example.invalid/large.bin".into(),
+            sha256: format!("{:x}", Sha256::digest(&body)),
+            size: u64::try_from(body.len())
+                .map_err(|_| Error::Invalid("test body length overflow".into()))?,
+        };
         let checks = Cell::new(0_u8);
-        let result = hash_file_with_cancel(&path, &|| {
+        let result = verify_contained_artifact(temp.path(), &artifact, &|| {
             checks.set(checks.get().saturating_add(1));
             checks.get() > 2
         });
         assert!(matches!(result, Err(Error::Cancelled)));
+        Ok(())
+    }
+
+    #[test]
+    fn status_hashing_is_capped_and_rejects_growth_on_the_open_handle() -> Result<()> {
+        let temp = TempDir::new()?;
+        let body = vec![3_u8; 128 * 1024];
+        let path = temp.path().join("artifact.bin");
+        fs::write(&path, &body)?;
+        let artifact = Artifact {
+            path: "artifact.bin".into(),
+            url: "https://example.invalid/artifact.bin".into(),
+            sha256: format!("{:x}", Sha256::digest(&body)),
+            size: u64::try_from(body.len())
+                .map_err(|_| Error::Invalid("test body length overflow".into()))?,
+        };
+        let mutated = Cell::new(false);
+        let mutation_succeeded = Cell::new(false);
+        let valid = verify_contained_artifact(temp.path(), &artifact, &|| {
+            if !mutated.replace(true) {
+                if let Ok(mut growing) = OpenOptions::new().append(true).open(&path) {
+                    mutation_succeeded
+                        .set(growing.write_all(b"x").is_ok() && growing.flush().is_ok());
+                }
+            }
+            false
+        })?;
+        assert!(mutation_succeeded.get());
+        assert!(!valid);
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_bytes_caps_growth_to_declared_size_plus_one() -> Result<()> {
+        let cache = TempDir::new()?;
+        let body = vec![5_u8; 128 * 1024];
+        let manifest = local_manifest(&body);
+        let store = trusted_store(cache.path(), &manifest)?;
+        let model = store.layout.model_dir(&manifest)?;
+        write_valid_model(&model, &manifest, &body)?;
+        let verified = store.verified_model(&manifest)?;
+        let path = model.join("weights/model.bin");
+        let result = verified.artifact_bytes_with_observer("weights/model.bin", || {
+            let mut growing = OpenOptions::new().append(true).open(&path)?;
+            growing.write_all(b"attacker-controlled-growth")?;
+            growing.flush()?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::Invalid(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn create_new_never_replaces_an_existing_leaf() -> Result<()> {
+        let temp = TempDir::new()?;
+        fs::create_dir(temp.path().join("nested"))?;
+        let leaf = temp.path().join("nested/artifact.bin");
+        fs::write(&leaf, b"sentinel")?;
+        let result = create_new_contained_file(temp.path(), Path::new("nested/artifact.bin"));
+        assert!(result.is_err());
+        assert_eq!(fs::read(leaf)?, b"sentinel");
+        Ok(())
+    }
+
+    #[test]
+    fn component_swap_between_preparation_and_create_is_rejected() -> Result<()> {
+        let cache = TempDir::new()?;
+        let outside = TempDir::new()?;
+        let relative = Path::new("nested/artifact.bin");
+        create_contained_parent_directories(cache.path(), relative)?;
+        fs::remove_dir(cache.path().join("nested"))?;
+        make_directory_link(outside.path(), &cache.path().join("nested"))?;
+
+        let result = create_new_contained_file(cache.path(), relative);
+        assert!(result.is_err());
+        assert!(!outside.path().join("artifact.bin").exists());
+        remove_directory_link(&cache.path().join("nested"))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn make_directory_link(target: &Path, link: &Path) -> Result<()> {
+        std::os::unix::fs::symlink(target, link)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn remove_directory_link(link: &Path) -> Result<()> {
+        fs::remove_file(link)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn make_directory_link(target: &Path, link: &Path) -> Result<()> {
+        let output = std::process::Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()?;
+        if !output.status.success() {
+            return Err(Error::Invalid(
+                "test environment could not create a directory junction".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn remove_directory_link(link: &Path) -> Result<()> {
+        fs::remove_dir(link)?;
         Ok(())
     }
 

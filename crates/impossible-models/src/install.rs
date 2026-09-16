@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    io,
+    io::{self, Write},
     path::Path,
     sync::{
         Arc,
@@ -79,7 +79,10 @@ use tokio::io::AsyncWriteExt;
 
 use crate::{
     Error, Manifest, ModelStatus, ModelStore, Result,
-    store::{prepare_staging, promote},
+    store::{
+        create_contained_parent_directories, create_new_contained_file, prepare_staging, promote,
+        revalidate_contained_path,
+    },
 };
 
 /// Cheap cloneable cancellation signal checked during locks and streamed transfers.
@@ -264,14 +267,12 @@ impl Installer {
         let staging = self.store.layout().staging_dir(manifest)?;
         prepare_staging(self.store.layout(), &staging)?;
         for artifact in &manifest.artifacts {
-            let target = staging.join(&artifact.path);
-            if let Some(parent) = target.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-                crate::store::ensure_contained_directory(&staging, parent)?;
-            }
+            let relative = Path::new(&artifact.path);
+            create_contained_parent_directories(&staging, relative)?;
             self.download(
                 &artifact.url,
-                &target,
+                &staging,
+                relative,
                 artifact.size,
                 &artifact.sha256,
                 cancel,
@@ -287,13 +288,22 @@ impl Installer {
             return Err(Error::Cancelled);
         }
         after_commit_boundary();
-        let manifest_path = staging.join("manifest.json");
-        tokio::fs::write(&manifest_path, manifest.to_json()?).await?;
-        let manifest_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&manifest_path)?;
+        let manifest_bytes = manifest.to_json()?;
+        let mut manifest_file = create_new_contained_file(&staging, Path::new("manifest.json"))?;
+        manifest_file.write_all(&manifest_bytes)?;
+        manifest_file.flush()?;
         manifest_file.sync_all()?;
+        let manifest_metadata = manifest_file.metadata()?;
+        if !manifest_metadata.is_file()
+            || manifest_metadata.len()
+                != u64::try_from(manifest_bytes.len())
+                    .map_err(|_| Error::Invalid("manifest length overflow".into()))?
+        {
+            return Err(Error::Invalid(
+                "staged manifest changed while writing".into(),
+            ));
+        }
+        revalidate_contained_path(&staging, Path::new("manifest.json"))?;
         drop(manifest_file);
         promote(self.store.layout(), manifest, &staging)?;
         drop(lock);
@@ -349,7 +359,8 @@ impl Installer {
     async fn download(
         &self,
         source: &str,
-        target: &Path,
+        staging: &Path,
+        relative: &Path,
         expected_size: u64,
         expected_hash: &str,
         cancel: &CancelToken,
@@ -391,20 +402,9 @@ impl Installer {
             }
             break response;
         };
-        if let Some(length) = response
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-        {
-            if length > expected_size {
-                return Err(Error::SizeLimit {
-                    expected: expected_size,
-                    actual: length,
-                });
-            }
-        }
-        let mut file = tokio::fs::File::create(target).await?;
+        validate_content_length(&response, expected_size)?;
+        let file = create_new_contained_file(staging, relative)?;
+        let mut file = tokio::fs::File::from_std(file);
         let mut digest = Sha256::new();
         let mut received = 0_u64;
         loop {
@@ -435,7 +435,7 @@ impl Installer {
         }
         file.flush().await?;
         file.sync_all().await?;
-        drop(file);
+        let final_metadata = file.metadata().await?;
         if received != expected_size {
             return Err(Error::SizeLimit {
                 expected: expected_size,
@@ -449,6 +449,13 @@ impl Installer {
                 actual,
             });
         }
+        if !final_metadata.is_file() || final_metadata.len() != expected_size {
+            return Err(Error::Invalid(
+                "staged artifact changed while writing".into(),
+            ));
+        }
+        revalidate_contained_path(staging, relative)?;
+        drop(file);
         Ok(())
     }
 
@@ -466,6 +473,23 @@ impl Installer {
             ))
         }
     }
+}
+
+fn validate_content_length(response: &reqwest::Response, expected_size: u64) -> Result<()> {
+    if let Some(length) = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        if length > expected_size {
+            return Err(Error::SizeLimit {
+                expected: expected_size,
+                actual: length,
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn wait_for_cancel(cancel: &CancelToken) {
@@ -611,12 +635,20 @@ mod tests {
     }
 
     async fn fixture_server(body: Vec<u8>) -> Result<(Url, tokio::task::JoinHandle<()>)> {
+        fixture_server_with_observer(body, || {}).await
+    }
+
+    async fn fixture_server_with_observer(
+        body: Vec<u8>,
+        after_request: impl FnOnce() + Send + 'static,
+    ) -> Result<(Url, tokio::task::JoinHandle<()>)> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let handle = tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let mut request = [0_u8; 1024];
                 let _ = stream.read(&mut request).await;
+                after_request();
                 let header = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -630,6 +662,50 @@ mod tests {
                 .map_err(|_| Error::Invalid("test URL did not parse".into()))?,
             handle,
         ))
+    }
+
+    #[tokio::test]
+    async fn artifact_write_rejects_a_component_swap_after_request() -> Result<()> {
+        let temp = TempDir::new()?;
+        let outside = TempDir::new()?;
+        let body = b"authenticated fixture bytes".to_vec();
+        let placeholder = fixture_manifest("https://example.invalid/artifact".into(), &body);
+        let store = ModelStore::new(temp.path())?;
+        let staging = store.layout().staging_dir(&placeholder)?;
+        let component = staging.join("weights");
+        let component_for_swap = component.clone();
+        let outside_path = outside.path().to_path_buf();
+        let (url, server) = fixture_server_with_observer(body.clone(), move || {
+            assert!(fs::remove_dir(&component_for_swap).is_ok());
+            assert!(make_directory_link(&outside_path, &component_for_swap).is_ok());
+        })
+        .await?;
+        let origin = Url::parse(&format!("{}/", url.origin().ascii_serialization()))
+            .map_err(|_| Error::Invalid("test origin did not parse".into()))?;
+        let manifest = fixture_manifest(url.to_string(), &body);
+        assert_eq!(
+            store.layout().staging_dir(&manifest)?,
+            staging,
+            "URL must not affect semantic cache identity"
+        );
+        let installer = Installer::new(
+            store,
+            InstallOptions {
+                allowed_origins: vec![origin],
+                max_artifact_bytes: 1024,
+                max_total_artifact_bytes: 1024,
+                ..InstallOptions::default()
+            },
+        )?;
+        let result = installer.install(&manifest, &CancelToken::new()).await;
+
+        assert!(result.is_err());
+        assert!(!outside.path().join("model.bin").exists());
+        remove_directory_link(&component)?;
+        server
+            .await
+            .map_err(|_| Error::Invalid("test server failed".into()))?;
+        Ok(())
     }
 
     #[test]
@@ -772,6 +848,82 @@ mod tests {
         server
             .await
             .map_err(|_| Error::Invalid("test server failed".into()))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manifest_write_rejects_a_staging_component_swap_after_commit() -> Result<()> {
+        let temp = TempDir::new()?;
+        let outside = TempDir::new()?;
+        let body = b"authenticated fixture bytes".to_vec();
+        let (url, server) = fixture_server(body.clone()).await?;
+        let origin = Url::parse(&format!("{}/", url.origin().ascii_serialization()))
+            .map_err(|_| Error::Invalid("test origin did not parse".into()))?;
+        let manifest = fixture_manifest(url.to_string(), &body);
+        let store = ModelStore::new(temp.path())?;
+        let installer = Installer::new(
+            store.clone(),
+            InstallOptions {
+                allowed_origins: vec![origin],
+                max_artifact_bytes: 1024,
+                max_total_artifact_bytes: 1024,
+                ..InstallOptions::default()
+            },
+        )?;
+        let staging = store.layout().staging_dir(&manifest)?;
+        let staging_for_swap = staging.clone();
+        let outside_path = outside.path().to_path_buf();
+        let result = installer
+            .install_transaction(
+                &manifest,
+                &CancelToken::new(),
+                &InstallCommitGate::new(),
+                move || {
+                    assert!(fs::remove_dir_all(&staging_for_swap).is_ok());
+                    assert!(make_directory_link(&outside_path, &staging_for_swap).is_ok());
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(!outside.path().join("manifest.json").exists());
+        remove_directory_link(&staging)?;
+        server
+            .await
+            .map_err(|_| Error::Invalid("test server failed".into()))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn make_directory_link(target: &Path, link: &Path) -> Result<()> {
+        std::os::unix::fs::symlink(target, link)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn remove_directory_link(link: &Path) -> Result<()> {
+        fs::remove_file(link)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn make_directory_link(target: &Path, link: &Path) -> Result<()> {
+        let output = std::process::Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()?;
+        if !output.status.success() {
+            return Err(Error::Invalid(
+                "test environment could not create a directory junction".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn remove_directory_link(link: &Path) -> Result<()> {
+        fs::remove_dir(link)?;
         Ok(())
     }
 }
