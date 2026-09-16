@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/impossible-embedding-header.png" alt="Impossible G — Embeddings" width="860">
+</p>
+
 # Impossible Embedding
 
 Impossible Embedding is a local-first server for dense text embeddings with open models. It owns
