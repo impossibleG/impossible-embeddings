@@ -38,6 +38,8 @@ RUN apt-get update \
 COPY --from=builder /release/impossible-embedding /usr/local/bin/impossible-embedding
 COPY --from=builder /release/lib/ /usr/local/lib/
 COPY --chown=root:root config/impossible-embedding.example.toml /etc/impossible-embedding/config.example.toml
+COPY --chown=root:root LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.txt /usr/share/licenses/impossible-embedding/
+COPY --chown=root:root licenses/ONNXRUNTIME-LICENSE /usr/share/licenses/impossible-embedding/ONNXRUNTIME-LICENSE
 
 ENV IMPOSSIBLE_CACHE_DIRECTORY=/var/lib/impossible-embedding \
     LD_LIBRARY_PATH=/usr/local/lib

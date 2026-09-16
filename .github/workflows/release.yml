@@ -97,6 +97,9 @@ jobs:
           done
           curl --fail --silent --show-error "http://127.0.0.1:$port/openapi.json" >/dev/null
           test "$(docker inspect --format '{{.Config.User}}' "$container")" = "65532:65532"
+          docker exec "$container" test -s /usr/share/licenses/impossible-embedding/THIRD_PARTY_LICENSES.txt
+          docker exec "$container" grep --quiet "PACKAGE: tokio " /usr/share/licenses/impossible-embedding/THIRD_PARTY_LICENSES.txt
+          docker exec "$container" test -s /usr/share/licenses/impossible-embedding/ONNXRUNTIME-LICENSE
 
   native:
     needs: gates
@@ -152,11 +155,13 @@ jobs:
           pattern: native-*
           path: dist
           merge-multiple: true
-      - name: Generate SPDX SBOM and unified checksums
+      - name: Validate target SBOMs and generate unified checksums
         shell: pwsh
         run: |
-          $env:SOURCE_DATE_EPOCH = git log -1 --format=%ct
-          ./scripts/generate-sbom.ps1 -OutputPath "dist/impossible-embedding-$env:GITHUB_REF_NAME.spdx.json"
+          foreach ($target in @("x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu")) {
+            $sbom = @(Get-ChildItem dist -File -Filter "*-$target.spdx.json")
+            if ($sbom.Count -ne 1) { throw "expected exactly one target-specific SBOM for $target" }
+          }
           $assets = Get-ChildItem dist -File | Where-Object { $_.Name -match '\.(zip|tar\.gz|spdx\.json)$' } | Sort-Object Name
           $lines = foreach ($asset in $assets) {
             $hash = (Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -167,13 +172,16 @@ jobs:
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
           subject-checksums: dist/SHA256SUMS
-      - name: Attest dependency SBOM
+      - name: Attest Windows dependency SBOM
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
-          subject-path: |
-            dist/*.zip
-            dist/*.tar.gz
-          sbom-path: dist/impossible-embedding-${{ github.ref_name }}.spdx.json
+          subject-path: dist/*-x86_64-pc-windows-msvc.zip
+          sbom-path: dist/*-x86_64-pc-windows-msvc.spdx.json
+      - name: Attest Linux dependency SBOM
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: dist/*-x86_64-unknown-linux-gnu.tar.gz
+          sbom-path: dist/*-x86_64-unknown-linux-gnu.spdx.json
       - name: Publish immutable GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}

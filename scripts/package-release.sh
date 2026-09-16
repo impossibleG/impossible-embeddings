@@ -28,10 +28,17 @@ stage="$temporary/$package_name"
 mkdir -p "$stage/config" "$stage/api"
 cp -P "$binary" "$stage/"
 if (( ${#runtime_libraries[@]} > 0 )); then cp -P "${runtime_libraries[@]}" "$stage/"; fi
-cp "$repo_root/README.md" "$repo_root/SECURITY.md" "$repo_root/LICENSE-MIT" "$repo_root/LICENSE-APACHE" "$repo_root/THIRD_PARTY_NOTICES.md" "$stage/"
+cp "$repo_root/README.md" "$repo_root/SECURITY.md" "$repo_root/LICENSE-MIT" "$repo_root/LICENSE-APACHE" "$repo_root/THIRD_PARTY_NOTICES.md" "$repo_root/THIRD_PARTY_LICENSES.txt" "$stage/"
 cp -R "$repo_root/licenses" "$stage/licenses"
 cp "$repo_root/config/impossible-embedding.example.toml" "$stage/config/"
 cp "$repo_root/docs/openapi-v1.json" "$repo_root/crates/impossible-protocol/proto/embedding.proto" "$stage/api/"
+
+command -v pwsh >/dev/null || { echo "PowerShell is required to generate the release SBOM" >&2; exit 1; }
+linkage=static
+if (( ${#runtime_libraries[@]} > 0 )); then linkage=dynamic; fi
+sbom="$repo_root/$output_directory/$package_name.spdx.json"
+pwsh -NoProfile -File "$repo_root/scripts/generate-sbom.ps1" -Target "$target" -OnnxRuntimeLinkage "$linkage" -OutputPath "$sbom"
+cp "$sbom" "$stage/sbom.spdx.json"
 
 archive="$repo_root/$output_directory/$package_name.tar.gz"
 epoch="${SOURCE_DATE_EPOCH:-$(git -C "$repo_root" log -1 --format=%ct)}"

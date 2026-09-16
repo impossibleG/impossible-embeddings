@@ -45,12 +45,33 @@ try {
     $root = $roots[0].FullName
     foreach ($required in @(
         "README.md", "SECURITY.md", "LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_NOTICES.md",
+        "THIRD_PARTY_LICENSES.txt", "sbom.spdx.json",
         "config/impossible-embedding.example.toml", "api/openapi-v1.json", "api/embedding.proto",
         "licenses/ONNXRUNTIME-LICENSE"
     )) {
         if (-not (Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) {
             throw "release archive is missing required content"
         }
+    }
+
+    $licenseBundle = [IO.File]::ReadAllText((Join-Path $root "THIRD_PARTY_LICENSES.txt"))
+    foreach ($requiredText in @("PACKAGE: tokio ", "Permission is hereby granted", "Apache License", "Redistribution and use in source and binary forms")) {
+        if (-not $licenseBundle.Contains($requiredText, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "release archive license bundle is missing representative dependency text"
+        }
+    }
+    $sbom = Get-Content -LiteralPath (Join-Path $root "sbom.spdx.json") -Raw | ConvertFrom-Json
+    $onnx = @($sbom.packages | Where-Object name -eq "onnxruntime")
+    if ($onnx.Count -ne 1 -or $onnx[0].versionInfo -ne "1.22.0" -or $onnx[0].licenseDeclared -ne "MIT") {
+        throw "release archive SBOM has invalid ONNX Runtime metadata"
+    }
+    if ($onnx[0].downloadLocation -notmatch '^https://' -or $onnx[0].checksums.checksumValue -notmatch '^[0-9a-f]{64}$') {
+        throw "release archive SBOM is missing the ONNX Runtime download or checksum"
+    }
+    $onnxRelationships = @($sbom.relationships | Where-Object relatedSpdxElement -eq $onnx[0].SPDXID)
+    if (-not ($onnxRelationships.relationshipType -contains "DEPENDS_ON") -or
+        -not (($onnxRelationships.relationshipType -contains "STATIC_LINK") -xor ($onnxRelationships.relationshipType -contains "DYNAMIC_LINK"))) {
+        throw "release archive SBOM has invalid ONNX Runtime dependency/linkage relationships"
     }
 
     $binaryName = if ($IsWindows) { "impossible-embedding.exe" } else { "impossible-embedding" }

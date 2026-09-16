@@ -2,9 +2,9 @@
 
 This file is generated from the locked Rust dependency graph by `scripts/generate-third-party-notices.ps1`. Do not edit it by hand.
 
-Impossible Embedding is distributed under MIT OR Apache-2.0. Native packages also redistribute the ONNX Runtime shared library under the MIT license; its license text is included at `licenses/ONNXRUNTIME-LICENSE`.
+Impossible Embedding is distributed under MIT OR Apache-2.0. Native packages also redistribute ONNX Runtime 1.22.0 under the MIT license, either statically or as a shared library as recorded in each target SBOM; its license text is included at `licenses/ONNXRUNTIME-LICENSE`.
 
-The inventory below records declared package licenses. The complete corresponding license text is included in each source package and remains available from its registry or repository. `cargo deny` validates this graph against the repository license policy.
+The inventory below records declared package licenses. The corresponding copyright, notice, and license/permission texts are mapped and deduplicated in `THIRD_PARTY_LICENSES.txt`. `cargo deny` validates this graph against the repository license policy.
 
 | Package | Version | Declared license | Source |
 | --- | --- | --- | --- |

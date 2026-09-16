@@ -102,4 +102,6 @@ platforms, and honest limitations are documented in [compatibility](docs/compati
 ## License
 
 Licensed under either Apache License 2.0 or the MIT license, at your option. Distributed third-party
-components are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+components are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), with their complete
+deduplicated copyright, notice, and permission texts in
+[THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt).

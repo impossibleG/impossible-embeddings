@@ -3,7 +3,7 @@
 ## Maintainer procedure
 
 1. Update the single workspace version in `Cargo.toml` and regenerate `Cargo.lock` if required.
-2. Regenerate `THIRD_PARTY_NOTICES.md` and run it again with `-Check`.
+2. Regenerate `THIRD_PARTY_NOTICES.md` and `THIRD_PARTY_LICENSES.txt`, then run the generator again with `-Check`.
 3. Run the complete commands in the README from a clean checkout.
 4. Commit the version change, then create and push an annotated `vMAJOR.MINOR.PATCH` tag.
 5. Let `.github/workflows/release.yml` publish the release. Do not upload hand-built replacements.
@@ -11,7 +11,7 @@
 The workflow rejects a tag that differs from the workspace version. It runs locked quality,
 dependency, advisory, privacy, and notice gates; builds the hardened container; creates Windows and
 Linux x86-64 native archives; executes each packaged binary and its HTTP process; generates an SPDX
-SBOM and SHA-256 checksums; and requests keyless Sigstore-backed GitHub attestations before creating
+SBOM for each target and SHA-256 checksums; and requests keyless Sigstore-backed GitHub attestations before creating
 the GitHub release. An existing release is never overwritten.
 
 The repository does not claim that a workflow feature succeeded until the tag's run is green. In
@@ -46,7 +46,9 @@ missing provenance, not as a successful verification.
 
 Each native archive contains one versioned top-level directory and no model weights. It contains the
 executable, any runtime libraries emitted by the target build, configuration example, HTTP and
-protobuf schemas, project licenses, ONNX Runtime license, third-party inventory, README, and security
-policy. The adjacent
+protobuf schemas, project licenses, ONNX Runtime license, third-party inventory, deduplicated full
+copyright/license/notice texts, a target-specific SPDX SBOM, README, and security policy. The SBOM
+records the checksum-pinned ONNX Runtime 1.22.0 distribution selected by `ort-sys` and whether the
+packaged target statically or dynamically links it. The adjacent
 `.sha256` file is convenient per-archive verification; `SHA256SUMS` covers all primary assets and the
-SBOM.
+target-specific SBOMs.

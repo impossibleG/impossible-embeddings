@@ -15,6 +15,9 @@ and inference qualification run are added. The container recipe is Linux x86-64 
 
 Native archives include the executable, any runtime shared libraries emitted by the build, example
 configuration, protocol schemas, project licenses, third-party notices, and ONNX Runtime's license.
+They also contain the complete deduplicated dependency license/notice text bundle and a
+target-specific SPDX SBOM. The container installs the same notices under
+`/usr/share/licenses/impossible-embedding`.
 The current baseline may link ONNX Runtime into the executable instead of emitting a separate file.
 
 ## Model compatibility

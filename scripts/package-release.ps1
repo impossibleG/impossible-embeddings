@@ -49,12 +49,20 @@ try {
     foreach ($file in @("README.md", "SECURITY.md", "LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_NOTICES.md")) {
         Copy-Item -LiteralPath (Join-Path $repoRoot $file) -Destination $stage
     }
+    Copy-Item -LiteralPath (Join-Path $repoRoot "THIRD_PARTY_LICENSES.txt") -Destination $stage
     Copy-Item -LiteralPath (Join-Path $repoRoot "licenses") -Destination $stage -Recurse
     New-Item -ItemType Directory -Force -Path (Join-Path $stage "config") | Out-Null
     Copy-Item -LiteralPath (Join-Path $repoRoot "config/impossible-embedding.example.toml") -Destination (Join-Path $stage "config")
     New-Item -ItemType Directory -Force -Path (Join-Path $stage "api") | Out-Null
     Copy-Item -LiteralPath (Join-Path $repoRoot "docs/openapi-v1.json") -Destination (Join-Path $stage "api")
     Copy-Item -LiteralPath (Join-Path $repoRoot "crates/impossible-protocol/proto/embedding.proto") -Destination (Join-Path $stage "api")
+
+    $linkage = if ($runtimeLibraries.Count -gt 0) { "dynamic" } else { "static" }
+    $sbomName = "$packageName.spdx.json"
+    $sbomPath = Join-Path $outputRoot $sbomName
+    & (Join-Path $repoRoot "scripts/generate-sbom.ps1") -Target $Target -OnnxRuntimeLinkage $linkage -OutputPath $sbomPath
+    if ($LASTEXITCODE -ne 0) { throw "SBOM generation failed" }
+    Copy-Item -LiteralPath $sbomPath -Destination (Join-Path $stage "sbom.spdx.json")
 
     $archive = Join-Path $outputRoot "$packageName.zip"
     if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive }
