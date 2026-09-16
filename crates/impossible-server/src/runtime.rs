@@ -2,7 +2,8 @@
 
 use impossible_embedding_core::{
     CancellationToken, EmbedOptions, EmbeddingBatch, EmbeddingBatchCost, EmbeddingOutput,
-    EngineFailure, ErrorCode, ExecutionControl, RequestedModel, ResolvedModelIdentity,
+    EmbeddingUsage, EngineFailure, ErrorCode, ExecutionControl, RequestedModel,
+    ResolvedModelIdentity,
 };
 use impossible_embedding_onnx::OnnxEmbeddingEngine;
 use impossible_models::{
@@ -2027,7 +2028,14 @@ fn execute_batch(
     }));
     match result {
         Ok(Ok(output)) if valid_engine_output(&output, &requests, &sizes) => {
-            publish_results(requests, sizes, output.vectors, &output.model, accepting);
+            publish_results(
+                requests,
+                sizes,
+                output.vectors,
+                &output.usage,
+                &output.model,
+                accepting,
+            );
         }
         Ok(Ok(_)) | Err(_) => fail_requests(requests, ErrorCode::InferenceFailed),
         Ok(Err(error)) => fail_requests(requests, error.public_error().code),
@@ -2041,7 +2049,10 @@ fn valid_engine_output(output: &EmbeddingOutput, requests: &[Request], sizes: &[
     else {
         return false;
     };
-    if output.vectors.len() != total || !identity_is_complete(&output.model) {
+    if output.vectors.len() != total
+        || output.usage.input_tokens().len() != total
+        || !identity_is_complete(&output.model)
+    {
         return false;
     }
     let mut offset = 0_usize;
@@ -2059,6 +2070,21 @@ fn valid_engine_output(output: &EmbeddingOutput, requests: &[Request], sizes: &[
         let Some(vectors) = output.vectors.get(offset..end) else {
             return false;
         };
+        let Some(input_tokens) = output.usage.input_tokens().get(offset..end) else {
+            return false;
+        };
+        let Some(expected_tokens) = u64::try_from(request.cost.tokens()).ok() else {
+            return false;
+        };
+        let Some(actual_tokens) = input_tokens
+            .iter()
+            .try_fold(0_u64, |sum, tokens| sum.checked_add(*tokens))
+        else {
+            return false;
+        };
+        if actual_tokens != expected_tokens {
+            return false;
+        }
         if vectors.iter().any(|vector| {
             vector.len() != expected_dimensions || !vector.iter().all(|value| value.is_finite())
         }) {
@@ -2073,10 +2099,12 @@ fn publish_results(
     requests: Vec<Request>,
     sizes: Vec<usize>,
     vectors: Vec<Vec<f32>>,
+    usage: &EmbeddingUsage,
     model: &ResolvedModelIdentity,
     accepting: &AtomicBool,
 ) {
     let mut vectors = vectors.into_iter();
+    let mut input_tokens = usage.input_tokens().iter().copied();
     for (request, size) in requests.into_iter().zip(sizes) {
         if !accepting.load(Ordering::Acquire) {
             let _ = request
@@ -2084,6 +2112,7 @@ fn publish_results(
                 .send(Err(EngineFailure::public(ErrorCode::ModelUnavailable)));
             for _ in 0..size {
                 let _ = vectors.next();
+                let _ = input_tokens.next();
             }
             continue;
         }
@@ -2091,13 +2120,22 @@ fn publish_results(
             let _ = request.response.send(Err(error));
             for _ in 0..size {
                 let _ = vectors.next();
+                let _ = input_tokens.next();
             }
             continue;
         }
         let response_vectors = vectors.by_ref().take(size).collect();
+        let response_tokens = input_tokens.by_ref().take(size).collect();
+        let Ok(response_usage) = EmbeddingUsage::new(response_tokens) else {
+            let _ = request
+                .response
+                .send(Err(EngineFailure::public(ErrorCode::InferenceFailed)));
+            continue;
+        };
         let _ = request.response.send(Ok(EmbeddingOutput {
             vectors: response_vectors,
             model: model.clone(),
+            usage: response_usage,
         }));
     }
 }
@@ -2146,6 +2184,26 @@ mod tests {
         ResolvedModelIdentity::new(model.as_str(), "rev", "fake@1", "artifact", "semantic")
     }
 
+    fn default_test_usage(batch: &EmbeddingBatch<'_>) -> Result<EmbeddingUsage, EngineFailure> {
+        EmbeddingUsage::new(
+            batch
+                .inputs()
+                .iter()
+                .map(|input| {
+                    input
+                        .len()
+                        .checked_add(2)
+                        .and_then(|tokens| u64::try_from(tokens).ok())
+                        .ok_or_else(|| EngineFailure::public(ErrorCode::InferenceFailed))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    }
+
+    fn unit_test_usage(batch: &EmbeddingBatch<'_>) -> Result<EmbeddingUsage, EngineFailure> {
+        EmbeddingUsage::new(vec![1; batch.inputs().len()])
+    }
+
     struct FakeEngine {
         calls: AtomicUsize,
         finished: AtomicBool,
@@ -2173,6 +2231,7 @@ mod tests {
             Ok(EmbeddingOutput {
                 vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
                 model: test_identity(model)?,
+                usage: default_test_usage(batch)?,
             })
         }
 
@@ -2262,6 +2321,19 @@ mod tests {
             Ok(EmbeddingOutput {
                 vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
                 model: test_identity(model)?,
+                usage: EmbeddingUsage::new(
+                    batch
+                        .inputs()
+                        .iter()
+                        .map(|input| {
+                            Self::sequence_length(input).and_then(|tokens| {
+                                u64::try_from(tokens).map_err(|error| {
+                                    EngineFailure::with_source(ErrorCode::Internal, error)
+                                })
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                )?,
             })
         }
 
@@ -2297,6 +2369,7 @@ mod tests {
             Ok(EmbeddingOutput {
                 vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
                 model: test_identity(model)?,
+                usage: default_test_usage(batch)?,
             })
         }
 
@@ -2326,6 +2399,7 @@ mod tests {
             Ok(EmbeddingOutput {
                 vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
                 model: test_identity(model)?,
+                usage: default_test_usage(batch)?,
             })
         }
 
@@ -2358,6 +2432,7 @@ mod tests {
             Ok(EmbeddingOutput {
                 vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
                 model: test_identity(model)?,
+                usage: default_test_usage(batch)?,
             })
         }
 
@@ -2422,6 +2497,7 @@ mod tests {
                     })
                     .collect(),
                 model: test_identity(model)?,
+                usage: default_test_usage(batch)?,
             })
         }
 
@@ -2470,6 +2546,7 @@ mod tests {
             Ok(EmbeddingOutput {
                 vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
                 model: test_identity(model)?,
+                usage: unit_test_usage(batch)?,
             })
         }
 
@@ -2485,6 +2562,8 @@ mod tests {
         WrongCount,
         RaggedWidth,
         NonFinite,
+        WrongUsageCount,
+        WrongUsageValue,
         IgnoresRequestedWidth,
     }
 
@@ -2511,6 +2590,7 @@ mod tests {
                 .iter()
                 .map(|_| vec![1.0, 2.0])
                 .collect::<Vec<_>>();
+            let mut usage = default_test_usage(batch)?;
             match self.0 {
                 HostileOutput::WrongIdentity => identity.revision = "substituted".into(),
                 HostileOutput::IncompleteIdentity => identity.runtime.clear(),
@@ -2519,11 +2599,14 @@ mod tests {
                     vectors[0].pop();
                 }
                 HostileOutput::NonFinite => vectors[0][0] = f32::NAN,
+                HostileOutput::WrongUsageCount => usage = EmbeddingUsage::new(vec![3, 3])?,
+                HostileOutput::WrongUsageValue => usage = EmbeddingUsage::new(vec![4])?,
                 HostileOutput::IgnoresRequestedWidth => {}
             }
             Ok(EmbeddingOutput {
                 vectors,
                 model: identity,
+                usage,
             })
         }
 
@@ -2819,8 +2902,14 @@ mod tests {
             None,
         );
         let (a, b) = tokio::join!(a, b);
-        assert_eq!(a?.vectors, vec![vec![2.0, 0.0], vec![2.0, 1.0]]);
-        assert_eq!(b?.vectors, vec![vec![2.0, 2.0]]);
+        let a = a?;
+        let b = b?;
+        assert_eq!(a.vectors, vec![vec![2.0, 0.0], vec![2.0, 1.0]]);
+        assert_eq!(a.usage.input_tokens(), [3, 3]);
+        assert_eq!(a.usage.total_tokens(), 6);
+        assert_eq!(b.vectors, vec![vec![2.0, 2.0]]);
+        assert_eq!(b.usage.input_tokens(), [3]);
+        assert_eq!(b.usage.total_tokens(), 3);
         assert_eq!(engine.calls.load(Ordering::Acquire), 1);
         Ok(())
     }
@@ -4453,6 +4542,8 @@ mod tests {
             HostileOutput::WrongCount,
             HostileOutput::RaggedWidth,
             HostileOutput::NonFinite,
+            HostileOutput::WrongUsageCount,
+            HostileOutput::WrongUsageValue,
         ] {
             let runtime = ApplicationRuntime::new(policy())?;
             runtime.register_engine("fake", Arc::new(HostileEngine(mode)))?;

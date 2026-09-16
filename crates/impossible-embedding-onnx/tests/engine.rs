@@ -501,6 +501,16 @@ fn preflight_reports_exact_padded_cost_and_enforces_manifest_semantics() -> Resu
     assert_eq!(cost.tokens(), 7);
     assert_eq!(cost.max_sequence_length(), 4);
     assert_eq!(cost.padded_tokens()?, 8);
+    let requested = RequestedModel::new("fixture/cast-embedding")?;
+    let batch = EmbeddingBatch::new(["hello", "hello world"].into_iter().map(Cow::Borrowed))?;
+    let output = engine.embed_with_options(
+        &requested,
+        &batch,
+        &ExecutionControl::new(CancellationToken::default(), None),
+        defaults,
+    )?;
+    assert_eq!(output.usage.input_tokens(), [3, 4]);
+    assert_eq!(output.usage.total_tokens(), 7);
 
     let overlong = ["hello world hello world"];
     assert!(preflight(&engine, &overlong, defaults).is_err());

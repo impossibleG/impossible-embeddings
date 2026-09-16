@@ -5,8 +5,8 @@
 
 pub use impossible_embedding_core::{EmbedOptions, EmbeddingTask, Truncation};
 use impossible_embedding_core::{
-    EmbeddingBatch, EmbeddingBatchCost, EmbeddingEngine, EmbeddingOutput, EngineFailure, ErrorCode,
-    ExecutionControl, RequestedModel, ResolvedModelIdentity,
+    EmbeddingBatch, EmbeddingBatchCost, EmbeddingEngine, EmbeddingOutput, EmbeddingUsage,
+    EngineFailure, ErrorCode, ExecutionControl, RequestedModel, ResolvedModelIdentity,
 };
 use impossible_models::{Manifest, OnnxInputNames, Pooling, RuntimeMetadata, VerifiedModel};
 use ort::{
@@ -284,6 +284,15 @@ impl OnnxEmbeddingEngine {
                 model.encode(&prepared, options.truncation)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let usage = EmbeddingUsage::new(
+            encodings
+                .iter()
+                .map(|encoding| {
+                    u64::try_from(encoding.len())
+                        .map_err(|error| EngineFailure::with_source(ErrorCode::Internal, error))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
         control.ensure_active()?;
         let normalize = options.normalize.unwrap_or(model.contract.normalize);
         let vectors = model.run(&encodings, options.dimensions, normalize)?;
@@ -291,6 +300,7 @@ impl OnnxEmbeddingEngine {
         Ok(EmbeddingOutput {
             vectors,
             model: model.identity.clone(),
+            usage,
         })
     }
 }

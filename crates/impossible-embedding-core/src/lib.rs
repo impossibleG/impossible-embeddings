@@ -255,6 +255,51 @@ pub struct EmbeddingOutput {
     pub vectors: Vec<Vec<f32>>,
     /// Exact model identity used to produce the vectors.
     pub model: ResolvedModelIdentity,
+    /// Exact post-prefix, post-truncation tokenizer usage, ordered by request input.
+    pub usage: EmbeddingUsage,
+}
+
+/// Exact tokenizer usage for an embedding result.
+///
+/// The ordered per-input counts make dynamically batched output safely splittable without
+/// estimating from text or relying on transport-specific accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingUsage {
+    input_tokens: Vec<u64>,
+    total_tokens: u64,
+}
+
+impl EmbeddingUsage {
+    /// Construct usage from exact ordered tokenizer counts.
+    ///
+    /// # Errors
+    /// Returns an inference failure for an empty result or if the total would overflow `u64`.
+    pub fn new(input_tokens: Vec<u64>) -> Result<Self, EngineFailure> {
+        if input_tokens.is_empty() {
+            return Err(EngineFailure::public(ErrorCode::InferenceFailed));
+        }
+        let total_tokens = input_tokens.iter().try_fold(0_u64, |total, tokens| {
+            total
+                .checked_add(*tokens)
+                .ok_or_else(|| EngineFailure::public(ErrorCode::InferenceFailed))
+        })?;
+        Ok(Self {
+            input_tokens,
+            total_tokens,
+        })
+    }
+
+    /// Ordered token count for every input.
+    #[must_use]
+    pub fn input_tokens(&self) -> &[u64] {
+        &self.input_tokens
+    }
+
+    /// Exact aggregate input-token count.
+    #[must_use]
+    pub const fn total_tokens(&self) -> u64 {
+        self.total_tokens
+    }
 }
 
 /// Stable, privacy-safe codes exposed by every transport.
@@ -781,6 +826,16 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn usage_is_ordered_and_overflow_safe() -> Result<(), EngineFailure> {
+        let usage = EmbeddingUsage::new(vec![2, 7, 3])?;
+        assert_eq!(usage.input_tokens(), [2, 7, 3]);
+        assert_eq!(usage.total_tokens(), 12);
+        assert!(EmbeddingUsage::new(Vec::new()).is_err());
+        assert!(EmbeddingUsage::new(vec![u64::MAX, 1]).is_err());
+        Ok(())
+    }
+
     struct CancelsDuringInference;
 
     struct CancelsThenFails;
@@ -812,6 +867,7 @@ mod tests {
             Ok(EmbeddingOutput {
                 vectors: vec![vec![1.0]],
                 model: identity()?,
+                usage: EmbeddingUsage::new(vec![1])?,
             })
         }
     }

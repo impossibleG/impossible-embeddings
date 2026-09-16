@@ -101,3 +101,25 @@ stable for the lifetime of v1; clients must treat unspecified or unknown enum va
 Cancellation and deadline checks run after native inference on both success and failure paths.
 When cancellation or deadline expiry is observed after dispatch, that control-state failure takes
 precedence over any late engine result, including a simultaneous engine failure.
+
+## Frozen v1 transport surface
+
+The checked-in [`openapi-v1.json`](openapi-v1.json) document is the normative HTTP schema. The v1
+route names are frozen:
+
+- `POST /v1/embeddings` is the OpenAI-compatible adapter. `input` is one string or a non-empty
+  string array. `encoding_format` may be omitted or equal `float`; unknown fields are rejected.
+- `POST /v1/embed` is the typed native adapter. It exposes `task`, `truncation`, `dimensions`, and
+  `normalize`, and returns the complete immutable resolved model identity plus exact token usage.
+- `GET /v1/models` lists aggregate model state. `POST /v1/admin/models/install`, `load`, `unload`,
+  and `delete` accept a model identifier in a strict JSON body.
+- `GET /health/live`, `GET /health/ready`, `GET /metrics`, and `GET /openapi.json` are the
+  operational endpoints. `GET /` is a static aggregate status page and never reveals host details.
+- `POST /mcp` is the MCP Streamable HTTP endpoint. The same tools are also available over MCP
+  standard input/output when that process mode is selected.
+
+Native HTTP failures use the strict envelope
+`{"error":{"code":"...","message":"...","retryable":false}}`. The gRPC service carries the
+same semantics with `PublicErrorDetail`. HTTP and protobuf response usage reports the exact
+post-prefix, post-truncation tokenizer counts. `input_tokens` preserves input order; `prompt_tokens`
+and `total_tokens` are the checked sum and are identical for embedding-only responses.

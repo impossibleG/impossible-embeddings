@@ -9,6 +9,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .build_transport(false)
+        .file_descriptor_set_path(
+            std::path::PathBuf::from(std::env::var("OUT_DIR")?)
+                .join("impossible_embedding_v1_descriptor.bin"),
+        )
         .compile_with_config(prost, &["proto/embedding.proto"], &["proto"])?;
 
     println!("cargo:rerun-if-changed=proto/embedding.proto");

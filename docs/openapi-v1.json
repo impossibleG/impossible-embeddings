@@ -1,0 +1,87 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Impossible Embedding API",
+    "version": "1.0.0",
+    "description": "Stable local-first embedding and model lifecycle API. Unknown request fields are rejected."
+  },
+  "paths": {
+    "/": { "get": { "operationId": "statusPage", "responses": { "200": { "description": "Aggregate status page", "content": { "text/html": { "schema": { "type": "string" } } } } } } },
+    "/v1/embeddings": {
+      "post": {
+        "operationId": "createOpenAiEmbedding",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OpenAiEmbeddingRequest" } } } },
+        "responses": {
+          "200": { "description": "Embedding result", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OpenAiEmbeddingResponse" } } } },
+          "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Error" }, "429": { "$ref": "#/components/responses/Error" }, "500": { "$ref": "#/components/responses/Error" }, "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/embed": {
+      "post": {
+        "operationId": "createNativeEmbedding",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NativeEmbeddingRequest" } } } },
+        "responses": {
+          "200": { "description": "Embedding result with immutable model identity", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NativeEmbeddingResponse" } } } },
+          "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Error" }, "429": { "$ref": "#/components/responses/Error" }, "500": { "$ref": "#/components/responses/Error" }, "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/models": { "get": { "operationId": "listModels", "responses": { "200": { "description": "Installed and loaded model summaries", "content": { "application/json": { "schema": { "type": "object", "required": ["data"], "additionalProperties": false, "properties": { "data": { "type": "array", "items": { "$ref": "#/components/schemas/ModelSummary" } } } } } } }, "401": { "$ref": "#/components/responses/Error" } } } },
+    "/v1/admin/models/install": { "post": { "operationId": "installModel", "requestBody": { "$ref": "#/components/requestBodies/ModelCommand" }, "responses": { "202": { "$ref": "#/components/responses/ModelCommandAccepted" }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" }, "503": { "$ref": "#/components/responses/Error" } } } },
+    "/v1/admin/models/load": { "post": { "operationId": "loadModel", "requestBody": { "$ref": "#/components/requestBodies/ModelCommand" }, "responses": { "200": { "$ref": "#/components/responses/ModelCommandCompleted" }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Error" }, "404": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" }, "503": { "$ref": "#/components/responses/Error" } } } },
+    "/v1/admin/models/unload": { "post": { "operationId": "unloadModel", "requestBody": { "$ref": "#/components/requestBodies/ModelCommand" }, "responses": { "200": { "$ref": "#/components/responses/ModelCommandCompleted" }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Error" }, "404": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" }, "503": { "$ref": "#/components/responses/Error" } } } },
+    "/v1/admin/models/delete": { "post": { "operationId": "deleteModel", "requestBody": { "$ref": "#/components/requestBodies/ModelCommand" }, "responses": { "200": { "$ref": "#/components/responses/ModelCommandCompleted" }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Error" }, "404": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" }, "503": { "$ref": "#/components/responses/Error" } } } },
+    "/health/live": { "get": { "operationId": "liveHealth", "responses": { "200": { "description": "Process is live", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } } }, "503": { "description": "Process is stopped", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } } } } } },
+    "/health/ready": { "get": { "operationId": "readyHealth", "responses": { "200": { "description": "At least one model can serve", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } } }, "503": { "description": "Service is not ready", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } } } } } },
+    "/metrics": { "get": { "operationId": "prometheusMetrics", "responses": { "200": { "description": "Prometheus text exposition", "content": { "text/plain": { "schema": { "type": "string" } } } } } } },
+    "/openapi.json": { "get": { "operationId": "openApiContract", "responses": { "200": { "description": "This OpenAPI contract", "content": { "application/json": { "schema": { "type": "object" } } } } } } },
+    "/mcp": { "post": { "operationId": "mcpStreamableHttp", "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "MCP Streamable HTTP response", "content": { "application/json": { "schema": { "type": "object" } }, "text/event-stream": { "schema": { "type": "string" } } } }, "202": { "description": "MCP notification accepted" }, "401": { "$ref": "#/components/responses/Error" } } } }
+  },
+  "components": {
+    "requestBodies": { "ModelCommand": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelCommand" } } } } },
+    "responses": {
+      "Error": { "description": "Stable privacy-safe failure", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+      "ModelCommandAccepted": { "description": "Command accepted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelSummary" } } } },
+      "ModelCommandCompleted": { "description": "Command completed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelSummary" } } } }
+    },
+    "schemas": {
+      "OpenAiEmbeddingRequest": {
+        "type": "object", "additionalProperties": false, "required": ["model", "input"],
+        "properties": {
+          "model": { "type": "string", "minLength": 1 },
+          "input": { "oneOf": [ { "type": "string" }, { "type": "array", "minItems": 1, "items": { "type": "string" } } ] },
+          "encoding_format": { "type": "string", "enum": ["float"] },
+          "dimensions": { "type": "integer", "minimum": 1 }
+        }
+      },
+      "OpenAiEmbeddingResponse": {
+        "type": "object", "additionalProperties": false, "required": ["object", "data", "model", "usage"],
+        "properties": {
+          "object": { "const": "list" }, "model": { "type": "string" },
+          "data": { "type": "array", "items": { "$ref": "#/components/schemas/OpenAiEmbedding" } },
+          "usage": { "$ref": "#/components/schemas/OpenAiUsage" }
+        }
+      },
+      "OpenAiEmbedding": { "type": "object", "additionalProperties": false, "required": ["object", "index", "embedding"], "properties": { "object": { "const": "embedding" }, "index": { "type": "integer", "minimum": 0 }, "embedding": { "$ref": "#/components/schemas/DenseVector" } } },
+      "OpenAiUsage": { "type": "object", "additionalProperties": false, "required": ["prompt_tokens", "total_tokens"], "properties": { "prompt_tokens": { "type": "integer", "minimum": 0 }, "total_tokens": { "type": "integer", "minimum": 0 } } },
+      "NativeEmbeddingRequest": {
+        "type": "object", "additionalProperties": false, "required": ["model", "input"],
+        "properties": {
+          "model": { "type": "string", "minLength": 1 }, "input": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "task": { "type": "string", "enum": ["query", "document"], "default": "document" },
+          "truncation": { "type": "string", "enum": ["reject", "truncate"], "default": "reject" },
+          "dimensions": { "type": "integer", "minimum": 1 }, "normalize": { "type": "boolean" }
+        }
+      },
+      "NativeEmbeddingResponse": { "type": "object", "additionalProperties": false, "required": ["embeddings", "model", "usage"], "properties": { "embeddings": { "type": "array", "items": { "$ref": "#/components/schemas/DenseVector" } }, "model": { "$ref": "#/components/schemas/ResolvedModelIdentity" }, "usage": { "$ref": "#/components/schemas/TokenUsage" } } },
+      "DenseVector": { "type": "array", "items": { "type": "number", "format": "float" } },
+      "ResolvedModelIdentity": { "type": "object", "additionalProperties": false, "required": ["canonical_id", "revision", "runtime", "artifact_fingerprint", "semantic_fingerprint"], "properties": { "canonical_id": { "type": "string" }, "revision": { "type": "string" }, "runtime": { "type": "string" }, "artifact_fingerprint": { "type": "string" }, "semantic_fingerprint": { "type": "string" } } },
+      "TokenUsage": { "type": "object", "additionalProperties": false, "required": ["prompt_tokens", "total_tokens", "input_tokens"], "properties": { "prompt_tokens": { "type": "integer", "minimum": 0 }, "total_tokens": { "type": "integer", "minimum": 0 }, "input_tokens": { "type": "array", "items": { "type": "integer", "minimum": 0 } } } },
+      "ModelCommand": { "type": "object", "additionalProperties": false, "required": ["model"], "properties": { "model": { "type": "string", "minLength": 1 } } },
+      "ModelSummary": { "type": "object", "additionalProperties": false, "required": ["model", "state"], "properties": { "model": { "type": "string" }, "state": { "type": "string", "enum": ["missing", "installed", "loading", "ready", "unloading", "invalid"] } } },
+      "Health": { "type": "object", "additionalProperties": false, "required": ["status"], "properties": { "status": { "type": "string", "enum": ["ok", "unavailable"] }, "reason": { "type": "string" } } },
+      "ErrorEnvelope": { "type": "object", "additionalProperties": false, "required": ["error"], "properties": { "error": { "type": "object", "additionalProperties": false, "required": ["code", "message", "retryable"], "properties": { "code": { "type": "string", "enum": ["invalid_request", "model_unavailable", "queue_full", "cancelled", "deadline_exceeded", "inference_failed", "internal"] }, "message": { "type": "string" }, "retryable": { "type": "boolean" } } } } }
+    }
+  }
+}

@@ -42,11 +42,37 @@ message EmbedRequest {
   // immutable identity that was actually used.
   string model = 1;
   repeated string input = 2;
+  EmbeddingTask task = 3;
+  Truncation truncation = 4;
+  optional uint32 dimensions = 5;
+  optional bool normalize = 6;
 }
 
 message EmbedResponse {
   repeated DenseVector embeddings = 1;
   ResolvedModelIdentity model = 2;
+  TokenUsage usage = 3;
+}
+
+// Semantic purpose of the input. Unspecified maps to the document default.
+enum EmbeddingTask {
+  EMBEDDING_TASK_UNSPECIFIED = 0;
+  EMBEDDING_TASK_QUERY = 1;
+  EMBEDDING_TASK_DOCUMENT = 2;
+}
+
+// Explicit behavior when tokenization exceeds the model's sequence limit.
+enum Truncation {
+  TRUNCATION_UNSPECIFIED = 0;
+  TRUNCATION_REJECT = 1;
+  TRUNCATION_TRUNCATE = 2;
+}
+
+// Exact post-prefix, post-truncation tokenizer usage for a completed request.
+message TokenUsage {
+  uint64 prompt_tokens = 1;
+  uint64 total_tokens = 2;
+  repeated uint64 input_tokens = 3;
 }
 
 // The immutable model identity used for inference. Clients should persist this
