@@ -572,7 +572,17 @@ impl ModelStore {
         &self,
         manifest: &Manifest,
         source: &Path,
+        source_opened: impl FnMut(&Path) -> Result<()>,
+    ) -> Result<ModelStatus> {
+        self.import_with_write_observer(manifest, source, source_opened, |_, _| Ok(()))
+    }
+
+    fn import_with_write_observer(
+        &self,
+        manifest: &Manifest,
+        source: &Path,
         mut source_opened: impl FnMut(&Path) -> Result<()>,
+        mut destination_ready: impl FnMut(&Path, &Path) -> Result<()>,
     ) -> Result<ModelStatus> {
         manifest.validate()?;
         let existing = self.status(manifest)?;
@@ -609,18 +619,27 @@ impl ModelStore {
                         "import artifact escaped configured source".into(),
                     ));
                 }
-                let target = staging.join(&artifact.path);
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent)?;
-                    ensure_contained_directory(&staging, parent)?;
-                }
-                copy_import_artifact(&canonical, &target, artifact, || source_opened(&from))?;
+                let relative = Path::new(&artifact.path);
+                create_contained_parent_directories(&staging, relative)
+                    .map_err(|error| stable_import_destination_error(&staging, relative, error))?;
+                copy_import_artifact(
+                    &canonical,
+                    &staging,
+                    relative,
+                    artifact,
+                    || source_opened(&from),
+                    || destination_ready(&staging, relative),
+                )?;
             }
-            let manifest_path = staging.join(MANIFEST_FILE);
-            let mut manifest_options = OpenOptions::new();
-            manifest_options.write(true).create_new(true);
-            configure_no_follow(&mut manifest_options);
-            let mut manifest_file = manifest_options.open(&manifest_path)?;
+            let manifest_relative = Path::new(MANIFEST_FILE);
+            create_contained_parent_directories(&staging, manifest_relative).map_err(|error| {
+                stable_import_destination_error(&staging, manifest_relative, error)
+            })?;
+            destination_ready(&staging, manifest_relative)?;
+            let mut manifest_file = create_new_contained_file(&staging, manifest_relative)
+                .map_err(|error| {
+                    stable_import_destination_error(&staging, manifest_relative, error)
+                })?;
             manifest_file.write_all(&manifest.to_json()?)?;
             manifest_file.flush()?;
             manifest_file.sync_all()?;
@@ -1346,9 +1365,11 @@ fn verify_contained_artifact(
 
 fn copy_import_artifact(
     source: &Path,
-    target: &Path,
+    staging: &Path,
+    relative: &Path,
     artifact: &Artifact,
     after_open: impl FnOnce() -> Result<()>,
+    before_target_create: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let mut source_options = OpenOptions::new();
     source_options.read(true);
@@ -1371,11 +1392,10 @@ fn copy_import_artifact(
     // Tests use this boundary to replace or mutate the pathname deterministically. All reads
     // below remain bound to the single handle opened above.
     after_open()?;
+    before_target_create()?;
 
-    let mut target_options = OpenOptions::new();
-    target_options.write(true).create_new(true);
-    configure_no_follow(&mut target_options);
-    let mut target_file = target_options.open(target)?;
+    let mut target_file = create_new_contained_file(staging, relative)
+        .map_err(|error| stable_import_destination_error(staging, relative, error))?;
     let mut digest = Sha256::new();
     let mut copied = 0_u64;
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
@@ -1419,10 +1439,8 @@ fn copy_import_artifact(
 
     // Verify the exact bytes at the staging pathname after the copy is durable. Promotion never
     // relies only on the source hash or on metadata observed before the copy.
-    let mut staged_options = OpenOptions::new();
-    staged_options.read(true);
-    configure_no_follow(&mut staged_options);
-    let mut staged_file = staged_options.open(target)?;
+    let mut staged_file = securely_open_existing_file(staging, relative)
+        .map_err(|error| stable_import_destination_error(staging, relative, error))?;
     let staged_metadata = staged_file.metadata()?;
     if !staged_metadata.is_file() || staged_metadata.len() != artifact.size {
         return Err(Error::Invalid(
@@ -1458,6 +1476,17 @@ fn copy_import_artifact(
         });
     }
     Ok(())
+}
+
+fn stable_import_destination_error(base: &Path, relative: &Path, error: Error) -> Error {
+    if matches!(
+        reject_reparse_components(base, relative),
+        Err(Error::Invalid(_))
+    ) {
+        Error::Invalid("import staging destination became unsafe".into())
+    } else {
+        error
+    }
 }
 
 pub(crate) fn prepare_staging(layout: &CacheLayout, staging: &Path) -> Result<()> {
@@ -2753,6 +2782,119 @@ mod transaction_tests {
         assert_eq!(status, ModelStatus::Loadable);
         let verified = store.verified_model(&manifest)?;
         assert_eq!(verified.artifact_bytes("weights/model.bin")?, body);
+        Ok(())
+    }
+
+    #[test]
+    fn import_rejects_artifact_parent_swap_before_capability_open() -> Result<()> {
+        let cache = TempDir::new()?;
+        let source = TempDir::new()?;
+        let outside = TempDir::new()?;
+        let body = b"expected import bytes";
+        let manifest = local_manifest(body);
+        fs::create_dir_all(source.path().join("weights"))?;
+        fs::write(source.path().join("weights/model.bin"), body)?;
+        fs::write(outside.path().join("sentinel"), b"outside")?;
+        let store = trusted_store(cache.path(), &manifest)?;
+
+        let result = store.import_with_write_observer(
+            &manifest,
+            source.path(),
+            |_| Ok(()),
+            |staging, relative| {
+                if relative == Path::new("weights/model.bin") {
+                    let parent = staging.join("weights");
+                    fs::remove_dir(&parent)?;
+                    make_directory_link(outside.path(), &parent)?;
+                }
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::Invalid(ref message))
+                if message == "import staging destination became unsafe"
+        ));
+        assert!(!outside.path().join("model.bin").exists());
+        assert_eq!(fs::read(outside.path().join("sentinel"))?, b"outside");
+        assert_eq!(store.status(&manifest)?, ModelStatus::Missing);
+        Ok(())
+    }
+
+    #[test]
+    fn import_rejects_staging_root_swap_before_manifest_capability_open() -> Result<()> {
+        let cache = TempDir::new()?;
+        let source = TempDir::new()?;
+        let outside = TempDir::new()?;
+        let body = b"expected import bytes";
+        let manifest = local_manifest(body);
+        fs::create_dir_all(source.path().join("weights"))?;
+        fs::write(source.path().join("weights/model.bin"), body)?;
+        fs::write(outside.path().join("sentinel"), b"outside")?;
+        let store = trusted_store(cache.path(), &manifest)?;
+        let displaced = cache.path().join("displaced-import-staging");
+
+        let result = store.import_with_write_observer(
+            &manifest,
+            source.path(),
+            |_| Ok(()),
+            |staging, relative| {
+                if relative == Path::new(MANIFEST_FILE) {
+                    fs::rename(staging, &displaced)?;
+                    make_directory_link(outside.path(), staging)?;
+                }
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::Invalid(ref message))
+                if message == "import staging destination became unsafe"
+        ));
+        assert!(!outside.path().join(MANIFEST_FILE).exists());
+        assert_eq!(fs::read(outside.path().join("sentinel"))?, b"outside");
+        assert_eq!(store.status(&manifest)?, ModelStatus::Missing);
+        if displaced.exists() {
+            fs::remove_dir_all(displaced)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_rejects_manifest_leaf_symlink_before_capability_open() -> Result<()> {
+        let cache = TempDir::new()?;
+        let source = TempDir::new()?;
+        let outside = TempDir::new()?;
+        let body = b"expected import bytes";
+        let manifest = local_manifest(body);
+        fs::create_dir_all(source.path().join("weights"))?;
+        fs::write(source.path().join("weights/model.bin"), body)?;
+        let outside_manifest = outside.path().join(MANIFEST_FILE);
+        fs::write(&outside_manifest, b"outside manifest sentinel")?;
+        let store = trusted_store(cache.path(), &manifest)?;
+
+        let result = store.import_with_write_observer(
+            &manifest,
+            source.path(),
+            |_| Ok(()),
+            |staging, relative| {
+                if relative == Path::new(MANIFEST_FILE) {
+                    std::os::unix::fs::symlink(&outside_manifest, staging.join(MANIFEST_FILE))?;
+                }
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::Invalid(ref message))
+                if message == "import staging destination became unsafe"
+        ));
+        assert_eq!(fs::read(outside_manifest)?, b"outside manifest sentinel");
+        assert_eq!(store.status(&manifest)?, ModelStatus::Missing);
         Ok(())
     }
 
