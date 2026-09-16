@@ -13,7 +13,7 @@ use impossible_embedding_core::{
     CancellationToken, EmbedOptions, EmbeddingOutput, EmbeddingTask, ModelVerificationStatus,
     Retryability, Truncation,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 use std::io;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -26,6 +26,7 @@ use crate::{
 pub const PROTOCOL_VERSION: &str = "2025-03-26";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const SESSION_HEADER: &str = "mcp-session-id";
+const MAX_BATCH_ITEMS: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -63,23 +64,55 @@ impl McpDispatcher {
 
     /// Dispatch exactly one UTF-8 JSON-RPC frame.
     pub async fn dispatch(&mut self, frame: &[u8]) -> DispatchResult {
-        let Ok(value) = serde_json::from_slice::<Value>(frame) else {
+        let Ok(frame) = serde_json::from_slice::<WireFrame>(frame) else {
             return DispatchResult::response(rpc_error(Value::Null, -32700, "Parse error"));
         };
-        if value.is_array() {
-            return DispatchResult::response(rpc_error(
-                Value::Null,
-                -32600,
-                "JSON-RPC batches are not supported",
-            ));
-        }
-        let incoming = match Incoming::parse(value) {
-            Ok(incoming) => incoming,
-            Err(id) => {
-                return DispatchResult::response(rpc_error(id, -32600, "Invalid Request"));
+        match frame {
+            WireFrame::Single(item) => match item.into_incoming() {
+                Ok(incoming) => self.dispatch_incoming(incoming).await,
+                Err(()) => {
+                    DispatchResult::response(rpc_error(Value::Null, -32600, "Invalid Request"))
+                }
+            },
+            WireFrame::Batch(items) if items.is_empty() => {
+                DispatchResult::response(rpc_error(Value::Null, -32600, "Invalid Request"))
             }
-        };
-        self.dispatch_incoming(incoming).await
+            WireFrame::Batch(items) if items.len() > MAX_BATCH_ITEMS => {
+                DispatchResult::response(rpc_error(Value::Null, -32600, "Invalid Request"))
+            }
+            WireFrame::Batch(items) => {
+                let mut responses = Vec::new();
+                for item in items {
+                    let result = match item.into_incoming() {
+                        Ok(incoming) if incoming.method == "initialize" => {
+                            if incoming.id.is_none() {
+                                DispatchResult::Notification
+                            } else {
+                                DispatchResult::response(rpc_error(
+                                    incoming.id.unwrap_or(Value::Null),
+                                    -32600,
+                                    "Invalid Request",
+                                ))
+                            }
+                        }
+                        Ok(incoming) => self.dispatch_incoming(incoming).await,
+                        Err(()) => DispatchResult::response(rpc_error(
+                            Value::Null,
+                            -32600,
+                            "Invalid Request",
+                        )),
+                    };
+                    if let DispatchResult::Response(response) = result {
+                        responses.push(response);
+                    }
+                }
+                if responses.is_empty() {
+                    DispatchResult::Notification
+                } else {
+                    DispatchResult::response(Value::Array(responses))
+                }
+            }
+        }
     }
 
     async fn dispatch_incoming(&mut self, incoming: Incoming) -> DispatchResult {
@@ -232,36 +265,63 @@ struct Incoming {
     params: Option<Value>,
 }
 
-impl Incoming {
-    fn parse(value: Value) -> Result<Self, Value> {
-        let Value::Object(mut object) = value else {
-            return Err(Value::Null);
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WireFrame {
+    Batch(Vec<WireItem>),
+    Single(WireItem),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WireItem {
+    Incoming(IncomingEnvelope),
+    Invalid(Value),
+}
+
+impl WireItem {
+    fn into_incoming(self) -> Result<Incoming, ()> {
+        let envelope = match self {
+            Self::Incoming(envelope) => envelope,
+            Self::Invalid(value) => {
+                drop(value);
+                return Err(());
+            }
         };
-        let prospective_id = object.get("id").cloned().unwrap_or(Value::Null);
-        if object
-            .keys()
-            .any(|key| !matches!(key.as_str(), "jsonrpc" | "id" | "method" | "params"))
+        if envelope.jsonrpc != "2.0"
+            || envelope.method.is_empty()
+            || envelope.id.0.as_ref().is_some_and(|value| !valid_id(value))
         {
-            return Err(valid_error_id(&prospective_id));
+            return Err(());
         }
-        if object.remove("jsonrpc") != Some(Value::String("2.0".into())) {
-            return Err(valid_error_id(&prospective_id));
-        }
-        let Some(Value::String(method)) = object.remove("method") else {
-            return Err(valid_error_id(&prospective_id));
-        };
-        if method.is_empty() {
-            return Err(valid_error_id(&prospective_id));
-        }
-        let id = object.remove("id");
-        if id.as_ref().is_some_and(|value| !valid_id(value)) {
-            return Err(Value::Null);
-        }
-        Ok(Self {
-            id,
-            method,
-            params: object.remove("params"),
+        Ok(Incoming {
+            id: envelope.id.0,
+            method: envelope.method,
+            params: envelope.params.0,
         })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IncomingEnvelope {
+    jsonrpc: String,
+    #[serde(default)]
+    id: PresentValue,
+    method: String,
+    #[serde(default)]
+    params: PresentValue,
+}
+
+#[derive(Default)]
+struct PresentValue(Option<Value>);
+
+impl<'de> Deserialize<'de> for PresentValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Value::deserialize(deserializer).map(|value| Self(Some(value)))
     }
 }
 
@@ -270,12 +330,6 @@ fn valid_id(value: &Value) -> bool {
         || value
             .as_number()
             .is_some_and(|number| number.is_i64() || number.is_u64())
-}
-
-fn valid_error_id(value: &Value) -> Value {
-    valid_id(value)
-        .then(|| value.clone())
-        .unwrap_or(Value::Null)
 }
 
 #[derive(Deserialize)]
@@ -630,15 +684,44 @@ fn accepts_streamable_http(headers: &HeaderMap) -> bool {
         let Ok(value) = value.to_str() else {
             return false;
         };
-        for media in value.split(',').filter_map(|part| part.split(';').next()) {
-            match media.trim().to_ascii_lowercase().as_str() {
-                "application/json" => json = true,
-                "text/event-stream" => events = true,
-                _ => {}
+        for part in value.split(',') {
+            let Some((media, acceptable)) = acceptable_media_range(part) else {
+                return false;
+            };
+            if acceptable {
+                if media.eq_ignore_ascii_case("application/json") {
+                    json = true;
+                } else if media.eq_ignore_ascii_case("text/event-stream") {
+                    events = true;
+                }
             }
         }
     }
     json && events
+}
+
+fn acceptable_media_range(value: &str) -> Option<(&str, bool)> {
+    let mut parts = value.split(';');
+    let media = parts.next()?.trim();
+    if media.is_empty() {
+        return None;
+    }
+    let mut quality = 1.0_f32;
+    let mut saw_quality = false;
+    for parameter in parts {
+        let (name, value) = parameter.split_once('=')?;
+        if name.trim().eq_ignore_ascii_case("q") {
+            if saw_quality {
+                return None;
+            }
+            saw_quality = true;
+            quality = value.trim().parse::<f32>().ok()?;
+            if !quality.is_finite() || !(0.0..=1.0).contains(&quality) {
+                return None;
+            }
+        }
+    }
+    Some((media, quality > 0.0))
 }
 
 fn valid_content_length(headers: &HeaderMap, limit: usize) -> bool {
@@ -670,10 +753,15 @@ where
     W: AsyncWrite + Unpin,
 {
     let limit = state.limits().max_body_bytes;
+    let shutdown = state.shutdown_trigger().clone();
     let mut dispatcher = McpDispatcher::new(state);
     let mut line = Vec::new();
     loop {
-        match read_capped_line(&mut reader, &mut line, limit).await? {
+        let read = tokio::select! {
+            () = shutdown.cancelled() => break,
+            result = read_capped_line(&mut reader, &mut line, limit) => result?,
+        };
+        match read {
             LineResult::Eof => break,
             LineResult::Oversized => {
                 write_frame(
@@ -753,7 +841,10 @@ mod tests {
     use super::*;
     use axum::http::{Method, header::ACCEPT};
     use http_body_util::BodyExt;
-    use impossible_server_core::{ServerConfig, config::Limits};
+    use impossible_server_core::{
+        ServerConfig,
+        config::{CredentialSource, Limits},
+    };
     use std::{
         fs,
         sync::atomic::{AtomicUsize, Ordering},
@@ -830,8 +921,9 @@ mod tests {
         let mut dispatcher = McpDispatcher::new(state("strict"));
         for (input, code) in [
             ("not json", -32700),
-            (r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#, -32600),
+            (r"[]", -32600),
             (r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#, -32600),
+            (r#"{"jsonrpc":"2.0","id":1,"id":2,"method":"ping"}"#, -32600),
             (r#"{"jsonrpc":"2.0","id":1.5,"method":"ping"}"#, -32600),
             (
                 r#"{"jsonrpc":"2.0","id":1,"method":"ping","extra":true}"#,
@@ -847,6 +939,39 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[tokio::test]
+    async fn batches_are_received_and_notifications_are_omitted_from_the_response() {
+        let mut dispatcher = McpDispatcher::new(state("batches"));
+        initialize(&mut dispatcher).await;
+        let response = dispatch(
+            &mut dispatcher,
+            r#"[{"jsonrpc":"2.0","id":"ping","method":"ping"},{"jsonrpc":"2.0","method":"unknown"},{"jsonrpc":"2.0","id":7,"method":"tools/list"}]"#,
+        )
+        .await;
+        let responses = response.as_array().expect("batch response");
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], "ping");
+        assert_eq!(responses[1]["id"], 7);
+
+        let initialize_batch = dispatch(
+            &mut dispatcher,
+            r#"[{"jsonrpc":"2.0","id":9,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}]"#,
+        )
+        .await;
+        assert_eq!(initialize_batch[0]["error"]["code"], -32600);
+
+        let oversized = format!(
+            "[{}]",
+            std::iter::repeat_n(r#"{"jsonrpc":"2.0","method":"unknown"}"#, 129)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(
+            dispatch(&mut dispatcher, &oversized).await["error"]["code"],
+            -32600
+        );
     }
 
     #[tokio::test]
@@ -920,6 +1045,25 @@ mod tests {
         assert_eq!(error["error"]["code"], "model_unavailable");
         assert!(error.to_string().len() < 256);
         assert!(!error.to_string().contains("impossible-mcp"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_reported_as_a_sanitized_tool_failure() {
+        let state = state("tool-shutdown");
+        assert!(state.application().shutdown().await);
+        let mut dispatcher = McpDispatcher::new(state);
+        initialize(&mut dispatcher).await;
+        let result = dispatch(
+            &mut dispatcher,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"embed","arguments":{"model":"bge-small-en","input":"hello"}}}"#,
+        )
+        .await;
+        assert_eq!(result["result"]["isError"], true);
+        let text = result["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool error text");
+        let error: Value = serde_json::from_str(text).expect("tool error JSON");
+        assert_eq!(error["error"]["code"], "model_unavailable");
     }
 
     fn mcp_request(body: &'static str) -> Request {
@@ -996,6 +1140,49 @@ mod tests {
                 .status(),
             StatusCode::NOT_ACCEPTABLE
         );
+        let mut wrong_content_type = mcp_request(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        wrong_content_type
+            .headers_mut()
+            .insert(CONTENT_TYPE, "text/plain".parse().expect("header"));
+        assert_eq!(
+            app.clone()
+                .oneshot(wrong_content_type)
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        let mut oversized = mcp_request(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        oversized.headers_mut().insert(
+            axum::http::header::CONTENT_LENGTH,
+            (Limits::default().max_body_bytes + 1)
+                .to_string()
+                .parse()
+                .expect("header"),
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(oversized)
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let mut zero_quality = mcp_request(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        zero_quality.headers_mut().insert(
+            ACCEPT,
+            "application/json;q=0, text/event-stream"
+                .parse()
+                .expect("header"),
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(zero_quality)
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::NOT_ACCEPTABLE
+        );
         let mut session = mcp_request(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
         session
             .headers_mut()
@@ -1023,6 +1210,67 @@ mod tests {
                 StatusCode::METHOD_NOT_ALLOWED
             );
         }
+    }
+
+    #[tokio::test]
+    async fn streamable_http_uses_public_auth_and_exact_origin_policy() {
+        let directory = std::env::temp_dir().join(format!(
+            "impossible-mcp-auth-{}-{}",
+            std::process::id(),
+            FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).expect("fixture");
+        let credential = directory.join("public.token");
+        fs::write(&credential, b"mcp-fixture-token").expect("credential");
+        let state = AppState::new(&ServerConfig {
+            cache_directory: directory.join("cache"),
+            auth: Some(CredentialSource::File(credential)),
+            allowed_origins: vec!["https://console.example".to_owned()],
+            ..ServerConfig::default()
+        })
+        .expect("state");
+        let app = crate::http::router(state);
+
+        assert_eq!(
+            app.clone()
+                .oneshot(mcp_request(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut rejected = mcp_request(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        rejected.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer mcp-fixture-token".parse().expect("header"),
+        );
+        rejected.headers_mut().insert(
+            axum::http::header::ORIGIN,
+            "https://console.example.evil".parse().expect("header"),
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(rejected)
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let mut allowed = mcp_request(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        allowed.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer mcp-fixture-token".parse().expect("header"),
+        );
+        allowed.headers_mut().insert(
+            axum::http::header::ORIGIN,
+            "https://console.example".parse().expect("header"),
+        );
+        assert_eq!(
+            app.oneshot(allowed).await.expect("response").status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
@@ -1096,5 +1344,21 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0]["error"]["code"], -32600);
         assert_eq!(frames[1]["id"], 2);
+    }
+
+    #[tokio::test]
+    async fn stdio_exits_when_process_shutdown_is_triggered_while_input_is_idle() {
+        let state = state("stdio-shutdown");
+        let shutdown = state.shutdown_trigger().clone();
+        let (_client, server) = tokio::io::duplex(128);
+        let (server_read, server_write) = tokio::io::split(server);
+        let task = tokio::spawn(run_stdio(state, BufReader::new(server_read), server_write));
+        tokio::task::yield_now().await;
+        shutdown.trigger();
+        tokio::time::timeout(std::time::Duration::from_millis(100), task)
+            .await
+            .expect("stdio shutdown must be bounded")
+            .expect("join")
+            .expect("stdio");
     }
 }
