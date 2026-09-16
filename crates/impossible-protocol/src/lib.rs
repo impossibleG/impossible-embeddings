@@ -285,6 +285,21 @@ mod tests {
     }
 
     #[test]
+    fn openai_compatibility_errors_have_the_frozen_wire_shape() -> Result<(), serde_json::Error> {
+        let document: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/openapi-v1.json"))?;
+        assert_eq!(
+            document["paths"]["/v1/embeddings"]["post"]["responses"]["400"]["$ref"],
+            "#/components/responses/CompatibilityError"
+        );
+        assert_eq!(
+            document["components"]["schemas"]["OpenAiErrorEnvelope"]["properties"]["error"]["required"],
+            serde_json::json!(["message", "type", "param", "code"])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn every_core_error_has_the_normative_grpc_mapping() {
         let cases = [
             (

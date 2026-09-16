@@ -123,3 +123,6 @@ Native HTTP failures use the strict envelope
 same semantics with `PublicErrorDetail`. HTTP and protobuf response usage reports the exact
 post-prefix, post-truncation tokenizer counts. `input_tokens` preserves input order; `prompt_tokens`
 and `total_tokens` are the checked sum and are identical for embedding-only responses.
+The OpenAI-compatible route instead uses the familiar
+`{"error":{"message":"...","type":"...","param":null,"code":"..."}}` shape while retaining the
+same privacy-reviewed message and stable core code.

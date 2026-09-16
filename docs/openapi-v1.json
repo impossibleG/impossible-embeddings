@@ -13,7 +13,7 @@
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OpenAiEmbeddingRequest" } } } },
         "responses": {
           "200": { "description": "Embedding result", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OpenAiEmbeddingResponse" } } } },
-          "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Error" }, "429": { "$ref": "#/components/responses/Error" }, "500": { "$ref": "#/components/responses/Error" }, "503": { "$ref": "#/components/responses/Error" }
+          "400": { "$ref": "#/components/responses/CompatibilityError" }, "401": { "$ref": "#/components/responses/CompatibilityError" }, "429": { "$ref": "#/components/responses/CompatibilityError" }, "500": { "$ref": "#/components/responses/CompatibilityError" }, "503": { "$ref": "#/components/responses/CompatibilityError" }
         }
       }
     },
@@ -42,6 +42,7 @@
     "requestBodies": { "ModelCommand": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelCommand" } } } } },
     "responses": {
       "Error": { "description": "Stable privacy-safe failure", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+      "CompatibilityError": { "description": "OpenAI-compatible privacy-safe failure", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OpenAiErrorEnvelope" } } } },
       "ModelCommandAccepted": { "description": "Command accepted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelSummary" } } } },
       "ModelCommandCompleted": { "description": "Command completed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelSummary" } } } }
     },
@@ -81,7 +82,8 @@
       "ModelCommand": { "type": "object", "additionalProperties": false, "required": ["model"], "properties": { "model": { "type": "string", "minLength": 1 } } },
       "ModelSummary": { "type": "object", "additionalProperties": false, "required": ["model", "state"], "properties": { "model": { "type": "string" }, "state": { "type": "string", "enum": ["missing", "installed", "loading", "ready", "unloading", "invalid"] } } },
       "Health": { "type": "object", "additionalProperties": false, "required": ["status"], "properties": { "status": { "type": "string", "enum": ["ok", "unavailable"] }, "reason": { "type": "string" } } },
-      "ErrorEnvelope": { "type": "object", "additionalProperties": false, "required": ["error"], "properties": { "error": { "type": "object", "additionalProperties": false, "required": ["code", "message", "retryable"], "properties": { "code": { "type": "string", "enum": ["invalid_request", "model_unavailable", "queue_full", "cancelled", "deadline_exceeded", "inference_failed", "internal"] }, "message": { "type": "string" }, "retryable": { "type": "boolean" } } } } }
+      "ErrorEnvelope": { "type": "object", "additionalProperties": false, "required": ["error"], "properties": { "error": { "type": "object", "additionalProperties": false, "required": ["code", "message", "retryable"], "properties": { "code": { "type": "string", "enum": ["invalid_request", "model_unavailable", "queue_full", "cancelled", "deadline_exceeded", "inference_failed", "internal"] }, "message": { "type": "string" }, "retryable": { "type": "boolean" } } } } },
+      "OpenAiErrorEnvelope": { "type": "object", "additionalProperties": false, "required": ["error"], "properties": { "error": { "type": "object", "additionalProperties": false, "required": ["message", "type", "param", "code"], "properties": { "message": { "type": "string" }, "type": { "type": "string", "enum": ["invalid_request_error", "server_error"] }, "param": { "type": ["string", "null"] }, "code": { "type": "string", "enum": ["invalid_request", "model_unavailable", "queue_full", "cancelled", "deadline_exceeded", "inference_failed", "internal"] } } } } }
     }
   }
 }

@@ -1,6 +1,7 @@
 //! Transport-independent application runtime for model lifecycle and bounded inference.
 
 pub mod application;
+pub mod http;
 pub mod runtime;
 
 pub use application::{
