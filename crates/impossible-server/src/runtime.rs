@@ -22,7 +22,7 @@ use std::{
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex, Once, RwLock,
+        Arc, Mutex, Once, RwLock, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{SyncSender, TrySendError, sync_channel},
     },
@@ -476,10 +476,60 @@ struct Inner {
     shutdown_flight: Mutex<Option<ShutdownFlight>>,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The final public owner is also a terminal lifecycle boundary. This path cannot await,
+        // but it can fence publication, abort async schedulers, and release registry-owned engine
+        // and verified-artifact references. Every operation is best-effort and poison-safe because
+        // unwinding through `Drop` must never introduce a second panic.
+        self.draining.store(true, Ordering::Release);
+        self.shutdown.begin();
+        self.shutdown.force_stop();
+        let _ = self.force_stop.send(true);
+        if let Ok(models) = self.models.read() {
+            for slot in models.values() {
+                slot.accepting.store(false, Ordering::Release);
+                slot.cancellation.cancel();
+            }
+        }
+        if let Ok(installs) = self.installs.lock() {
+            for install in installs.values() {
+                install.cancel_before_commit();
+            }
+        }
+        if let Ok(mut schedulers) = self.schedulers.lock() {
+            for (_, task) in schedulers.drain() {
+                let _ = task.stop.send(true);
+                task.handle.abort();
+            }
+        }
+        if let Ok(mut retired) = self.retired_schedulers.lock() {
+            for task in retired.drain(..) {
+                task.abort();
+            }
+        }
+        if let Ok(mut flight) = self.shutdown_flight.lock() {
+            if let Some(flight) = flight.take() {
+                flight.task.abort();
+            }
+        }
+        if let Ok(mut models) = self.models.write() {
+            models.clear();
+        }
+        if let Ok(mut loading) = self.loading.lock() {
+            loading.clear();
+        }
+        self.health.clear_models();
+        let _ = self
+            .health
+            .transition(LifecycleState::Stopped, Some(ReadinessReason::Stopped));
+    }
+}
+
 struct ShutdownFlight {
     completion: watch::Receiver<Option<bool>>,
     deadline: watch::Sender<Option<Instant>>,
-    _task: JoinHandle<()>,
+    task: JoinHandle<()>,
 }
 
 #[derive(Clone, Copy)]
@@ -1454,17 +1504,16 @@ impl ApplicationRuntime {
                 let initially_drained = self.0.admitted.load(Ordering::Acquire) == 0;
                 let (finished, completion) = watch::channel(None);
                 let (deadline, deadline_updates) = watch::channel(requested_deadline);
-                let runtime = self.clone();
+                let runtime = Arc::downgrade(&self.0);
                 let task = executor.spawn(async move {
-                    let result = runtime
-                        .finish_shutdown(deadline_updates, initially_drained)
-                        .await;
+                    let result =
+                        Self::finish_shutdown(runtime, deadline_updates, initially_drained).await;
                     let _ = finished.send(Some(result));
                 });
                 *flight = Some(ShutdownFlight {
                     completion: completion.clone(),
                     deadline,
-                    _task: task,
+                    task,
                 });
                 drop(admin);
                 completion
@@ -1485,35 +1534,45 @@ impl ApplicationRuntime {
     }
 
     async fn finish_shutdown(
-        &self,
+        runtime: Weak<Inner>,
         mut deadline: watch::Receiver<Option<Instant>>,
         initially_drained: bool,
     ) -> bool {
+        let Some(inner) = runtime.upgrade() else {
+            return false;
+        };
+        let admitted = Arc::clone(&inner.admitted);
+        let admitted_zero = Arc::clone(&inner.admitted_zero);
+        drop(inner);
         let drained = if initially_drained {
             true
         } else {
-            wait_for_drain(&self.0.admitted, &self.0.admitted_zero, &mut deadline).await
+            wait_for_drain(&admitted, &admitted_zero, &mut deadline).await
         };
-        if let Ok(models) = self.0.models.read() {
+        let Some(inner) = runtime.upgrade() else {
+            return false;
+        };
+        if !drained {
+            if let Ok(installs) = inner.installs.lock() {
+                for install in installs.values() {
+                    install.cancel_before_commit();
+                }
+            }
+            // Publish the forced-stop classification before model cancellation wakes request
+            // futures. This keeps terminal shutdown distinct from caller-requested cancellation.
+            let _ = inner.force_stop.send(true);
+        }
+        if let Ok(models) = inner.models.read() {
             for slot in models.values() {
                 slot.accepting.store(false, Ordering::Release);
                 slot.cancellation.cancel();
             }
         }
-        if !drained {
-            if let Ok(installs) = self.0.installs.lock() {
-                for install in installs.values() {
-                    install.cancel_before_commit();
-                }
-            }
-            let _ = self.0.force_stop.send(true);
-        }
         // Forced shutdown is a lifecycle fence, not a demand that arbitrary retained futures be
         // dropped. Existing RAII guards remain valid and clean up normally whenever their owners
         // resume or disappear, but they cannot hold the public service in Draining indefinitely.
-        self.0.shutdown.force_stop();
-        let mut tasks = self
-            .0
+        inner.shutdown.force_stop();
+        let mut tasks = inner
             .schedulers
             .lock()
             .map(|mut schedulers| {
@@ -1526,7 +1585,7 @@ impl ApplicationRuntime {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if let Ok(mut retired) = self.0.retired_schedulers.lock() {
+        if let Ok(mut retired) = inner.retired_schedulers.lock() {
             tasks.extend(retired.drain(..));
         }
         for mut task in tasks {
@@ -1537,9 +1596,20 @@ impl ApplicationRuntime {
             // jobs are separately fenced by `accepting` and may finish internally.
             let _ = (&mut task).await;
         }
-        self.0.health.clear_models();
-        let _ = self
-            .0
+        // Scheduler fencing precedes registry release so no scheduler can retain a model session
+        // or verified-store lease after terminal shutdown. Draining rejects all concurrent admin
+        // work, and the admin lock serializes this final publication with any operation admitted
+        // immediately before the boundary.
+        if let Ok(_admin) = inner.admin.lock() {
+            if let Ok(mut models) = inner.models.write() {
+                models.clear();
+            }
+            if let Ok(mut loading) = inner.loading.lock() {
+                loading.clear();
+            }
+        }
+        inner.health.clear_models();
+        let _ = inner
             .health
             .transition(LifecycleState::Stopped, Some(ReadinessReason::Stopped));
         drained
@@ -1717,7 +1787,9 @@ async fn await_controlled<T>(
     };
     let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
     tokio::pin!(sleep);
-    let mut cancellation_poll = tokio::time::interval(Duration::from_millis(1));
+    let cancellation = control.cancellation().clone();
+    let cancellation_event = cancellation.cancelled();
+    tokio::pin!(cancellation_event);
     let result = loop {
         if *force_stop.borrow() {
             break Err(EngineFailure::public(ErrorCode::ModelUnavailable));
@@ -1727,11 +1799,18 @@ async fn await_controlled<T>(
         }
         tokio::select! {
             biased;
-            _ = cancellation_poll.tick() => continue,
             changed = force_stop.changed() => {
                 if changed.is_err() || *force_stop.borrow() {
                     break Err(EngineFailure::public(ErrorCode::ModelUnavailable));
                 }
+            }
+            () = &mut cancellation_event => {
+                if *force_stop.borrow() {
+                    break Err(EngineFailure::public(ErrorCode::ModelUnavailable));
+                }
+                break control.ensure_active().and_then(|()| {
+                    Err(EngineFailure::public(ErrorCode::Cancelled))
+                });
             }
             () = &mut sleep => {
                 break control.ensure_active().and_then(|()| {
@@ -1764,26 +1843,21 @@ async fn run_scheduler(
     mut stop: watch::Receiver<bool>,
 ) {
     let mut pending = VecDeque::new();
-    loop {
+    'scheduler: loop {
         if *stop.borrow() {
-            receiver.close();
-            fail_requests(pending.drain(..).collect(), ErrorCode::ModelUnavailable);
-            while let Ok(request) = receiver.try_recv() {
-                fail_requests(vec![request], ErrorCode::ModelUnavailable);
-            }
-            break;
+            break 'scheduler;
         }
         if pending.is_empty() {
             tokio::select! {
                 biased;
                 changed = stop.changed() => {
                     if changed.is_err() || *stop.borrow() {
-                        continue;
+                        break 'scheduler;
                     }
                 }
                 request = receiver.recv() => match request {
                     Some(request) => pending.push_back(request),
-                    None => break,
+                    None => break 'scheduler,
                 }
             }
         }
@@ -1794,7 +1868,7 @@ async fn run_scheduler(
                 biased;
                 changed = stop.changed() => {
                     if changed.is_err() || *stop.borrow() {
-                        break;
+                        break 'scheduler;
                     }
                 }
                 () = &mut wait => break,
@@ -1862,6 +1936,11 @@ async fn run_scheduler(
         if !accepting.load(Ordering::Acquire) && receiver.is_empty() {
             break;
         }
+    }
+    receiver.close();
+    fail_requests(pending.drain(..).collect(), ErrorCode::ModelUnavailable);
+    while let Ok(request) = receiver.try_recv() {
+        fail_requests(vec![request], ErrorCode::ModelUnavailable);
     }
 }
 
@@ -2072,6 +2151,34 @@ mod tests {
         finished: AtomicBool,
         block: Duration,
         fail: bool,
+    }
+
+    struct DropProbeEngine;
+
+    impl RuntimeEngine for DropProbeEngine {
+        fn model_contract(
+            &self,
+            model: &RequestedModel,
+        ) -> Result<RuntimeModelContract, EngineFailure> {
+            test_contract(model, 1)
+        }
+
+        fn embed(
+            &self,
+            model: &RequestedModel,
+            batch: &EmbeddingBatch<'_>,
+            _control: &ExecutionControl,
+            _options: EmbedOptions,
+        ) -> Result<EmbeddingOutput, EngineFailure> {
+            Ok(EmbeddingOutput {
+                vectors: batch.inputs().iter().map(|_| vec![1.0]).collect(),
+                model: test_identity(model)?,
+            })
+        }
+
+        fn warm(&self) -> Result<(), EngineFailure> {
+            Ok(())
+        }
     }
 
     struct CostAwareEngine {
@@ -3288,22 +3395,33 @@ mod tests {
         while slow.calls.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
-        assert!(!runtime.shutdown(Duration::ZERO).await);
-        assert!(request.is_finished());
-        assert!(!slow.finished.load(Ordering::Acquire));
-        assert!(
-            runtime
-                .0
-                .schedulers
-                .lock()
-                .is_ok_and(|schedulers| schedulers.is_empty())
-        );
+        if runtime.shutdown(Duration::ZERO).await {
+            return Err("forced shutdown unexpectedly drained".into());
+        }
+        if !request.is_finished() {
+            return Err("accepted request was not woken before shutdown returned".into());
+        }
+        if slow.finished.load(Ordering::Acquire) {
+            return Err("native request unexpectedly finished before shutdown returned".into());
+        }
+        if !runtime
+            .0
+            .schedulers
+            .lock()
+            .is_ok_and(|schedulers| schedulers.is_empty())
+        {
+            return Err("scheduler registry was not cleared".into());
+        }
         let error = tokio::time::timeout(Duration::from_millis(20), request)
             .await??
             .err()
             .ok_or("forced shutdown must fail accepted request")?;
-        assert_eq!(error.public_error().code, ErrorCode::ModelUnavailable);
-        assert!(!runtime.health().is_live());
+        if error.public_error().code != ErrorCode::ModelUnavailable {
+            return Err(format!("unexpected forced-shutdown error: {error:?}").into());
+        }
+        if runtime.health().is_live() {
+            return Err("runtime remained live after shutdown".into());
+        }
         Ok(())
     }
 
@@ -3605,6 +3723,121 @@ mod tests {
         assert!(matches!(drain.as_mut().poll(&mut context), Poll::Pending));
         thread::sleep(Duration::from_millis(20));
         assert_eq!(wake_counter.0.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_cancellation_is_event_driven_without_wake_amplification()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let caller = CancellationToken::default();
+        let abandonment = CancellationToken::default();
+        let model = CancellationToken::default();
+        let combined =
+            CancellationToken::any(vec![caller.clone(), abandonment.clone(), model.clone()]);
+        let control = ExecutionControl::new(combined, None);
+        let (_response, receive) = oneshot::channel::<Result<(), EngineFailure>>();
+        let (_force_stop, force_stop) = watch::channel(false);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut wait = Box::pin(await_controlled(
+            control,
+            abandonment,
+            receive,
+            force_stop,
+            deadline,
+        ));
+        let wake_counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let task_waker = Waker::from(Arc::clone(&wake_counter));
+        let mut context = Context::from_waker(&task_waker);
+
+        assert!(matches!(wait.as_mut().poll(&mut context), Poll::Pending));
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(wake_counter.0.load(Ordering::Acquire), 0);
+        caller.cancel();
+        assert_eq!(wake_counter.0.load(Ordering::Acquire), 1);
+        let Poll::Ready(result) = wait.as_mut().poll(&mut context) else {
+            return Err("cancellation event did not complete the request".into());
+        };
+        assert_eq!(
+            result
+                .err()
+                .ok_or("cancelled request succeeded")?
+                .public_error()
+                .code,
+            ErrorCode::Cancelled
+        );
+        assert!(!model.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closed_scheduler_stop_channel_is_terminal() -> Result<(), Box<dyn std::error::Error>> {
+        let limits = policy();
+        let pool = BlockingPool::new(1, limits.queue_depth)?;
+        let (request_sender, request_receiver) = mpsc::channel(limits.queue_depth);
+        let accepting = Arc::new(AtomicBool::new(true));
+        let (stop, stop_receiver) = watch::channel(false);
+        let scheduler = tokio::spawn(run_scheduler(
+            request_receiver,
+            "closed-stop".into(),
+            Arc::new(DropProbeEngine),
+            limits,
+            pool,
+            accepting,
+            stop_receiver,
+        ));
+        drop(stop);
+        tokio::time::timeout(Duration::from_millis(100), scheduler).await??;
+        assert!(request_sender.is_closed());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn final_runtime_owner_releases_scheduler_and_engine()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let engine: Arc<dyn RuntimeEngine> = Arc::new(DropProbeEngine);
+        let engine_weak = Arc::downgrade(&engine);
+        runtime.register_engine("drop-probe", Arc::clone(&engine))?;
+        drop(engine);
+
+        let last_owner = runtime.clone();
+        drop(runtime);
+        assert!(engine_weak.upgrade().is_some());
+        drop(last_owner);
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while engine_weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_shutdown_clears_registry_and_releases_engine()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ApplicationRuntime::new(policy())?;
+        let engine: Arc<dyn RuntimeEngine> = Arc::new(DropProbeEngine);
+        let engine_weak = Arc::downgrade(&engine);
+        runtime.register_engine("shutdown-probe", Arc::clone(&engine))?;
+        drop(engine);
+
+        assert!(runtime.shutdown(Duration::from_millis(100)).await);
+        assert_eq!(runtime.snapshot().registered_models, 0);
+        assert_eq!(runtime.snapshot().ready_models, 0);
+        assert!(
+            runtime
+                .0
+                .loading
+                .lock()
+                .is_ok_and(|loading| loading.is_empty())
+        );
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while engine_weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
         Ok(())
     }
 

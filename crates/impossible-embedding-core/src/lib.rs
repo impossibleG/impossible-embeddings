@@ -4,10 +4,12 @@ use std::{
     borrow::Cow,
     error::Error,
     fmt,
+    future::poll_fn,
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Poll, Waker},
     time::Instant,
 };
 
@@ -422,14 +424,96 @@ impl fmt::Display for EngineFailure {
 impl Error for EngineFailure {}
 
 /// Cloneable cancellation signal shared by admission, engine, and response layers.
+#[derive(Debug, Default)]
+struct CancellationSignal {
+    cancelled: AtomicBool,
+    waiters: Mutex<Vec<Waker>>,
+    dependents: Mutex<Vec<Weak<CancellationState>>>,
+}
+
+impl CancellationSignal {
+    fn cancel(&self) {
+        if self.cancelled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let waiters = self
+            .waiters
+            .lock()
+            .map(|mut waiters| waiters.drain(..).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let dependents = self
+            .dependents
+            .lock()
+            .map(|mut dependents| {
+                dependents.retain(|dependent| dependent.strong_count() != 0);
+                dependents.clone()
+            })
+            .unwrap_or_default();
+        for waiter in waiters {
+            waiter.wake();
+        }
+        for dependent in dependents {
+            if let Some(dependent) = dependent.upgrade() {
+                dependent.source_changed();
+            }
+        }
+    }
+
+    fn register_waiter(&self, waiter: &Waker) {
+        if self.cancelled.load(Ordering::Acquire) {
+            waiter.wake_by_ref();
+            return;
+        }
+        if let Ok(mut waiters) = self.waiters.lock() {
+            if !waiters.iter().any(|existing| existing.will_wake(waiter)) {
+                waiters.push(waiter.clone());
+            }
+        }
+        if self.cancelled.load(Ordering::Acquire) {
+            waiter.wake_by_ref();
+        }
+    }
+
+    fn register_dependent(&self, dependent: &Weak<CancellationState>) {
+        if let Ok(mut dependents) = self.dependents.lock() {
+            dependents.retain(|existing| existing.strong_count() != 0);
+            if !dependents
+                .iter()
+                .any(|existing| Weak::ptr_eq(existing, dependent))
+            {
+                dependents.push(dependent.clone());
+            }
+        }
+        if self.cancelled.load(Ordering::Acquire) {
+            if let Some(dependent) = dependent.upgrade() {
+                dependent.source_changed();
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum CancellationState {
-    Single(AtomicBool),
+    Single(CancellationSignal),
     Any {
-        cancelled: AtomicBool,
+        signal: CancellationSignal,
         constituents: Arc<[CancellationToken]>,
     },
     Composite(Arc<[ExecutionControl]>),
+}
+
+impl CancellationState {
+    fn source_changed(&self) {
+        if let Self::Any {
+            signal,
+            constituents,
+        } = self
+        {
+            if constituents.iter().any(CancellationToken::is_cancelled) {
+                signal.cancel();
+            }
+        }
+    }
 }
 
 /// Cloneable cancellation signal shared by admission, engine, and response layers.
@@ -438,7 +522,9 @@ pub struct CancellationToken(Arc<CancellationState>);
 
 impl Default for CancellationToken {
     fn default() -> Self {
-        Self(Arc::new(CancellationState::Single(AtomicBool::new(false))))
+        Self(Arc::new(CancellationState::Single(
+            CancellationSignal::default(),
+        )))
     }
 }
 
@@ -447,18 +533,66 @@ impl CancellationToken {
     /// is cancelled. Cancelling the returned signal never mutates its constituents.
     #[must_use]
     pub fn any(constituents: impl Into<Arc<[CancellationToken]>>) -> Self {
-        Self(Arc::new(CancellationState::Any {
-            cancelled: AtomicBool::new(false),
-            constituents: constituents.into(),
-        }))
+        let constituents = constituents.into();
+        let combined = Self(Arc::new(CancellationState::Any {
+            signal: CancellationSignal::default(),
+            constituents: Arc::clone(&constituents),
+        }));
+        let dependent = Arc::downgrade(&combined.0);
+        for constituent in constituents.iter() {
+            constituent.register_dependent(&dependent);
+        }
+        combined.0.source_changed();
+        combined
+    }
+
+    fn register_dependent(&self, dependent: &Weak<CancellationState>) {
+        match self.0.as_ref() {
+            CancellationState::Single(signal) | CancellationState::Any { signal, .. } => {
+                signal.register_dependent(dependent);
+            }
+            CancellationState::Composite(constituents) => {
+                for control in constituents.iter() {
+                    control.cancellation.register_dependent(dependent);
+                }
+            }
+        }
+    }
+
+    fn register_waiter(&self, waiter: &Waker) {
+        match self.0.as_ref() {
+            CancellationState::Single(signal) | CancellationState::Any { signal, .. } => {
+                signal.register_waiter(waiter);
+            }
+            CancellationState::Composite(constituents) => {
+                for control in constituents.iter() {
+                    control.cancellation.register_waiter(waiter);
+                }
+            }
+        }
+    }
+
+    /// Wait until cancellation is requested without polling on a timer.
+    pub async fn cancelled(&self) {
+        poll_fn(|context| {
+            if self.is_cancelled() {
+                return Poll::Ready(());
+            }
+            self.register_waiter(context.waker());
+            if self.is_cancelled() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
     }
 
     /// Requests cancellation. Calls are idempotent.
     pub fn cancel(&self) {
         match self.0.as_ref() {
-            CancellationState::Single(cancelled) => cancelled.store(true, Ordering::Release),
-            CancellationState::Any { cancelled, .. } => {
-                cancelled.store(true, Ordering::Release);
+            CancellationState::Single(signal) | CancellationState::Any { signal, .. } => {
+                signal.cancel();
             }
             CancellationState::Composite(constituents) => {
                 for control in constituents.iter() {
@@ -472,12 +606,12 @@ impl CancellationToken {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         match self.0.as_ref() {
-            CancellationState::Single(cancelled) => cancelled.load(Ordering::Acquire),
+            CancellationState::Single(signal) => signal.cancelled.load(Ordering::Acquire),
             CancellationState::Any {
-                cancelled,
+                signal,
                 constituents,
             } => {
-                cancelled.load(Ordering::Acquire)
+                signal.cancelled.load(Ordering::Acquire)
                     || constituents.iter().any(CancellationToken::is_cancelled)
             }
             CancellationState::Composite(constituents) => constituents
