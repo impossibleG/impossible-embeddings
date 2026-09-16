@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 use crate::{
-    AppState, ApplicationError, ApplicationErrorKind, EmbedCommand, LoadStatus, ModelInfo,
+    AppState, ApplicationError, ApplicationErrorKind, EmbedCommand, LoadStatus, ModelInfo, mcp,
 };
 
 const OPENAPI: &[u8] = include_bytes!("../../../docs/openapi-v1.json");
@@ -44,6 +44,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/embeddings", post(openai_embeddings))
         .route("/v1/embed", post(native_embeddings))
         .route("/v1/models", get(list_models))
+        .route("/mcp", post(mcp::http_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_public_auth,
@@ -150,7 +151,7 @@ fn route_method(path: &str, admin_enabled: bool) -> Option<Method> {
         "/" | "/v1/models" | "/health/live" | "/health/ready" | "/metrics" | "/openapi.json" => {
             Some(Method::GET)
         }
-        "/v1/embeddings" | "/v1/embed" => Some(Method::POST),
+        "/v1/embeddings" | "/v1/embed" | "/mcp" => Some(Method::POST),
         "/v1/admin/models/install"
         | "/v1/admin/models/load"
         | "/v1/admin/models/unload"
