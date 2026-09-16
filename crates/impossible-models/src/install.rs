@@ -141,10 +141,23 @@ impl Default for InstallOptions {
     fn default() -> Self {
         Self {
             offline: false,
-            allowed_origins: ["https://huggingface.co"]
-                .into_iter()
-                .filter_map(|value| Url::parse(value).ok())
-                .collect(),
+            // Hugging Face's documented download origins. The Hub returns signed redirects to
+            // these exact hosts; permitting only huggingface.co makes every large curated model
+            // uninstallable. Redirects remain checked hop-by-hop and no suffix wildcard is used.
+            allowed_origins: [
+                "https://huggingface.co",
+                "https://cas-server.xethub.hf.co",
+                "https://cas-server.xethub-eu.hf.co",
+                "https://transfer.xethub.hf.co",
+                "https://transfer.xethub-eu.hf.co",
+                "https://us.aws.cdn.hf.co",
+                "https://us.gcp.cdn.hf.co",
+                "https://cdn-lfs-us-1.hf.co",
+                "https://cdn-lfs-eu-1.hf.co",
+            ]
+            .into_iter()
+            .filter_map(|value| Url::parse(value).ok())
+            .collect(),
             max_redirects: 3,
             max_artifact_bytes: 2 * 1024 * 1024 * 1024,
             max_artifacts: crate::MAX_ARTIFACTS,

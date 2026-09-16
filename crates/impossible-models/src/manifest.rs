@@ -580,11 +580,47 @@ mod tests {
                 "nomic-ai/nomic-embed-text-v1.5"
             ]
         );
-        assert!(
+        assert_eq!(
             manifests
                 .iter()
-                .all(|manifest| !manifest.semantics_verified())
+                .filter(|manifest| manifest.semantics_verified())
+                .map(|manifest| manifest.canonical_id.as_str())
+                .collect::<Vec<_>>(),
+            ["BAAI/bge-small-en-v1.5"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn verified_bge_evidence_matches_its_complete_runtime_manifest() -> Result<()> {
+        let manifests = curated_manifests()?;
+        let manifest = manifests
+            .iter()
+            .find(|manifest| manifest.canonical_id == "BAAI/bge-small-en-v1.5")
+            .ok_or_else(|| Error::Invalid("missing curated BGE manifest".into()))?;
+        let evidence: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../../docs/model-qualification/bge-small-en-v1.5.json"
+        ))?;
+        assert_eq!(evidence["model"], manifest.canonical_id);
+        assert_eq!(evidence["revision"], manifest.revision);
+        assert_eq!(evidence["semantics"]["dimensions"], 384);
+        assert_eq!(
+            evidence["semantics"]["maximum_tokens_including_special_tokens"],
+            manifest.tokenizer.max_tokens
+        );
+        let SemanticVerification::Verified {
+            evidence: reference,
+        } = &manifest.semantic_verification
+        else {
+            return Err(Error::Invalid("BGE evidence is not trusted".into()));
+        };
+        assert_eq!(reference, "docs/model-qualification/bge-small-en-v1.5.json");
+        for artifact in &manifest.artifacts {
+            let record = &evidence["artifacts"][&artifact.path];
+            assert_eq!(record["sha256"], artifact.sha256);
+            assert_eq!(record["size"].as_u64(), Some(artifact.size));
+        }
+        assert!(matches!(manifest.runtime, RuntimeMetadata::Onnx { .. }));
         Ok(())
     }
 

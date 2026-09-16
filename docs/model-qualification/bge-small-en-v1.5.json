@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "model": "BAAI/bge-small-en-v1.5",
+  "revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+  "qualified_on": "2026-09-16",
+  "license": {
+    "spdx": "MIT",
+    "source": "https://huggingface.co/BAAI/bge-small-en-v1.5/tree/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
+  },
+  "semantics": {
+    "tokenizer": "Bert WordPiece, lowercase",
+    "maximum_tokens_including_special_tokens": 512,
+    "pooling": "CLS",
+    "normalize": "L2",
+    "dimensions": 384,
+    "query_prefix": "Represent this sentence for searching relevant passages: ",
+    "document_prefix": ""
+  },
+  "artifacts": {
+    "config.json": {
+      "size": 743,
+      "sha256": "094f8e891b932f2000c92cfc663bac4c62069f5d8af5b5278c4306aef3084750"
+    },
+    "model.onnx": {
+      "size": 133093490,
+      "sha256": "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35"
+    },
+    "model.safetensors": {
+      "size": 133466304,
+      "sha256": "3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad",
+      "purpose": "independent PyTorch oracle only; not installed by the server"
+    },
+    "special_tokens_map.json": {
+      "size": 125,
+      "sha256": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3"
+    },
+    "tokenizer.json": {
+      "size": 711396,
+      "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
+    },
+    "tokenizer_config.json": {
+      "size": 366,
+      "sha256": "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3"
+    }
+  },
+  "oracle": {
+    "implementation": "transformers.AutoModel/BertModel last_hidden_state[:, 0], then L2 normalization",
+    "torch": "2.8.0+cpu",
+    "transformers": "4.56.1",
+    "remote_code": false,
+    "offline": true,
+    "full_generated_evidence_sha256": "ad5b8fe21940e1ea5bb43838616bd44a257883748143d6e3c3715e7a96987d82",
+    "vector_digest_encoding": "SHA-256 of 384 IEEE-754 float32 values in little-endian order"
+  },
+  "cases": [
+    {
+      "name": "document_public",
+      "task": "document",
+      "text": "The weather is lovely today.",
+      "token_ids": [101, 1996, 4633, 2003, 8403, 2651, 1012, 102],
+      "oracle_vector_sha256": "90eb8c9bf1c8b336aba5daa59f2f19b844fdf729b490890170d05b9d4ae36959"
+    },
+    {
+      "name": "document_unicode",
+      "task": "document",
+      "text": "Olá, 世界 — naïve café 🚀",
+      "token_ids": [101, 19330, 2050, 1010, 1745, 100, 1517, 15743, 7668, 100, 102],
+      "oracle_vector_sha256": "4b7ef3f355b6272d29b5c1fc125985d9d03b810cbf552a51c6e577c36110684c"
+    },
+    {
+      "name": "query_public",
+      "task": "query",
+      "text": "What is the capital of France?",
+      "token_ids": [101, 5050, 2023, 6251, 2005, 6575, 7882, 13768, 1024, 2054, 2003, 1996, 3007, 1997, 2605, 1029, 102],
+      "oracle_vector_sha256": "0427dc3c6af533cb123bfbea88e7f23f1a4014143b0db00bdef14dcd01f77e7b"
+    },
+    {
+      "name": "document_empty",
+      "task": "document",
+      "text": "",
+      "token_ids": [101, 102],
+      "oracle_vector_sha256": "1b70f1b75766937d695d714b2784b2f282c280dccb504b2f0ac79530ad0e1802"
+    }
+  ],
+  "limits": {
+    "exact_boundary": "510 repetitions of the single-token word hello plus CLS and SEP equals 512 tokens",
+    "over_boundary": "511 repetitions plus CLS and SEP equals 513 tokens and is rejected unless truncation is requested",
+    "truncation": "right truncation preserves CLS and SEP and matches the exact-boundary vector"
+  },
+  "comparison": {
+    "required_minimum_cosine": 0.99999,
+    "required_maximum_absolute_delta": 0.0001,
+    "observed_minimum_cosine": 0.999999881,
+    "observed_maximum_absolute_delta": 0.000000179,
+    "batch_matches_single": true,
+    "query_and_document_modes_verified": true,
+    "unicode_verified": true
+  },
+  "lifecycle": {
+    "online_install": "pass",
+    "artifact_integrity": "pass",
+    "load_and_warm": "pass",
+    "embed": "pass",
+    "offline_process_restart": "pass"
+  },
+  "reproduce": {
+    "oracle_script": "scripts/qualify_bge_oracle.py",
+    "rust_test": "pinned_bge_install_verify_embed_and_offline_restart",
+    "weights_committed": false
+  }
+}

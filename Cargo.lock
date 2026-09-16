@@ -937,9 +937,11 @@ dependencies = [
  "ndarray",
  "ort",
  "prost",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokenizers",
+ "tokio",
 ]
 
 [[package]]

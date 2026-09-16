@@ -17,7 +17,9 @@ use ort::{
 };
 use prost::Message;
 use std::{borrow::Cow, collections::BTreeSet, error::Error, fmt, path::Path, sync::Mutex};
-use tokenizers::{Encoding, Tokenizer};
+use tokenizers::{
+    Encoding, PostProcessor, Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy,
+};
 
 /// Stable runtime name used in model identities.
 pub const ENGINE_NAME: &str = "onnx-runtime";
@@ -35,6 +37,7 @@ struct LoadedModel {
     manifest: Manifest,
     contract: OnnxContract,
     tokenizer: Tokenizer,
+    truncating_tokenizer: Tokenizer,
     session: Mutex<Session>,
     identity: ResolvedModelIdentity,
     _lease: VerifiedModel,
@@ -117,6 +120,24 @@ impl OnnxEmbeddingEngine {
         let tokenizer_bytes = safe_artifact_bytes(verified, &tokenizer_file, "json")?;
         let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)
             .map_err(|e| private_error(ErrorCode::ModelUnavailable, "tokenizer parse", e))?;
+        let max_tokens = usize::try_from(manifest.tokenizer.max_tokens)
+            .map_err(|error| EngineFailure::with_source(ErrorCode::Internal, error))?;
+        if tokenizer
+            .get_post_processor()
+            .map_or(0, |processor| processor.added_tokens(false))
+            > max_tokens
+        {
+            return Err(EngineFailure::public(ErrorCode::InvalidRequest));
+        }
+        let mut truncating_tokenizer = tokenizer.clone();
+        truncating_tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: max_tokens,
+                strategy: TruncationStrategy::LongestFirst,
+                stride: 0,
+                direction: TruncationDirection::Right,
+            }))
+            .map_err(|e| private_error(ErrorCode::ModelUnavailable, "tokenizer truncation", e))?;
         let session = Session::builder()
             .and_then(|b| b.commit_from_memory(&model_bytes))
             .map_err(|e| private_error(ErrorCode::ModelUnavailable, "ONNX load", e))?;
@@ -137,6 +158,7 @@ impl OnnxEmbeddingEngine {
             manifest,
             contract,
             tokenizer,
+            truncating_tokenizer,
             session: Mutex::new(session),
             identity,
             _lease: verified.clone(),
@@ -325,19 +347,17 @@ impl LoadedModel {
         .filter(|p| !p.is_empty())
     }
     fn encode(&self, text: &str, truncation: Truncation) -> Result<Encoding, EngineFailure> {
-        let mut encoding = self
-            .tokenizer
+        let tokenizer = match truncation {
+            Truncation::Reject => &self.tokenizer,
+            Truncation::Truncate => &self.truncating_tokenizer,
+        };
+        let encoding = tokenizer
             .encode(text, true)
             .map_err(|e| private_error(ErrorCode::InvalidRequest, "tokenization", e))?;
         let max_tokens = usize::try_from(self.manifest.tokenizer.max_tokens)
             .map_err(|error| EngineFailure::with_source(ErrorCode::Internal, error))?;
         if encoding.len() > max_tokens {
-            match truncation {
-                Truncation::Reject => return Err(EngineFailure::public(ErrorCode::InvalidRequest)),
-                Truncation::Truncate => {
-                    encoding.truncate(max_tokens, 0, tokenizers::TruncationDirection::Right);
-                }
-            }
+            return Err(EngineFailure::public(ErrorCode::InvalidRequest));
         }
         Ok(encoding)
     }

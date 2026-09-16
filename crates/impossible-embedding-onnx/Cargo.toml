@@ -18,8 +18,10 @@ tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"
 [dev-dependencies]
 anyhow.workspace = true
 impossible-server-core = { version = "=0.1.0", path = "../impossible-server-core" }
+serde_json.workspace = true
 sha2 = "0.10.9"
 tempfile = "3.23.0"
+tokio.workspace = true
 
 [lints]
 workspace = true

@@ -58,13 +58,17 @@ only from repository-curated manifests; operators may supply separately authenti
 records explicitly. The initial three catalog entries deliberately remain
 `Unverified`: their upstream revisions, sizes, and hashes are pinned, but this repository has not
 yet committed runtime golden-vector evidence. Server integrations must not advertise them as ready
-until that evidence exists.
+until that evidence exists. BGE Small English v1.5 is the first `Verified` entry; its independent
+PyTorch oracle, tokenizer IDs, vector digests, tolerances, and lifecycle results are recorded in
+`docs/model-qualification/bge-small-en-v1.5.json`. The E5 and Nomic entries remain unverified.
 
 ## Network policy
 
 Downloads require an explicit origin allowlist. HTTPS is mandatory outside loopback-only test
 fixtures, redirects are checked hop by hop, response and streamed byte counts are bounded, and
-offline mode returns before issuing a request. Default policy permits only `https://huggingface.co`.
+offline mode returns before issuing a request. The default policy contains the exact Hub, Xet, and
+CDN origins in Hugging Face's published download allowlist; it does not trust an `hf.co` wildcard.
+Operators with stricter egress policy can replace that list.
 
 Curated manifests contain no weights. Their licenses are upstream assertions, not legal advice.
 

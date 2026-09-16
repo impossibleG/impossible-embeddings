@@ -1,18 +1,77 @@
 {
   "schema_version": 1,
   "canonical_id": "BAAI/bge-small-en-v1.5",
-  "revision": "5e62ea33e012fda8c02802b906664c915ebd1bb1",
-  "license": { "spdx": "MIT", "source_url": "https://huggingface.co/BAAI/bge-small-en-v1.5" },
-  "semantic_verification": { "status": "unverified", "reason": "Artifact integrity is pinned; golden-vector runtime verification is pending." },
-  "tokenizer": { "kind": "bert-wordpiece", "max_tokens": 512, "lowercase": true },
+  "revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+  "license": {
+    "spdx": "MIT",
+    "source_url": "https://huggingface.co/BAAI/bge-small-en-v1.5/tree/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
+  },
+  "semantic_verification": {
+    "status": "verified",
+    "evidence": "docs/model-qualification/bge-small-en-v1.5.json"
+  },
+  "tokenizer": {
+    "kind": "bert-wordpiece",
+    "max_tokens": 512,
+    "lowercase": true
+  },
   "pooling": "cls",
-  "prefixes": { "query": "Represent this sentence for searching relevant passages: ", "document": "" },
-  "dimensions": { "native": 384, "matryoshka": [] },
-  "tensors": { "format": "safetensors", "dtype": "float32", "architecture": "BertModel" },
-  "artifacts": [{
-    "path": "model.safetensors",
-    "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5e62ea33e012fda8c02802b906664c915ebd1bb1/model.safetensors",
-    "sha256": "3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad",
-    "size": 133466304
-  }]
+  "prefixes": {
+    "query": "Represent this sentence for searching relevant passages: ",
+    "document": ""
+  },
+  "dimensions": {
+    "native": 384,
+    "matryoshka": []
+  },
+  "tensors": {
+    "format": "onnx",
+    "dtype": "float32",
+    "architecture": "BertModel"
+  },
+  "runtime": {
+    "engine": "onnx",
+    "model_file": "model.onnx",
+    "tokenizer_file": "tokenizer.json",
+    "inputs": {
+      "input_ids": "input_ids",
+      "attention_mask": "attention_mask",
+      "token_type_ids": "token_type_ids"
+    },
+    "output": "last_hidden_state",
+    "pad_token_id": 0,
+    "normalize": true
+  },
+  "artifacts": [
+    {
+      "path": "model.onnx",
+      "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/onnx/model.onnx",
+      "sha256": "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35",
+      "size": 133093490
+    },
+    {
+      "path": "tokenizer.json",
+      "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/tokenizer.json",
+      "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+      "size": 711396
+    },
+    {
+      "path": "config.json",
+      "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/config.json",
+      "sha256": "094f8e891b932f2000c92cfc663bac4c62069f5d8af5b5278c4306aef3084750",
+      "size": 743
+    },
+    {
+      "path": "tokenizer_config.json",
+      "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/tokenizer_config.json",
+      "sha256": "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3",
+      "size": 366
+    },
+    {
+      "path": "special_tokens_map.json",
+      "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/special_tokens_map.json",
+      "sha256": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+      "size": 125
+    }
+  ]
 }
