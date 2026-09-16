@@ -27,6 +27,8 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked --workspace
+      - name: Real-binary end-to-end
+        run: cargo test --locked --package impossible-server --features e2e-fixture --test binary_e2e -- --test-threads=1
       - name: Privacy scan
         shell: pwsh
         run: ./scripts/privacy-scan.ps1

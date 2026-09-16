@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+e2e-fixture = ["impossible-models/e2e-fixture"]
+
 [[bin]]
 name = "impossible-embedding"
 path = "src/main.rs"
@@ -38,6 +41,10 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+sha2 = "=0.10.9"
+tempfile = "=3.23.0"
+tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
+tokio = { workspace = true, features = ["process"] }
 
 [lints]
 workspace = true

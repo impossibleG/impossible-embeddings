@@ -12,6 +12,9 @@ pub const MAX_ARTIFACTS: usize = 64;
 /// Hard schema bound for the sum of all declared artifact sizes (16 GiB).
 pub const MAX_TOTAL_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub(crate) const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+#[cfg(feature = "e2e-fixture")]
+const E2E_FIXTURE_SEMANTIC_FINGERPRINT: &str =
+    "sha256:35880bb9026dc54cf7540cc5ee23e7ccba794b68830ba5330e03b53773b20bb2";
 const MAX_METADATA_TEXT_BYTES: usize = 4 * 1024;
 const MAX_URL_BYTES: usize = 8 * 1024;
 const MAX_TENSOR_NAME_BYTES: usize = 256;
@@ -551,14 +554,55 @@ fn validate_id(value: &str) -> Result<()> {
 ///
 /// Returns an error if a committed manifest no longer satisfies the schema.
 pub fn curated_manifests() -> Result<Vec<Manifest>> {
-    [
+    let manifests = [
         include_bytes!("../manifests/bge-small-en.json").as_slice(),
         include_bytes!("../manifests/multilingual-e5-small.json").as_slice(),
         include_bytes!("../manifests/nomic-embed-text-v1.5.json").as_slice(),
     ]
     .into_iter()
     .map(Manifest::from_json)
-    .collect()
+    .collect::<Result<Vec<_>>>()?;
+
+    // This code is absent from release builds. It lets the cross-platform system test execute the
+    // production binary and production model lifecycle around a tiny, repository-authored ONNX
+    // graph without downloading or committing third-party model weights.
+    #[cfg(feature = "e2e-fixture")]
+    let manifests = {
+        let mut manifests = manifests;
+        if let Some(path) = std::env::var_os("IE_E2E_MANIFEST") {
+            use std::io::Read as _;
+
+            let mut file = std::fs::File::open(path)?;
+            let length = file.metadata()?.len();
+            if length > MAX_MANIFEST_BYTES as u64 {
+                return Err(Error::Invalid(
+                    "fixture manifest exceeds the supported size".into(),
+                ));
+            }
+            let mut bytes = Vec::with_capacity(
+                usize::try_from(length)
+                    .map_err(|_| Error::Invalid("fixture manifest is too large".into()))?,
+            );
+            file.by_ref()
+                .take((MAX_MANIFEST_BYTES as u64).saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_MANIFEST_BYTES {
+                return Err(Error::Invalid(
+                    "fixture manifest exceeds the supported size".into(),
+                ));
+            }
+            let fixture = Manifest::from_json(&bytes)?;
+            if fixture.semantic_fingerprint()? != E2E_FIXTURE_SEMANTIC_FINGERPRINT {
+                return Err(Error::Invalid(
+                    "fixture manifest does not match the repository test identity".into(),
+                ));
+            }
+            manifests.push(fixture);
+        }
+        manifests
+    };
+
+    Ok(manifests)
 }
 
 #[cfg(test)]
