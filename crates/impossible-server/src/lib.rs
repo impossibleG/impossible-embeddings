@@ -1,6 +1,7 @@
 //! Transport-independent application runtime for model lifecycle and bounded inference.
 
 pub mod application;
+pub mod grpc;
 pub mod http;
 pub mod runtime;
 
@@ -13,3 +14,5 @@ pub use application::{
 pub use runtime::{
     ApplicationRuntime, BatchPolicy, LifecycleError, RuntimeEngine, RuntimeLease, RuntimeSnapshot,
 };
+
+pub use grpc::{GrpcServerError, GrpcServerHandle, spawn_grpc_server};
