@@ -31,6 +31,16 @@ impl fmt::Debug for CredentialSource {
     }
 }
 
+/// Behavior when one or more explicitly configured preload models cannot be loaded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StartupPolicy {
+    /// Start the process and report individual preload failures without downloading anything.
+    #[default]
+    BestEffort,
+    /// Fail startup unless every explicitly configured preload model is already installed and loads.
+    Strict,
+}
+
 /// Bounded resource policy used before requests reach an inference engine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -79,18 +89,30 @@ impl Default for Limits {
 /// Fully merged server configuration.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ServerConfig {
-    /// Listener address. Loopback is the safe default.
-    pub bind: SocketAddr,
+    /// HTTP listener address. Loopback is the safe default.
+    pub http_bind: SocketAddr,
+    /// gRPC listener address. Loopback is the safe default.
+    pub grpc_bind: SocketAddr,
     /// Explicit acknowledgement allowing an unauthenticated non-loopback bind.
     pub allow_insecure_remote: bool,
     /// Credential for inference APIs.
     pub auth: Option<CredentialSource>,
     /// Separate credential for administrative APIs.
     pub admin_auth: Option<CredentialSource>,
+    /// Whether administrative model lifecycle endpoints are exposed.
+    pub admin_api_enabled: bool,
     /// Exact allowed browser origins. Wildcards are prohibited.
     pub allowed_origins: Vec<String>,
     /// Paths explicitly selected for model discovery.
     pub model_directories: Vec<PathBuf>,
+    /// Private application cache containing exact installed model identities.
+    pub cache_directory: PathBuf,
+    /// Exact aliases or canonical ids to load at startup. Startup never installs them.
+    pub preload_models: Vec<String>,
+    /// Prohibit explicit installation from issuing network requests.
+    pub offline: bool,
+    /// Handling for explicitly requested preload failures.
+    pub startup_policy: StartupPolicy,
     /// Resource and time limits.
     pub limits: Limits,
 }
@@ -99,12 +121,18 @@ impl fmt::Debug for ServerConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ServerConfig")
-            .field("bind", &"[REDACTED]")
+            .field("http_bind", &"[REDACTED]")
+            .field("grpc_bind", &"[REDACTED]")
             .field("allow_insecure_remote", &self.allow_insecure_remote)
             .field("auth", &self.auth)
             .field("admin_auth", &self.admin_auth)
+            .field("admin_api_enabled", &self.admin_api_enabled)
             .field("allowed_origin_count", &self.allowed_origins.len())
             .field("model_directory_count", &self.model_directories.len())
+            .field("cache_directory", &"[REDACTED]")
+            .field("preload_model_count", &self.preload_models.len())
+            .field("offline", &self.offline)
+            .field("startup_policy", &self.startup_policy)
             .field("limits", &self.limits)
             .finish()
     }
@@ -113,12 +141,18 @@ impl fmt::Debug for ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080),
+            http_bind: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080),
+            grpc_bind: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 50051),
             allow_insecure_remote: false,
             auth: None,
             admin_auth: None,
+            admin_api_enabled: true,
             allowed_origins: Vec::new(),
             model_directories: Vec::new(),
+            cache_directory: PathBuf::from(".impossible-embedding-cache"),
+            preload_models: Vec::new(),
+            offline: false,
+            startup_policy: StartupPolicy::BestEffort,
             limits: Limits::default(),
         }
     }
@@ -128,7 +162,8 @@ impl Default for ServerConfig {
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigKey {
-    Bind,
+    HttpBind,
+    GrpcBind,
     AllowInsecureRemote,
     AuthEnv,
     AuthTokenPresent,
@@ -136,8 +171,13 @@ pub enum ConfigKey {
     AdminAuthEnv,
     AdminAuthTokenPresent,
     AdminAuthFile,
+    AdminApiEnabled,
     AllowedOrigins,
     ModelDirectories,
+    CacheDirectory,
+    PreloadModels,
+    Offline,
+    StartupPolicy,
     MaxBodyBytes,
     MaxInputBytes,
     MaxRequestBytes,
@@ -158,7 +198,8 @@ impl ConfigKey {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Bind => "bind",
+            Self::HttpBind => "http_bind",
+            Self::GrpcBind => "grpc_bind",
             Self::AllowInsecureRemote => "allow_insecure_remote",
             Self::AuthEnv => "auth_env",
             Self::AuthTokenPresent => "auth_token_present",
@@ -166,8 +207,13 @@ impl ConfigKey {
             Self::AdminAuthEnv => "admin_auth_env",
             Self::AdminAuthTokenPresent => "admin_auth_token_present",
             Self::AdminAuthFile => "admin_auth_file",
+            Self::AdminApiEnabled => "admin_api_enabled",
             Self::AllowedOrigins => "allowed_origins",
             Self::ModelDirectories => "model_directories",
+            Self::CacheDirectory => "cache_directory",
+            Self::PreloadModels => "preload_models",
+            Self::Offline => "offline",
+            Self::StartupPolicy => "startup_policy",
             Self::MaxBodyBytes => "limits.max_body_bytes",
             Self::MaxInputBytes => "limits.max_input_bytes",
             Self::MaxRequestBytes => "limits.max_request_bytes",
@@ -305,7 +351,7 @@ impl ConfigError {
             Self::UnsafeRemoteBind => ConfigDiagnostic {
                 code: "config_unsafe_remote_bind",
                 source: ConfigSource::Validation,
-                key: Some(ConfigKey::Bind),
+                key: Some(ConfigKey::HttpBind),
                 reason: None,
             },
             Self::InvalidAdminCredentialPolicy => ConfigDiagnostic {
@@ -417,11 +463,39 @@ impl ServerConfig {
     ///
     /// Returns a sanitized [`ConfigError`] for an unsafe or unsupported policy.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !self.bind.ip().is_loopback() && self.auth.is_none() && !self.allow_insecure_remote {
+        let remotely_exposed =
+            !self.http_bind.ip().is_loopback() || !self.grpc_bind.ip().is_loopback();
+        if remotely_exposed && self.auth.is_none() && !self.allow_insecure_remote {
             return Err(ConfigError::UnsafeRemoteBind);
         }
-        if self.admin_auth.is_some() && self.admin_auth == self.auth {
+        if (self.admin_auth.is_some() && self.admin_auth == self.auth)
+            || (remotely_exposed && self.admin_api_enabled && self.admin_auth.is_none())
+        {
             return Err(ConfigError::InvalidAdminCredentialPolicy);
+        }
+        if self.http_bind == self.grpc_bind {
+            return Err(ConfigError::InvalidValue {
+                key: ConfigKey::GrpcBind,
+                reason: "HTTP and gRPC listeners must use distinct addresses",
+            });
+        }
+        if self.cache_directory.as_os_str().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: ConfigKey::CacheDirectory,
+                reason: "cache directory must not be empty",
+            });
+        }
+        let mut preloads = std::collections::HashSet::new();
+        if self.preload_models.iter().any(|model| {
+            model.trim().is_empty()
+                || model.len() > 512
+                || model.chars().any(char::is_control)
+                || !preloads.insert(model)
+        }) {
+            return Err(ConfigError::InvalidValue {
+                key: ConfigKey::PreloadModels,
+                reason: "preload models must be unique, bounded, non-empty identifiers",
+            });
         }
         validate_bounds(&self.limits)?;
         if self
@@ -585,7 +659,8 @@ where
             continue;
         };
         let normalized = match suffix {
-            "BIND" => ConfigKey::Bind,
+            "HTTP_BIND" => ConfigKey::HttpBind,
+            "GRPC_BIND" => ConfigKey::GrpcBind,
             "ALLOW_INSECURE_REMOTE" => ConfigKey::AllowInsecureRemote,
             "AUTH_ENV" => ConfigKey::AuthEnv,
             "AUTH_TOKEN" => ConfigKey::AuthTokenPresent,
@@ -593,8 +668,13 @@ where
             "ADMIN_AUTH_ENV" => ConfigKey::AdminAuthEnv,
             "ADMIN_AUTH_TOKEN" => ConfigKey::AdminAuthTokenPresent,
             "ADMIN_AUTH_FILE" => ConfigKey::AdminAuthFile,
+            "ADMIN_API_ENABLED" => ConfigKey::AdminApiEnabled,
             "ALLOWED_ORIGINS" => ConfigKey::AllowedOrigins,
             "MODEL_DIRECTORIES" => ConfigKey::ModelDirectories,
+            "CACHE_DIRECTORY" => ConfigKey::CacheDirectory,
+            "PRELOAD_MODELS" => ConfigKey::PreloadModels,
+            "OFFLINE" => ConfigKey::Offline,
+            "STARTUP_POLICY" => ConfigKey::StartupPolicy,
             "MAX_BODY_BYTES" => ConfigKey::MaxBodyBytes,
             "MAX_INPUT_BYTES" => ConfigKey::MaxInputBytes,
             "MAX_REQUEST_BYTES" => ConfigKey::MaxRequestBytes,
@@ -672,7 +752,7 @@ where
                 reason: "inline option values are not supported",
             });
         }
-        if key == ConfigKey::AllowInsecureRemote {
+        if matches!(key, ConfigKey::AllowInsecureRemote | ConfigKey::Offline) {
             patch.set(key, PatchValue::Scalar("true".to_owned()))?;
             continue;
         }
@@ -693,7 +773,8 @@ fn credential_like_option(option: &str) -> bool {
 
 fn parse_key(key: &str) -> Option<ConfigKey> {
     match key {
-        "bind" => Some(ConfigKey::Bind),
+        "http_bind" => Some(ConfigKey::HttpBind),
+        "grpc_bind" => Some(ConfigKey::GrpcBind),
         "allow_insecure_remote" => Some(ConfigKey::AllowInsecureRemote),
         "auth_env" => Some(ConfigKey::AuthEnv),
         "auth_token_present" => Some(ConfigKey::AuthTokenPresent),
@@ -701,8 +782,13 @@ fn parse_key(key: &str) -> Option<ConfigKey> {
         "admin_auth_env" => Some(ConfigKey::AdminAuthEnv),
         "admin_auth_token_present" => Some(ConfigKey::AdminAuthTokenPresent),
         "admin_auth_file" => Some(ConfigKey::AdminAuthFile),
+        "admin_api_enabled" => Some(ConfigKey::AdminApiEnabled),
         "allowed_origins" => Some(ConfigKey::AllowedOrigins),
         "model_directories" => Some(ConfigKey::ModelDirectories),
+        "cache_directory" => Some(ConfigKey::CacheDirectory),
+        "preload_models" => Some(ConfigKey::PreloadModels),
+        "offline" => Some(ConfigKey::Offline),
+        "startup_policy" => Some(ConfigKey::StartupPolicy),
         "limits.max_body_bytes" => Some(ConfigKey::MaxBodyBytes),
         "limits.max_input_bytes" => Some(ConfigKey::MaxInputBytes),
         "limits.max_request_bytes" => Some(ConfigKey::MaxRequestBytes),
@@ -729,8 +815,13 @@ fn apply_value(
         PatchValue::List(_) => Err(invalid("expected scalar value")),
     };
     match key {
-        ConfigKey::Bind => {
-            target.bind = scalar()?
+        ConfigKey::HttpBind => {
+            target.http_bind = scalar()?
+                .parse()
+                .map_err(|_| invalid("expected socket address"))?;
+        }
+        ConfigKey::GrpcBind => {
+            target.grpc_bind = scalar()?
                 .parse()
                 .map_err(|_| invalid("expected socket address"))?;
         }
@@ -760,6 +851,10 @@ fn apply_value(
         ConfigKey::AdminAuthFile => {
             target.admin_auth = Some(CredentialSource::File(PathBuf::from(scalar()?)));
         }
+        ConfigKey::AdminApiEnabled => {
+            target.admin_api_enabled =
+                parse_bool(scalar()?).ok_or_else(|| invalid("expected boolean"))?;
+        }
         ConfigKey::AllowedOrigins => {
             target.allowed_origins = list_value(value, key)?;
         }
@@ -768,6 +863,18 @@ fn apply_value(
                 .into_iter()
                 .map(PathBuf::from)
                 .collect();
+        }
+        ConfigKey::CacheDirectory => target.cache_directory = PathBuf::from(scalar()?),
+        ConfigKey::PreloadModels => target.preload_models = list_value(value, key)?,
+        ConfigKey::Offline => {
+            target.offline = parse_bool(scalar()?).ok_or_else(|| invalid("expected boolean"))?;
+        }
+        ConfigKey::StartupPolicy => {
+            target.startup_policy = match scalar()? {
+                "best_effort" => StartupPolicy::BestEffort,
+                "strict" => StartupPolicy::Strict,
+                _ => return Err(invalid("expected best_effort or strict")),
+            };
         }
         ConfigKey::MaxBodyBytes => target.limits.max_body_bytes = parse_usize(scalar()?, key)?,
         ConfigKey::MaxInputBytes => target.limits.max_input_bytes = parse_usize(scalar()?, key)?,
@@ -978,24 +1085,178 @@ mod tests {
     use super::*;
 
     #[test]
-    fn precedence_is_cli_then_environment_then_toml_then_defaults() {
-        let path = std::env::temp_dir().join(format!("impossible-config-{}", std::process::id()));
+    fn service_defaults_use_distinct_ipv6_loopback_listeners_and_no_implicit_work() {
+        let config = ServerConfig::default();
+        assert_eq!(
+            config.http_bind,
+            "[::1]:8080".parse().expect("HTTP address")
+        );
+        assert_eq!(
+            config.grpc_bind,
+            "[::1]:50051".parse().expect("gRPC address")
+        );
+        assert!(config.http_bind.ip().is_loopback());
+        assert!(config.grpc_bind.ip().is_loopback());
+        assert!(config.preload_models.is_empty());
+        assert!(!config.offline);
+        assert_eq!(config.startup_policy, StartupPolicy::BestEffort);
+        assert!(config.admin_api_enabled);
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn application_fields_follow_normal_source_precedence() {
+        let path = std::env::temp_dir().join(format!(
+            "impossible-application-config-{}.toml",
+            std::process::id()
+        ));
         fs::write(
             &path,
-            "bind = \"127.0.0.1:1001\"\n[limits]\nmax_items = 4\n",
+            "http_bind = \"127.0.0.1:1101\"\ngrpc_bind = \"127.0.0.1:5101\"\ncache_directory = \"toml-cache\"\npreload_models = [\"bge-small-en\"]\noffline = true\nstartup_policy = \"strict\"\n",
         )
         .expect("fixture");
         let config = ServerConfig::load(
             Some(&path),
             [
-                ("IMPOSSIBLE_BIND", "127.0.0.1:1002"),
-                ("IMPOSSIBLE_MAX_ITEMS", "8"),
+                ("IMPOSSIBLE_HTTP_BIND", "127.0.0.1:1102"),
+                ("IMPOSSIBLE_GRPC_BIND", "127.0.0.1:5102"),
+                ("IMPOSSIBLE_CACHE_DIRECTORY", "environment-cache"),
+                ("IMPOSSIBLE_PRELOAD_MODELS", "multilingual-e5-small"),
+                ("IMPOSSIBLE_OFFLINE", "false"),
+                ("IMPOSSIBLE_STARTUP_POLICY", "best_effort"),
             ],
-            ["--bind", "127.0.0.1:1003", "--max-items", "16"],
+            [
+                "--http-bind",
+                "127.0.0.1:1103",
+                "--grpc-bind",
+                "127.0.0.1:5103",
+                "--cache-directory",
+                "cli-cache",
+                "--preload-models",
+                "nomic-embed-text",
+                "--startup-policy",
+                "strict",
+            ],
         )
         .expect("valid config");
         let _ = fs::remove_file(path);
-        assert_eq!(config.bind, "127.0.0.1:1003".parse().expect("address"));
+        assert_eq!(
+            config.http_bind,
+            "127.0.0.1:1103".parse().expect("HTTP address")
+        );
+        assert_eq!(
+            config.grpc_bind,
+            "127.0.0.1:5103".parse().expect("gRPC address")
+        );
+        assert_eq!(config.cache_directory, PathBuf::from("cli-cache"));
+        assert_eq!(config.preload_models, ["nomic-embed-text"]);
+        assert!(!config.offline);
+        assert_eq!(config.startup_policy, StartupPolicy::Strict);
+    }
+
+    #[test]
+    fn remote_admin_api_requires_a_separate_admin_credential_source() {
+        let remote = ServerConfig {
+            http_bind: "0.0.0.0:8080".parse().expect("address"),
+            allow_insecure_remote: true,
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            remote.validate(),
+            Err(ConfigError::InvalidAdminCredentialPolicy)
+        );
+
+        let inference = CredentialSource::Environment("IMPOSSIBLE_PUBLIC".to_owned());
+        let aliased = ServerConfig {
+            auth: Some(inference.clone()),
+            admin_auth: Some(inference),
+            ..remote.clone()
+        };
+        assert_eq!(
+            aliased.validate(),
+            Err(ConfigError::InvalidAdminCredentialPolicy)
+        );
+
+        let protected = ServerConfig {
+            auth: Some(CredentialSource::Environment(
+                "IMPOSSIBLE_PUBLIC".to_owned(),
+            )),
+            admin_auth: Some(CredentialSource::Environment("IMPOSSIBLE_ADMIN".to_owned())),
+            ..remote.clone()
+        };
+        assert_eq!(protected.validate(), Ok(()));
+
+        let no_admin_routes = ServerConfig {
+            admin_api_enabled: false,
+            ..remote
+        };
+        assert_eq!(no_admin_routes.validate(), Ok(()));
+    }
+
+    #[test]
+    fn application_config_validation_rejects_collisions_and_bad_preloads() {
+        let same_listener = ServerConfig {
+            grpc_bind: ServerConfig::default().http_bind,
+            ..ServerConfig::default()
+        };
+        assert!(matches!(
+            same_listener.validate(),
+            Err(ConfigError::InvalidValue {
+                key: ConfigKey::GrpcBind,
+                ..
+            })
+        ));
+        for preload_models in [
+            vec![String::new()],
+            vec!["model\nname".to_owned()],
+            vec!["same".to_owned(), "same".to_owned()],
+        ] {
+            let config = ServerConfig {
+                preload_models,
+                ..ServerConfig::default()
+            };
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::InvalidValue {
+                    key: ConfigKey::PreloadModels,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn debug_redacts_cache_and_preload_names() {
+        let config = ServerConfig {
+            cache_directory: PathBuf::from("C:/sentinel-private-cache"),
+            preload_models: vec!["sentinel-private-model".to_owned()],
+            ..ServerConfig::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("sentinel"));
+        assert!(debug.contains("preload_model_count: 1"));
+        assert!(debug.contains("cache_directory: \"[REDACTED]\""));
+    }
+
+    #[test]
+    fn precedence_is_cli_then_environment_then_toml_then_defaults() {
+        let path = std::env::temp_dir().join(format!("impossible-config-{}", std::process::id()));
+        fs::write(
+            &path,
+            "http_bind = \"127.0.0.1:1001\"\n[limits]\nmax_items = 4\n",
+        )
+        .expect("fixture");
+        let config = ServerConfig::load(
+            Some(&path),
+            [
+                ("IMPOSSIBLE_HTTP_BIND", "127.0.0.1:1002"),
+                ("IMPOSSIBLE_MAX_ITEMS", "8"),
+            ],
+            ["--http-bind", "127.0.0.1:1003", "--max-items", "16"],
+        )
+        .expect("valid config");
+        let _ = fs::remove_file(path);
+        assert_eq!(config.http_bind, "127.0.0.1:1003".parse().expect("address"));
         assert_eq!(config.limits.max_items, 16);
         assert_eq!(config.limits.max_tokens, Limits::default().max_tokens);
     }
@@ -1029,7 +1290,7 @@ mod tests {
             parse_cli(["--SENTINEL_SECRET_PATH\n\u{1b}[31m", "secret"])
                 .err()
                 .expect("unknown command-line key"),
-            parse_cli(["--bind", "SENTINEL_SECRET_PATH\n\u{1b}[31m"])
+            parse_cli(["--http-bind", "SENTINEL_SECRET_PATH\n\u{1b}[31m"])
                 .and_then(|patch| {
                     let mut config = ServerConfig::default();
                     patch.apply(&mut config)
@@ -1094,7 +1355,7 @@ mod tests {
         fs::create_dir_all(&base).expect("fixture directory");
         let target = base.join("target.toml");
         let link = base.join("configured.toml");
-        fs::write(&target, "bind = \"127.0.0.1:8080\"\n").expect("target fixture");
+        fs::write(&target, "http_bind = \"127.0.0.1:8080\"\n").expect("target fixture");
 
         #[cfg(unix)]
         let linked = std::os::unix::fs::symlink(&target, &link).is_ok();
@@ -1120,18 +1381,21 @@ mod tests {
     fn loopback_ipv4_and_ipv6_are_safe_but_remote_requires_policy() {
         for bind in ["127.0.0.1:8080", "[::1]:8080"] {
             let config = ServerConfig {
-                bind: bind.parse().expect("address"),
+                http_bind: bind.parse().expect("address"),
                 ..ServerConfig::default()
             };
             assert_eq!(config.validate(), Ok(()));
         }
         let remote = ServerConfig {
-            bind: "0.0.0.0:8080".parse().expect("address"),
+            http_bind: "0.0.0.0:8080".parse().expect("address"),
             ..ServerConfig::default()
         };
         assert_eq!(remote.validate(), Err(ConfigError::UnsafeRemoteBind));
         let protected = ServerConfig {
             auth: Some(CredentialSource::Environment("IMPOSSIBLE_TOKEN".to_owned())),
+            admin_auth: Some(CredentialSource::Environment(
+                "IMPOSSIBLE_ADMIN_TOKEN".to_owned(),
+            )),
             ..remote
         };
         assert_eq!(protected.validate(), Ok(()));
@@ -1208,7 +1472,7 @@ mod tests {
     #[test]
     fn debug_redacts_credentials_network_and_configured_paths() {
         let config = ServerConfig {
-            bind: "192.0.2.40:9123".parse().expect("address"),
+            http_bind: "192.0.2.40:9123".parse().expect("address"),
             auth: Some(CredentialSource::Environment(
                 "SENTINEL_PRIVATE_ENV".to_owned(),
             )),
@@ -1386,7 +1650,7 @@ mod tests {
 
     #[test]
     fn duplicate_and_conflicting_keys_fail_closed() {
-        assert!(parse_toml("bind = \"[::1]:1\"\nbind = \"[::1]:2\"").is_err());
+        assert!(parse_toml("http_bind = \"[::1]:1\"\nhttp_bind = \"[::1]:2\"").is_err());
         assert!(
             ServerConfig::load(
                 None,

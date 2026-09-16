@@ -8,7 +8,7 @@ pub mod security;
 pub mod shutdown;
 pub mod telemetry;
 
-pub use config::{ConfigError, ServerConfig};
+pub use config::{ConfigError, ServerConfig, StartupPolicy};
 pub use health::{
     HealthRegistry, LifecycleState, ModelFailureReason, ModelKey, ModelState, Readiness,
     ReadinessReason,
