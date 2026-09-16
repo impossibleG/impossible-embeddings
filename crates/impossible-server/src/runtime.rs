@@ -1011,6 +1011,18 @@ impl ApplicationRuntime {
         reservation.publish(executor, engine).await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn load_with_test<F>(
+        &self,
+        model_id: String,
+        load: F,
+    ) -> Result<(), LifecycleError>
+    where
+        F: FnOnce() -> Result<Arc<dyn RuntimeEngine>, LifecycleError> + Send + 'static,
+    {
+        self.load_with(model_id, load).await
+    }
+
     async fn register_reserved_engine(
         &self,
         model_id: String,
