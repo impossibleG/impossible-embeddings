@@ -4,13 +4,35 @@ Impossible Embedding is a local-first, production-oriented embedding server. Its
 stable API and dependable model lifecycle while keeping inference and data on infrastructure
 you control.
 
-This repository is in its foundation phase. The current workspace proves two critical choices:
+The server runs open embedding models locally through ONNX Runtime. It exposes native HTTP,
+OpenAI-compatible HTTP, gRPC, MCP over HTTP, and MCP over stdio. Compatibility describes only the
+wire format: no OpenAI account, API key, model, or service is used.
 
-- Protocol code generation works without a system `protoc` installation.
-- A small, redistributable synthetic ONNX graph can execute in-process on CPU.
+## Running
 
-No network server is shipped yet. See [the product contract](docs/product-contract.md) for the
-intended boundary and [the backlog](docs/backlog.md) for the staged delivery plan.
+```shell
+cargo run --release -- serve --preload-models bge-small-en
+```
+
+Startup only loads explicitly configured models that are already installed; it never downloads a
+model. Installation is an explicit authenticated administration operation:
+
+```shell
+cargo run --release -- models install bge-small-en
+cargo run --release -- models list
+```
+
+Use `--auth-env NAME` or `--auth-file PATH` for client authentication. Secret values are never
+accepted as command-line arguments. The server has corresponding public and separate admin
+credential-source options. Configuration precedence is command line, `IMPOSSIBLE_*` environment,
+TOML, then safe loopback defaults. Run `impossible-embedding <command> --help` for the complete
+bounded resource and lifecycle configuration.
+
+For MCP stdio, stdout is reserved exclusively for JSON-RPC frames:
+
+```shell
+cargo run --release -- mcp --stdio --preload-models bge-small-en
+```
 
 ## Development
 

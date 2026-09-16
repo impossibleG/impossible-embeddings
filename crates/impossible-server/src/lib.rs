@@ -1,9 +1,11 @@
 //! Transport-independent application runtime for model lifecycle and bounded inference.
 
 pub mod application;
+pub mod cli;
 pub mod grpc;
 pub mod http;
 pub mod mcp;
+pub mod process;
 pub mod runtime;
 
 pub use application::{
@@ -17,3 +19,4 @@ pub use runtime::{
 };
 
 pub use grpc::{GrpcServerError, GrpcServerHandle, spawn_grpc_server};
+pub use process::{ProcessError, ServerHost};

@@ -1,14 +1,10 @@
-//! Process assembly placeholder for the foundation milestone.
+//! Impossible Embedding process entry point.
 
-use impossible_server_core::{LifecycleState, Readiness, ReadinessReason};
+use clap::Parser;
+use impossible_server::cli::{Cli, run};
+use std::process::ExitCode;
 
-fn main() {
-    let readiness = Readiness {
-        state: LifecycleState::Starting,
-        reason_code: Some(ReadinessReason::Starting),
-    };
-    println!(
-        "Impossible Embedding foundation (ready: {})",
-        readiness.is_ready()
-    );
+#[tokio::main]
+async fn main() -> ExitCode {
+    run(Cli::parse()).await
 }

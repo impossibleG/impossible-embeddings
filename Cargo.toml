@@ -25,6 +25,7 @@ http-body-util = "=0.1.3"
 hyper = { version = "=1.7.0", features = ["http1", "server"] }
 prost = "=0.14.4"
 prost-types = "=0.14.4"
+reqwest = { version = "=0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"
 tokio = "=1.48.0"

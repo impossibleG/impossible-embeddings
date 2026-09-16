@@ -35,6 +35,15 @@ impl Secret {
     pub fn verify(&self, candidate: &[u8]) -> bool {
         constant_time_eq(&self.0, candidate)
     }
+
+    /// Borrow the secret only for the duration of a caller-supplied operation.
+    ///
+    /// This capability exists for authenticated clients that must place the credential on the
+    /// wire. The bytes are never returned from this method, and callers should avoid retaining a
+    /// copy beyond the operation that needs it.
+    pub fn with_bytes<T>(&self, operation: impl FnOnce(&[u8]) -> T) -> T {
+        operation(&self.0)
+    }
 }
 
 impl fmt::Debug for Secret {

@@ -78,6 +78,14 @@ impl GrpcServerHandle {
         self.local_addr
     }
 
+    /// Whether the transport task has terminated before its owner requested shutdown.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
     /// Mark health not-serving, stop accepting connections, and wait within the configured bound.
     ///
     /// # Errors
