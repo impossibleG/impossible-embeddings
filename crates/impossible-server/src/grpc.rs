@@ -25,6 +25,7 @@ const AUTHORIZATION: &str = "authorization";
 const AUTHORIZATION_BIN: &str = "authorization-bin";
 const GRPC_TIMEOUT: &str = "grpc-timeout";
 const GRPC_TIMEOUT_BIN: &str = "grpc-timeout-bin";
+const HEALTH_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Sanitized gRPC host lifecycle failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,9 +135,7 @@ pub async fn spawn_grpc_server(
         });
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_serving::<EmbeddingServiceServer<GrpcEmbeddingService>>()
-        .await;
+    publish_health(&health_reporter, state.application().readiness().is_ready()).await;
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(v1::FILE_DESCRIPTOR_SET)
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
@@ -144,29 +143,30 @@ pub async fn spawn_grpc_server(
         .map_err(|_| GrpcServerError::Reflection)?;
 
     let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let health_shutdown_rx = shutdown_rx.clone();
     let process_shutdown = state.shutdown_trigger().clone();
-    let shutdown_health = health_reporter.clone();
+    let health_process_shutdown = process_shutdown.clone();
+    let health_state = state;
     let join = tokio::spawn(async move {
         let shutdown_signal = async move {
             tokio::select! {
                 () = wait_for_shutdown(&mut shutdown_rx) => {}
                 () = process_shutdown.cancelled() => {}
             }
-            shutdown_health
-                .set_not_serving::<EmbeddingServiceServer<GrpcEmbeddingService>>()
-                .await;
-            shutdown_health
-                .set_service_status("", tonic_health::ServingStatus::NotServing)
-                .await;
         };
-        Server::builder()
-            .timeout(limits.request_timeout)
+        let server = Server::builder()
             .add_service(reflection)
             .add_service(health_service)
             .add_service(embedding)
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
-            .await
-            .map_err(|_| GrpcServerError::Transport)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal);
+        let health = track_health(
+            health_reporter,
+            health_state,
+            health_shutdown_rx,
+            health_process_shutdown,
+        );
+        let (server_result, ()) = tokio::join!(server, health);
+        server_result.map_err(|_| GrpcServerError::Transport)
     });
 
     Ok(GrpcServerHandle {
@@ -175,6 +175,47 @@ pub async fn spawn_grpc_server(
         shutdown,
         join: Some(join),
     })
+}
+
+async fn publish_health(reporter: &tonic_health::server::HealthReporter, ready: bool) {
+    let status = if ready {
+        tonic_health::ServingStatus::Serving
+    } else {
+        tonic_health::ServingStatus::NotServing
+    };
+    reporter.set_service_status("", status).await;
+    reporter
+        .set_service_status(
+            <EmbeddingServiceServer<GrpcEmbeddingService> as tonic::server::NamedService>::NAME,
+            status,
+        )
+        .await;
+}
+
+async fn track_health(
+    reporter: tonic_health::server::HealthReporter,
+    state: AppState,
+    mut shutdown: watch::Receiver<bool>,
+    process_shutdown: crate::ShutdownTrigger,
+) {
+    let mut last_ready = state.application().readiness().is_ready();
+    let mut interval = tokio::time::interval(HEALTH_REFRESH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown) => break,
+            () = process_shutdown.cancelled() => break,
+            _ = interval.tick() => {
+                let ready = state.application().readiness().is_ready();
+                if ready != last_ready {
+                    publish_health(&reporter, ready).await;
+                    last_ready = ready;
+                }
+            }
+        }
+    }
+    publish_health(&reporter, false).await;
 }
 
 async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
@@ -402,7 +443,10 @@ mod tests {
     use impossible_protocol::v1::{
         ErrorCode as ProtoErrorCode, embedding_service_client::EmbeddingServiceClient,
     };
-    use impossible_server_core::{ServerConfig, config::CredentialSource};
+    use impossible_server_core::{
+        LifecycleState, ModelKey, ModelState, ReadinessReason, ServerConfig,
+        config::CredentialSource,
+    };
     use tonic::{Code, metadata::MetadataValue, transport::Endpoint};
     use tonic_health::pb::{
         HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
@@ -675,17 +719,47 @@ mod tests {
 
     #[tokio::test]
     async fn health_and_reflection_publish_standard_descriptors() -> Result<(), &'static str> {
-        let (server, directory) = start(false).await;
+        let (config, directory) = fixture_config(false);
+        let state = AppState::new(&config).expect("construct app state");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture");
+        let server = spawn_grpc_server(listener, state.clone())
+            .await
+            .expect("start server");
         let channel = channel(server.local_addr()).await;
         let mut health = HealthClient::new(channel.clone());
-        let health_response = health
+        let initial = health
             .check(HealthCheckRequest {
                 service: "impossible.embedding.v1.EmbeddingService".into(),
             })
             .await
             .expect("health check")
             .into_inner();
-        assert_eq!(health_response.status, ServingStatus::Serving as i32);
+        assert_eq!(initial.status, ServingStatus::NotServing as i32);
+
+        state
+            .application()
+            .health()
+            .set_model(ModelKey(1), ModelState::Ready);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let current = health
+                .check(HealthCheckRequest {
+                    service: "impossible.embedding.v1.EmbeddingService".into(),
+                })
+                .await
+                .expect("health check")
+                .into_inner();
+            if current.status == ServingStatus::Serving as i32 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "health became ready"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         let mut reflection = ServerReflectionClient::new(channel);
         let requests = tokio_stream::iter([ServerReflectionRequest {
@@ -706,17 +780,45 @@ mod tests {
         else {
             return Err("unexpected reflection response");
         };
-        let names = services
+        let mut names = services
             .service
             .into_iter()
             .map(|service| service.name)
             .collect::<Vec<_>>();
-        assert!(
-            names
-                .iter()
-                .any(|name| name == "impossible.embedding.v1.EmbeddingService")
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "grpc.health.v1.Health".to_owned(),
+                "grpc.reflection.v1.ServerReflection".to_owned(),
+                "impossible.embedding.v1.EmbeddingService".to_owned(),
+            ]
         );
-        assert!(names.iter().any(|name| name == "grpc.health.v1.Health"));
+
+        assert!(
+            state
+                .application()
+                .health()
+                .transition(LifecycleState::Draining, Some(ReadinessReason::Draining))
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let current = health
+                .check(HealthCheckRequest {
+                    service: String::new(),
+                })
+                .await
+                .expect("overall health check")
+                .into_inner();
+            if current.status == ServingStatus::NotServing as i32 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "health reflected drain"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         server.shutdown().await.expect("graceful shutdown");
         fs::remove_dir_all(directory).expect("remove fixture");
