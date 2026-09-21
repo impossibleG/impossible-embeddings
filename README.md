@@ -12,6 +12,10 @@ Inference runs locally through ONNX Runtime. Nothing calls OpenAI or any other h
 service. `POST /v1/embeddings` is only a wire-compatible adapter so existing OpenAI-compatible
 clients can use a local base URL.
 
+<p align="center">
+  <img src="docs/assets/impossible-embedding-scene.gif" alt="A moving field of connected points representing local text embeddings" width="100%">
+</p>
+
 ## What is included
 
 - Native and OpenAI-compatible HTTP APIs, with a checked-in OpenAPI v1 contract.
