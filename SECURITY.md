@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Do not open a public issue for a suspected vulnerability. Use GitHub private vulnerability
-reporting for `impossibleG/impossible-embedding` and include affected versions, impact, and minimal
+reporting for `impossibleG/impossible-embeddings` and include affected versions, impact, and minimal
 reproduction steps. Do not include real credentials, private model data, or sensitive request text.
 
 This community project does not promise a response time. A supported-version table will be added
