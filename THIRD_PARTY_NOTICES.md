@@ -199,9 +199,9 @@ The inventory below records declared package licenses. The corresponding copyrig
 | `ring` | 0.17.14 | `Apache-2.0 AND ISC` | crates.io |
 | `rustc-hash` | 2.1.3 | `Apache-2.0 OR MIT` | crates.io |
 | `rustix` | 1.1.4 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | crates.io |
-| `rustls` | 0.23.45 | `Apache-2.0 OR ISC OR MIT` | crates.io |
+| `rustls` | 0.23.46 | `Apache-2.0 OR ISC OR MIT` | crates.io |
 | `rustls-pki-types` | 1.15.1 | `MIT OR Apache-2.0` | crates.io |
-| `rustls-webpki` | 0.103.15 | `ISC` | crates.io |
+| `rustls-webpki` | 0.103.16 | `ISC` | crates.io |
 | `rustversion` | 1.0.23 | `MIT OR Apache-2.0` | crates.io |
 | `ryu` | 1.0.23 | `Apache-2.0 OR BSL-1.0` | crates.io |
 | `schannel` | 0.1.29 | `MIT` | crates.io |
@@ -294,8 +294,8 @@ The inventory below records declared package licenses. The corresponding copyrig
 | `wasm-streams` | 0.4.2 | `MIT OR Apache-2.0` | crates.io |
 | `web-sys` | 0.3.105 | `MIT OR Apache-2.0` | crates.io |
 | `web-time` | 1.1.0 | `MIT OR Apache-2.0` | crates.io |
-| `webpki-root-certs` | 1.0.9 | `CDLA-Permissive-2.0` | crates.io |
-| `webpki-roots` | 1.0.9 | `CDLA-Permissive-2.0` | crates.io |
+| `webpki-root-certs` | 1.0.10 | `CDLA-Permissive-2.0` | crates.io |
+| `webpki-roots` | 1.0.10 | `CDLA-Permissive-2.0` | crates.io |
 | `winapi` | 0.3.9 | `MIT/Apache-2.0` | crates.io |
 | `winapi-i686-pc-windows-gnu` | 0.4.0 | `MIT/Apache-2.0` | crates.io |
 | `winapi-x86_64-pc-windows-gnu` | 0.4.0 | `MIT/Apache-2.0` | crates.io |

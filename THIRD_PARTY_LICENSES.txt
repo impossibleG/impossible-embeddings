@@ -1278,7 +1278,7 @@ TEXT: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2 [crate] L
 TEXT: a6c48161a09acc75a0e25503bab66a731eb5fba5392ed4bb4743e4ba5085327a [crate] LICENSE-Apache-2.0_WITH_LLVM-exception
 TEXT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3 [crate] LICENSE-MIT
 
-PACKAGE: rustls 0.23.45
+PACKAGE: rustls 0.23.46
 DECLARED-LICENSE: Apache-2.0 OR ISC OR MIT
 UPSTREAM: https://github.com/rustls/rustls
 TEXT: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2 [crate] LICENSE-APACHE
@@ -1291,7 +1291,7 @@ UPSTREAM: https://github.com/rustls/pki-types
 TEXT: 45fd05c4865e7c350b98ad7ac50e1b15462d49af4a91e9b0c9dd933dc9a69742 [crate] LICENSE-APACHE
 TEXT: 9117d922e667125508dde62b02c1f57ed22f5ad21eb536aa2e2d99e1c796e639 [crate] LICENSE-MIT
 
-PACKAGE: rustls-webpki 0.103.15
+PACKAGE: rustls-webpki 0.103.16
 DECLARED-LICENSE: ISC
 UPSTREAM: https://github.com/rustls/webpki
 TEXT: 5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a [crate] LICENSE
@@ -1907,12 +1907,12 @@ UPSTREAM: https://github.com/daxpedda/web-time
 TEXT: 54a744942eb3fa63a74d8d359989ed6962c04f3f10ff20cfa08ff8aa7efbe4e6 [crate] LICENSE-APACHE
 TEXT: f428305bbf2e70fbd807af0f3c7ac1b7acfb95311640f451e9d2e48db6d7e96b [crate] LICENSE-MIT
 
-PACKAGE: webpki-root-certs 1.0.9
+PACKAGE: webpki-root-certs 1.0.10
 DECLARED-LICENSE: CDLA-Permissive-2.0
 UPSTREAM: https://github.com/rustls/webpki-roots
 TEXT: e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8 [crate] LICENSE
 
-PACKAGE: webpki-roots 1.0.9
+PACKAGE: webpki-roots 1.0.10
 DECLARED-LICENSE: CDLA-Permissive-2.0
 UPSTREAM: https://github.com/rustls/webpki-roots
 TEXT: e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8 [crate] LICENSE
