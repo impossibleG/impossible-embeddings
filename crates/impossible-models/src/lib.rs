@@ -151,6 +151,13 @@ impl From<io::Error> for Error {
     }
 }
 
+#[cfg(unix)]
+impl From<rustix::io::Errno> for Error {
+    fn from(value: rustix::io::Errno) -> Self {
+        Self::Io(value.into())
+    }
+}
+
 impl From<reqwest::Error> for Error {
     fn from(value: reqwest::Error) -> Self {
         let kind = if value.is_connect() {

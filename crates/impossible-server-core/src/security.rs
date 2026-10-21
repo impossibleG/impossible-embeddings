@@ -109,7 +109,7 @@ fn open_secret_file(path: &Path) -> Result<File, CredentialError> {
     let mut options = OpenOptions::new();
     options.read(true);
     configure_no_follow(&mut options);
-    options.open(path).map_err(map_open_error)
+    options.open(path).map_err(|error| map_open_error(&error))
 }
 
 #[cfg(unix)]
@@ -136,9 +136,10 @@ fn configure_no_follow(options: &mut OpenOptions) {
 #[cfg(not(any(unix, windows)))]
 fn configure_no_follow(_options: &mut OpenOptions) {}
 
-fn map_open_error(_error: std::io::Error) -> CredentialError {
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn map_open_error(error: &std::io::Error) -> CredentialError {
     #[cfg(unix)]
-    if _error.raw_os_error() == Some(libc::ELOOP) {
+    if error.raw_os_error() == Some(libc::ELOOP) {
         return CredentialError::Invalid;
     }
     CredentialError::Unavailable
