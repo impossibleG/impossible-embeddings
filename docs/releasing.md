@@ -35,7 +35,7 @@ When the release displays a GitHub attestation, verify its keyless signature and
 
 ```shell
 gh attestation verify impossible-embedding-0.1.0-x86_64-unknown-linux-gnu.tar.gz \
-  --repo impossibleG/impossible-embedding
+  --repo impossibleG/impossible-embeddings
 ```
 
 A checksum detects corruption only when its source is trusted. The attestation additionally binds
